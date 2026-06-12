@@ -1,0 +1,98 @@
+{
+  "name": "shadow-ssh-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop client for shadow-ssh with Electron, TypeScript, and a platform-ready service boundary.",
+  "type": "module",
+  "main": "dist/main/main.js",
+  "author": "shadow-ssh",
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"tsc -p tsconfig.node.json --watch --preserveWatchOutput\" \"wait-on tcp:5173 dist/main/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build:node": "tsc -p tsconfig.node.json",
+    "build": "npm run typecheck && vite build && tsc -p tsconfig.node.json",
+    "build:dev-exe": "cross-env NODE_ENV=development SHADOW_SSH_BUILD_CHANNEL=development npm run build && electron-builder --win nsis --config.productName=\"Shadow SSH Dev\" --config.artifactName=\"shadow-ssh-dev-${version}-${arch}.${ext}\"",
+    "build:prod-exe": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run build && electron-builder --win nsis",
+    "service:simulator": "npm run build:node && node dist/service/service-host.js",
+    "service:install": "powershell -ExecutionPolicy Bypass -File scripts/install-service.ps1",
+    "service:uninstall": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-service.ps1",
+    "service:start": "powershell -ExecutionPolicy Bypass -File scripts/start-service.ps1",
+    "service:stop": "powershell -ExecutionPolicy Bypass -File scripts/stop-service.ps1",
+    "signing:check": "powershell -ExecutionPolicy Bypass -File scripts/check-signing-env.ps1",
+    "native:test-service": "node scripts/test-native-service.mjs",
+    "native:build-service": "node scripts/build-native-service.mjs",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "clean": "rimraf dist release coverage .vite"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^6.0.2",
+    "concurrently": "^10.0.3",
+    "cross-env": "^7.0.3",
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.2",
+    "eslint": "^9.17.0",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.2",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "app.shadowssh.desktop",
+    "productName": "Shadow SSH",
+    "directories": {
+      "output": "release",
+      "buildResources": "resources"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json",
+      "icon.svg",
+      "native/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "native",
+        "to": "native",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "resources/icons/icon.ico",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "category": "public.app-category.utilities",
+      "icon": "icon.svg"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Network",
+      "icon": "resources/icons/icon.png"
+    }
+  }
+}

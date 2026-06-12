@@ -1,0 +1,38 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="64" y1="64" x2="448" y2="448" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#111111"/>
+      <stop offset="1" stop-color="#000000"/>
+    </linearGradient>
+
+    <linearGradient id="orange" x1="120" y1="90" x2="380" y2="430" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB000"/>
+      <stop offset="1" stop-color="#F68B00"/>
+    </linearGradient>
+
+    <filter id="shadow" x="40" y="40" width="432" height="432" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="12" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect x="32" y="32" width="448" height="448" rx="100" fill="url(#bg)"/>
+  <rect x="32.5" y="32.5" width="447" height="447" rx="99.5" stroke="#2A2A2A"/>
+
+  <g filter="url(#shadow)">
+    <path d="M256 83L384 132V224C384 321 330 393 256 438C182 393 128 321 128 224V132L256 83Z" fill="#090909" stroke="url(#orange)" stroke-width="18" stroke-linejoin="round"/>
+  </g>
+
+  <circle cx="358" cy="159" r="12" fill="#F2F2F2"/>
+
+  <circle cx="206" cy="205" r="40" fill="url(#orange)"/>
+  <circle cx="206" cy="205" r="16" fill="#F2F2F2"/>
+  <rect x="238" y="189" width="116" height="32" rx="16" fill="url(#orange)"/>
+  <rect x="304" y="189" width="24" height="62" rx="12" fill="url(#orange)"/>
+  <rect x="336" y="189" width="24" height="44" rx="12" fill="url(#orange)"/>
+
+  <path d="M165 317C187 280 220 260 256 260C292 260 325 280 347 317" stroke="url(#orange)" stroke-width="18" stroke-linecap="round"/>
+  <path d="M190 354C206 329 229 315 256 315C283 315 306 329 322 354" stroke="#F2F2F2" stroke-width="18" stroke-linecap="round"/>
+
+  <rect x="170" y="393" width="172" height="58" rx="29" fill="url(#orange)"/>
+  <text x="256" y="430" text-anchor="middle" fill="#111111" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="700">SSH</text>
+</svg>
