@@ -73,17 +73,29 @@ func (a *App) HandleCommand(ctx context.Context, command protocol.Command) proto
 		return a.handleCheckTunnel(command)
 	case "open-terminal":
 		return a.handleOpenTerminal(command)
+	case "close-terminal":
+		return a.ok(command.ID, protocol.Accepted(), diagnostic("info", "Native shell channel close requested."))
 	case "terminal-input":
 		return a.handleTerminalInput(command)
 	case "update-config":
 		return a.ok(command.ID, protocol.Accepted())
 	case "update-routing-rules":
 		return a.handleUpdateRoutingRules(command)
+	case "list-process-connections":
+		return a.handleListProcessConnections(ctx, command)
 	case "shutdown":
 		return a.ok(command.ID, protocol.Accepted(), diagnostic("info", "Native service shutdown requested."))
 	default:
 		return protocol.CommandResult{Response: protocol.Error(command.ID, fmt.Errorf("unsupported service command %q", command.Type))}
 	}
+}
+
+func (a *App) handleListProcessConnections(ctx context.Context, command protocol.Command) protocol.CommandResult {
+	connections, err := a.driver.ListProcessConnections(ctx)
+	if err != nil {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
+	}
+	return a.ok(command.ID, map[string]any{"connections": connections})
 }
 
 func (a *App) authorize(command protocol.Command) error {

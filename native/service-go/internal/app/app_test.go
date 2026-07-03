@@ -12,7 +12,8 @@ import (
 )
 
 type fakeDriver struct {
-	applyCalls int
+	applyCalls  int
+	connections []platform.ProcessConnection
 }
 
 func (driver *fakeDriver) Capabilities() platform.Capabilities {
@@ -33,7 +34,7 @@ func (*fakeDriver) ClearRouting(context.Context) error {
 }
 
 func (*fakeDriver) ListProcessConnections(context.Context) ([]platform.ProcessConnection, error) {
-	return nil, platform.ErrRoutingDriverNotInstalled
+	return []platform.ProcessConnection{{PID: 42, ProcessName: "chrome.exe", RemoteAddress: "1.1.1.1", RemotePort: 443, Protocol: "tcp4"}}, nil
 }
 
 func TestAppRejectsUnauthorizedCommand(t *testing.T) {
@@ -104,5 +105,22 @@ func TestAppSelectedRulesRequiresEnabledRule(t *testing.T) {
 	result := service.HandleCommand(context.Background(), protocol.Command{ID: "1", Type: "connect", Payload: rawPayload})
 	if result.Response.OK || !strings.Contains(result.Response.Error, "selected-rules") {
 		t.Fatalf("expected selected-rules validation error, got %+v", result.Response)
+	}
+}
+
+func TestAppListsProcessConnections(t *testing.T) {
+	service := New(Options{Driver: &fakeDriver{}})
+	result := service.HandleCommand(context.Background(), protocol.Command{ID: "1", Type: "list-process-connections"})
+	if !result.Response.OK {
+		t.Fatalf("expected ok response, got %+v", result.Response)
+	}
+
+	payload, ok := result.Response.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map payload, got %T", result.Response.Payload)
+	}
+	connections, ok := payload["connections"].([]platform.ProcessConnection)
+	if !ok || len(connections) != 1 || connections[0].ProcessName != "chrome.exe" {
+		t.Fatalf("unexpected connections payload: %#v", payload["connections"])
 	}
 }

@@ -1,4 +1,4 @@
-import { generateKeyPairSync, sign as nodeSign } from "node:crypto";
+import { generateKeyPairSync, sign as nodeSign, type KeyObject } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { ChannelStateManager } from "../src/core/ssh/channel-state.js";
 import {
@@ -11,8 +11,15 @@ import {
 import { deriveKey, deriveTransportKeys, transportKeyLengthsFor } from "../src/core/ssh/key-derivation.js";
 import { bufferToBigInt } from "../src/core/ssh/kex-group14.js";
 import { SshPacketProtector } from "../src/core/ssh/packet-codec.js";
-import { buildPublicKeyAuthSigningPayload, buildSignedPublicKeyAuthRequest, loadPrivateKey, signSshData } from "../src/core/ssh/private-key.js";
-import { SshBinaryReader } from "../src/core/ssh/binary.js";
+import {
+  SshPrivateKeyLoadError,
+  assertSshPrivateKeyText,
+  buildPublicKeyAuthSigningPayload,
+  buildSignedPublicKeyAuthRequest,
+  loadPrivateKey,
+  signSshData
+} from "../src/core/ssh/private-key.js";
+import { SshBinaryReader, SshBinaryWriter } from "../src/core/ssh/binary.js";
 
 describe("SSH transport key derivation and packet protection", () => {
   it("derives deterministic RFC-style keys", () => {
@@ -108,6 +115,81 @@ describe("SSH host-key verification and private-key signing", () => {
     expect(signatureBlob.length).toBeGreaterThan(64);
   });
 
+  it("normalizes escaped newlines before loading private keys", () => {
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const pem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    const escaped = pem.trim().replace(/\n/gu, "\\n");
+
+    const loaded = loadPrivateKey(escaped);
+
+    expect(loaded.privateKey.type).toBe("private");
+  });
+
+  it("loads unencrypted OpenSSH Ed25519 private keys", () => {
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const openSshPem = encodeOpenSshEd25519PrivateKey(privateKey);
+
+    const loaded = loadPrivateKey(openSshPem);
+    const payload = buildPublicKeyAuthSigningPayload({
+      sessionId: Buffer.alloc(32, 8),
+      username: "alice",
+      service: "ssh-connection",
+      publicKeyAlgorithm: "ssh-ed25519",
+      publicKeyBlob: encodeEd25519PublicKeyBlob(loaded.publicKey.export({ format: "der", type: "spki" }).subarray(-32))
+    });
+    const signatureBlob = signSshData(loaded.privateKey, "ssh-ed25519", payload);
+
+    expect(signatureBlob.length).toBeGreaterThan(64);
+  });
+
+  it("reports safe private-key parse diagnostics", () => {
+    const malformed = "-----BEGIN OPENSSH PRIVATE KEY-----\\nnot-a-key\\n-----END OPENSSH PRIVATE KEY-----";
+
+    expect(() => loadPrivateKey(malformed)).toThrow(SshPrivateKeyLoadError);
+
+    try {
+      loadPrivateKey(malformed);
+    } catch (error) {
+      expect(error).toBeInstanceOf(SshPrivateKeyLoadError);
+      const diagnostics = (error as SshPrivateKeyLoadError).diagnostics.join("; ");
+      expect(diagnostics).toContain("format=openssh");
+      expect(diagnostics).toContain("containsEscapedNewlines=true");
+      expect(diagnostics).toContain("normalizedLineCount=3");
+      expect(diagnostics).toContain("parserError=");
+      expect(diagnostics).not.toContain("not-a-key");
+    }
+  });
+
+  it("reports unsupported encrypted OpenSSH private keys explicitly", () => {
+    const encryptedOpenSsh = encodeOpenSshEnvelope(
+      new SshBinaryWriter()
+        .string("aes256-ctr")
+        .string("bcrypt")
+        .string(new SshBinaryWriter().string(Buffer.alloc(16, 1)).uint32(16).toBuffer())
+        .uint32(1)
+        .string(Buffer.alloc(0))
+        .string(Buffer.alloc(16))
+        .toBuffer()
+    );
+
+    expect(() => loadPrivateKey(encryptedOpenSsh, "secret")).toThrow(/Encrypted OpenSSH private keys are not supported yet/);
+
+    try {
+      loadPrivateKey(encryptedOpenSsh, "secret");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SshPrivateKeyLoadError);
+      const diagnostics = (error as SshPrivateKeyLoadError).diagnostics.join("; ");
+      expect(diagnostics).toContain("openSshCipher=aes256-ctr");
+      expect(diagnostics).toContain("openSshKdf=bcrypt");
+      expect(diagnostics).toContain("passphraseProvided=true");
+    }
+  });
+
+  it("rejects non-private-key text with actionable errors", () => {
+    expect(() => assertSshPrivateKeyText("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample user@host")).toThrow(/public key/i);
+    expect(() => loadPrivateKey("C:\\Users\\Administrator\\.ssh\\id_ed25519")).toThrow(/Paste the key contents/i);
+  });
+
   it("exports SSH public key blobs and builds signed auth requests", () => {
     const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const exported = exportSshPublicKeyBlob(publicKey, "rsa-sha2-256");
@@ -155,3 +237,42 @@ describe("SSH channel state manager", () => {
     expect(manager.get(open.localId)).toBeUndefined();
   });
 });
+
+function encodeOpenSshEd25519PrivateKey(privateKey: KeyObject): string {
+  const jwk = privateKey.export({ format: "jwk" });
+  const publicKey = Buffer.from(jwk.x!, "base64url");
+  const seed = Buffer.from(jwk.d!, "base64url");
+  const publicBlob = new SshBinaryWriter().string("ssh-ed25519").string(publicKey).toBuffer();
+  const privateBody = new SshBinaryWriter()
+    .uint32(0x12345678)
+    .uint32(0x12345678)
+    .string("ssh-ed25519")
+    .string(publicKey)
+    .string(Buffer.concat([seed, publicKey]))
+    .string("vitest")
+    .toBuffer();
+  const paddingLength = 8 - (privateBody.length % 8 || 8);
+  const padding = Buffer.alloc(paddingLength);
+  for (let index = 0; index < padding.length; index += 1) {
+    padding[index] = index + 1;
+  }
+  const privateBlock = Buffer.concat([privateBody, padding]);
+  const envelope = Buffer.concat([
+    Buffer.from("openssh-key-v1\0", "utf8"),
+    new SshBinaryWriter()
+      .string("none")
+      .string("none")
+      .string(Buffer.alloc(0))
+      .uint32(1)
+      .string(publicBlob)
+      .string(privateBlock)
+      .toBuffer()
+  ]);
+  return encodeOpenSshEnvelope(envelope.subarray(Buffer.from("openssh-key-v1\0", "utf8").length));
+}
+
+function encodeOpenSshEnvelope(payload: Buffer): string {
+  const envelope = Buffer.concat([Buffer.from("openssh-key-v1\0", "utf8"), payload]);
+  const base64 = envelope.toString("base64").match(/.{1,70}/gu)?.join("\n") ?? "";
+  return `-----BEGIN OPENSSH PRIVATE KEY-----\n${base64}\n-----END OPENSSH PRIVATE KEY-----`;
+}

@@ -6,6 +6,7 @@ export interface ChannelState {
   kind: "session" | "direct-tcpip";
   lifecycle: ChannelLifecycle;
   localWindow: number;
+  localWindowMaximum: number;
   remoteWindow: number;
   maximumPacketSize: number;
 }
@@ -14,7 +15,7 @@ export class ChannelStateManager {
   private readonly channels = new Map<number, ChannelState>();
   private nextLocalId = 0;
 
-  open(kind: ChannelState["kind"], localWindow = 1024 * 1024, maximumPacketSize = 32 * 1024): ChannelState {
+  open(kind: ChannelState["kind"], localWindow = 16 * 1024 * 1024, maximumPacketSize = 64 * 1024): ChannelState {
     const localId = this.nextLocalId;
     this.nextLocalId += 1;
     const state: ChannelState = {
@@ -22,6 +23,7 @@ export class ChannelStateManager {
       kind,
       lifecycle: "opening",
       localWindow,
+      localWindowMaximum: localWindow,
       remoteWindow: 0,
       maximumPacketSize
     };
@@ -59,6 +61,27 @@ export class ChannelStateManager {
       throw new Error("Window bytes must be a non-negative integer.");
     }
     state.remoteWindow += bytes;
+    return { ...state };
+  }
+
+  consumeLocalWindow(localId: number, bytes: number): ChannelState {
+    const state = this.requireOpen(localId);
+    if (bytes < 0 || !Number.isInteger(bytes)) {
+      throw new Error("Window bytes must be a non-negative integer.");
+    }
+    if (bytes > state.localWindow) {
+      throw new Error(`Channel ${localId} local window exhausted.`);
+    }
+    state.localWindow -= bytes;
+    return { ...state };
+  }
+
+  replenishLocalWindow(localId: number, bytes: number): ChannelState {
+    const state = this.requireOpen(localId);
+    if (bytes < 0 || !Number.isInteger(bytes)) {
+      throw new Error("Window bytes must be a non-negative integer.");
+    }
+    state.localWindow += bytes;
     return { ...state };
   }
 

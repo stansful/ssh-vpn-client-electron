@@ -16,7 +16,7 @@ import {
   SSH_MSG_USERAUTH_SUCCESS,
   messageNumber
 } from "./connection-messages.js";
-import { buildSignedPublicKeyAuthRequest, loadPrivateKey } from "./private-key.js";
+import { SshPrivateKeyLoadError, buildSignedPublicKeyAuthRequest, loadPrivateKey } from "./private-key.js";
 import type { PacketProtectionConfig } from "./packet-codec.js";
 import { SshSessionStateMachine, type ChannelEvent } from "./session-state.js";
 import { SshSocketTransport, type SshIdentificationExchange, type SshPacketTransportEvent } from "./socket-transport.js";
@@ -48,6 +48,16 @@ export type SshLiveClientEvent =
   | { type: "error"; error: Error }
   | { type: "close" };
 
+export class SshAuthenticationError extends Error {
+  readonly diagnostics: string[];
+
+  constructor(message: string, diagnostics: string[]) {
+    super(message);
+    this.name = "SshAuthenticationError";
+    this.diagnostics = diagnostics;
+  }
+}
+
 type PayloadWaiter = {
   predicate: (payload: Buffer) => boolean;
   resolve: (payload: Buffer) => void;
@@ -74,6 +84,7 @@ export class SshLiveClient {
   private closed = false;
   private terminalChannel: number | undefined;
   private keepaliveTimer: NodeJS.Timeout | undefined;
+  private lastActivityAt = Date.now();
 
   private constructor(
     private readonly transport: SshSocketTransport,
@@ -128,7 +139,28 @@ export class SshLiveClient {
     if (this.terminalChannel === undefined) {
       throw new Error("SSH shell channel is not open.");
     }
-    this.transport.send(this.session.buildChannelData(this.terminalChannel, Buffer.isBuffer(data) ? data : Buffer.from(data)));
+    await this.writeChannelDataFlowControlled(this.terminalChannel, Buffer.isBuffer(data) ? data : Buffer.from(data));
+  }
+
+  async closeShell(): Promise<void> {
+    if (this.terminalChannel === undefined) {
+      return;
+    }
+    const localChannel = this.terminalChannel;
+    this.terminalChannel = undefined;
+    this.markActivity();
+    try {
+      this.transport.send(this.session.buildChannelEof(localChannel));
+    } catch {
+      // Shell channel may already be closed by the server.
+    }
+    try {
+      this.transport.send(this.session.buildChannelClose(localChannel));
+    } catch {
+      // Shell channel may already be closed by the server.
+    }
+    this.channelEmitters.delete(localChannel);
+    this.rejectChannelWaiters(localChannel, new Error(`SSH channel ${localChannel} was closed.`));
   }
 
   async resizePty(columns: number, rows: number): Promise<void> {
@@ -152,11 +184,12 @@ export class SshLiveClient {
     return new SshDirectTcpIpChannel(channel.localId, emitter, this);
   }
 
-  writeDirectChannel(localChannel: number, data: Buffer): void {
-    this.transport.send(this.session.buildChannelData(localChannel, data));
+  async writeDirectChannel(localChannel: number, data: Buffer): Promise<void> {
+    await this.writeChannelDataFlowControlled(localChannel, data);
   }
 
   closeDirectChannel(localChannel: number): void {
+    this.markActivity();
     try {
       this.transport.send(this.session.buildChannelEof(localChannel));
     } catch {
@@ -167,6 +200,8 @@ export class SshLiveClient {
     } catch {
       // Channel may already be closed by the server.
     }
+    this.channelEmitters.delete(localChannel);
+    this.rejectChannelWaiters(localChannel, new Error(`SSH channel ${localChannel} was closed.`));
   }
 
   async checkTunnel(endpoint: string): Promise<void> {
@@ -176,6 +211,7 @@ export class SshLiveClient {
   }
 
   async sendKeepalive(): Promise<void> {
+    this.markActivity();
     this.transport.send(encodeKeepaliveRequest());
     await this.waitForGlobalResponse(this.operationTimeoutMs());
   }
@@ -243,6 +279,7 @@ export class SshLiveClient {
     this.session.receiveServiceAccept(serviceAccept);
 
     const errors: string[] = [];
+    const diagnostics: string[] = [];
     if (this.options.privateKey) {
       try {
         const key = loadPrivateKey(this.options.privateKey, this.options.privateKeyPassphrase || undefined);
@@ -261,6 +298,9 @@ export class SshLiveClient {
         errors.push("private-key auth rejected");
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
+        if (error instanceof SshPrivateKeyLoadError) {
+          diagnostics.push(...error.diagnostics);
+        }
       }
     }
 
@@ -272,7 +312,10 @@ export class SshLiveClient {
       errors.push("password auth rejected");
     }
 
-    throw new Error(errors.length > 0 ? `SSH authentication failed: ${errors.join("; ")}` : "SSH authentication failed: no auth method available.");
+    throw new SshAuthenticationError(
+      errors.length > 0 ? `SSH authentication failed: ${errors.join("; ")}` : "SSH authentication failed: no auth method available.",
+      diagnostics
+    );
   }
 
   private async waitForAuthSuccess(): Promise<boolean> {
@@ -295,11 +338,15 @@ export class SshLiveClient {
   }
 
   private startKeepalive(): void {
-    const intervalMs = Math.max(0, this.options.keepaliveIntervalSec ?? 0) * 1000;
+    const configuredIntervalSec = this.options.keepaliveIntervalSec ?? 0;
+    const intervalMs = (configuredIntervalSec <= 0 ? 0 : Math.max(60, configuredIntervalSec)) * 1000;
     if (intervalMs <= 0) {
       return;
     }
     this.keepaliveTimer = setInterval(() => {
+      if (Date.now() - this.lastActivityAt < intervalMs) {
+        return;
+      }
       void this.sendKeepalive().catch((error: unknown) => {
         const normalized = error instanceof Error ? error : new Error(String(error));
         this.events.emit("event", { type: "error", error: normalized } satisfies SshLiveClientEvent);
@@ -318,6 +365,7 @@ export class SshLiveClient {
 
   private handleTransportEvent(event: SshPacketTransportEvent): void {
     if (event.type === "payload") {
+      this.markActivity();
       if (this.runtimeDispatchEnabled) {
         this.dispatchRuntimePayload(event.payload);
       } else {
@@ -351,6 +399,9 @@ export class SshLiveClient {
     }
     if (isChannelMessage(number)) {
       const channelEvent = this.session.receiveChannelMessage(payload);
+      if (channelEvent.windowAdjustPayload) {
+        this.transport.send(channelEvent.windowAdjustPayload);
+      }
       this.emitChannelEvent(channelEvent);
     }
   }
@@ -487,6 +538,37 @@ export class SshLiveClient {
     }
   }
 
+  private async writeChannelDataFlowControlled(localChannel: number, data: Buffer): Promise<void> {
+    let offset = 0;
+    while (offset < data.length) {
+      const { payloads, bytesWritten } = this.session.buildChannelDataFrames(localChannel, data.subarray(offset));
+      if (payloads.length > 0) {
+        this.markActivity();
+        for (const payload of payloads) {
+          this.transport.send(payload);
+        }
+        offset += bytesWritten;
+        continue;
+      }
+      await this.waitForChannelWriteWindow(localChannel);
+    }
+  }
+
+  private async waitForChannelWriteWindow(localChannel: number): Promise<void> {
+    const event = await this.waitForChannelEvent(
+      localChannel,
+      (candidate) =>
+        candidate.type === "window-adjust" ||
+        candidate.type === "close" ||
+        candidate.type === "eof" ||
+        candidate.type === "open-failed",
+      this.operationTimeoutMs()
+    );
+    if (event.type !== "window-adjust") {
+      throw new Error(`SSH channel ${localChannel} closed before queued data was written.`);
+    }
+  }
+
   private rejectWaiters(error: Error): void {
     for (const waiter of this.payloadWaiters.splice(0)) {
       clearTimeout(waiter.timer);
@@ -498,12 +580,30 @@ export class SshLiveClient {
     }
   }
 
+  private rejectChannelWaiters(localChannel: number, error: Error): void {
+    for (const waiter of [...this.channelWaiters]) {
+      if (waiter.localChannel !== localChannel) {
+        continue;
+      }
+      this.channelWaiters.splice(this.channelWaiters.indexOf(waiter), 1);
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+  }
+
   private operationTimeoutMs(): number {
     return this.options.operationTimeoutMs ?? 15000;
+  }
+
+  private markActivity(): void {
+    this.lastActivityAt = Date.now();
   }
 }
 
 class SshDirectTcpIpChannel implements DirectTcpIpChannel {
+  private closed = false;
+  private writeQueue: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly localChannel: number,
     private readonly emitter: EventEmitter,
@@ -511,10 +611,24 @@ class SshDirectTcpIpChannel implements DirectTcpIpChannel {
   ) {}
 
   async write(data: Buffer): Promise<void> {
-    this.client.writeDirectChannel(this.localChannel, data);
+    if (this.closed) {
+      throw new Error("Direct TCP channel is closed.");
+    }
+    const write = this.writeQueue.then(() => {
+      if (this.closed) {
+        throw new Error("Direct TCP channel is closed.");
+      }
+      return this.client.writeDirectChannel(this.localChannel, data);
+    });
+    this.writeQueue = write.catch(() => undefined);
+    await write;
   }
 
   async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
     this.client.closeDirectChannel(this.localChannel);
   }
 
@@ -524,8 +638,12 @@ class SshDirectTcpIpChannel implements DirectTcpIpChannel {
   }
 
   onClose(listener: () => void): () => void {
-    this.emitter.on("close", listener);
-    return () => this.emitter.off("close", listener);
+    const wrapped = (): void => {
+      this.closed = true;
+      listener();
+    };
+    this.emitter.on("close", wrapped);
+    return () => this.emitter.off("close", wrapped);
   }
 
   onError(listener: (error: Error) => void): () => void {

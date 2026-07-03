@@ -17,15 +17,20 @@ export const IPC_CHANNELS = {
   deleteConfig: "shadow-ssh:delete-config",
   selectConfig: "shadow-ssh:select-config",
   upsertKey: "shadow-ssh:upsert-key",
+  copyPrivateKey: "shadow-ssh:copy-private-key",
   deleteKey: "shadow-ssh:delete-key",
   updateSettings: "shadow-ssh:update-settings",
   updateRoutingMode: "shadow-ssh:update-routing-mode",
   updateRoutingRules: "shadow-ssh:update-routing-rules",
+  clearDiagnostics: "shadow-ssh:clear-diagnostics",
+  readLogFile: "shadow-ssh:read-log-file",
+  clearLogFile: "shadow-ssh:clear-log-file",
   listProcesses: "shadow-ssh:list-processes",
   connect: "shadow-ssh:connect",
   disconnect: "shadow-ssh:disconnect",
   checkTunnel: "shadow-ssh:check-tunnel",
   openTerminal: "shadow-ssh:open-terminal",
+  closeTerminal: "shadow-ssh:close-terminal",
   terminalInput: "shadow-ssh:terminal-input",
   serviceEvent: "shadow-ssh:service-event"
 } as const;
@@ -43,15 +48,20 @@ export interface ShadowSshApi {
   deleteConfig(id: string): Promise<AppSnapshot>;
   selectConfig(id: string): Promise<AppSnapshot>;
   upsertKey(input: UpsertSshKeyInput): Promise<AppSnapshot>;
+  copyPrivateKey(id: string): Promise<boolean>;
   deleteKey(id: string): Promise<AppSnapshot>;
   updateSettings(settings: AppSettings): Promise<AppSnapshot>;
   updateRoutingMode(mode: RoutingMode): Promise<AppSnapshot>;
   updateRoutingRules(rules: RoutingRule[]): Promise<AppSnapshot>;
+  clearDiagnostics(): Promise<AppSnapshot>;
+  readLogFile(): Promise<string>;
+  clearLogFile(): Promise<string>;
   listProcesses(): Promise<string[]>;
   connect(): Promise<AppSnapshot>;
   disconnect(): Promise<AppSnapshot>;
   checkTunnel(endpoint?: string): Promise<AppSnapshot>;
   openTerminal(): Promise<AppSnapshot>;
+  closeTerminal(): Promise<AppSnapshot>;
   terminalInput(input: string): Promise<void>;
   onServiceEvent(callback: (event: ServiceEvent) => void): () => void;
 }

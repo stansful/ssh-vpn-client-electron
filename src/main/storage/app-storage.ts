@@ -1,8 +1,9 @@
 import { app, safeStorage } from "electron";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { assertSshPrivateKeyText, normalizeSshPrivateKeyText } from "../../core/ssh/private-key.js";
 import { createDefaultStore, STORE_SCHEMA_VERSION } from "../../shared/defaults.js";
 import type {
   AppSettings,
@@ -38,6 +39,8 @@ export class AppStorage {
   private readonly secretPath: string;
   private store: AppStore = createDefaultStore();
   private secrets: SecretStore = { schemaVersion: 1, secrets: {} };
+  private storePersistQueue: Promise<void> = Promise.resolve();
+  private secretsPersistQueue: Promise<void> = Promise.resolve();
 
   constructor(dataDir = path.join(app.getPath("userData"), "storage")) {
     this.dataDir = dataDir;
@@ -49,6 +52,7 @@ export class AppStorage {
     await mkdir(this.dataDir, { recursive: true });
     this.store = normalizeStore(await readJson<AppStore>(this.storePath, createDefaultStore()));
     this.secrets = await readJson<SecretStore>(this.secretPath, { schemaVersion: 1, secrets: {} });
+    this.migrateConfigPassphrasesToKeys();
     await this.persistStore();
     await this.persistSecrets();
   }
@@ -64,10 +68,6 @@ export class AppStorage {
       input.password !== undefined && input.password.length > 0
         ? await this.saveSecret("ssh-password", input.password, existing?.passwordSecretId)
         : existing?.passwordSecretId;
-    const passphraseSecretId =
-      input.privateKeyPassphrase !== undefined && input.privateKeyPassphrase.length > 0
-        ? await this.saveSecret("private-key-passphrase", input.privateKeyPassphrase, existing?.privateKeyPassphraseSecretId)
-        : existing?.privateKeyPassphraseSecretId;
 
     const config: SshConfig = {
       id: existing?.id ?? randomUUID(),
@@ -78,9 +78,9 @@ export class AppStorage {
       authType: input.authType,
       passwordSecretId,
       privateKeyId: input.authType === "private-key" ? input.privateKeyId : undefined,
-      privateKeyPassphraseSecretId: input.authType === "private-key" ? passphraseSecretId : undefined,
+      privateKeyPassphraseSecretId: undefined,
       expectedServerFingerprint: input.expectedServerFingerprint.trim(),
-      keepaliveIntervalSec: Number(input.keepaliveIntervalSec),
+      keepaliveIntervalSec: Math.max(60, Number(input.keepaliveIntervalSec)),
       note: input.note.trim(),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
@@ -134,11 +134,20 @@ export class AppStorage {
     if (!existing && !input.privateKey) {
       throw new Error("Private key is required for a new key.");
     }
+    const normalizedPrivateKey =
+      input.privateKey !== undefined && input.privateKey.length > 0 ? normalizeSshPrivateKeyText(input.privateKey) : undefined;
+    if (normalizedPrivateKey !== undefined) {
+      assertSshPrivateKeyText(normalizedPrivateKey);
+    }
 
     const privateKeySecretId =
-      input.privateKey !== undefined && input.privateKey.length > 0
-        ? await this.saveSecret("private-key", input.privateKey, existing?.privateKeySecretId)
+      normalizedPrivateKey !== undefined
+        ? await this.saveSecret("private-key", normalizedPrivateKey, existing?.privateKeySecretId)
         : existing?.privateKeySecretId;
+    const privateKeyPassphraseSecretId =
+      input.privateKeyPassphrase !== undefined && input.privateKeyPassphrase.length > 0
+        ? await this.saveSecret("private-key-passphrase", input.privateKeyPassphrase, existing?.privateKeyPassphraseSecretId)
+        : existing?.privateKeyPassphraseSecretId;
 
     if (!privateKeySecretId) {
       throw new Error("Private key secret is missing.");
@@ -148,7 +157,8 @@ export class AppStorage {
       id: existing?.id ?? randomUUID(),
       name: input.name.trim(),
       privateKeySecretId,
-      fingerprint: input.privateKey ? fingerprintSecret(input.privateKey) : existing?.fingerprint ?? "",
+      privateKeyPassphraseSecretId,
+      fingerprint: normalizedPrivateKey ? fingerprintSecret(normalizedPrivateKey) : existing?.fingerprint ?? "",
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     };
@@ -171,7 +181,10 @@ export class AppStorage {
     const existing = this.store.sshKeys.find((key) => key.id === id);
     if (existing) {
       this.store.sshKeys = this.store.sshKeys.filter((key) => key.id !== id);
-      await this.deleteSecret(existing.privateKeySecretId);
+      await Promise.all([
+        this.deleteSecret(existing.privateKeySecretId),
+        existing.privateKeyPassphraseSecretId ? this.deleteSecret(existing.privateKeyPassphraseSecretId) : Promise.resolve()
+      ]);
       await this.persistStore();
     }
 
@@ -200,8 +213,18 @@ export class AppStorage {
     return {
       password: config.passwordSecretId ? this.readSecret(config.passwordSecretId) : undefined,
       privateKey: config.privateKeyId ? this.readPrivateKeySecret(config.privateKeyId) : undefined,
-      privateKeyPassphrase: config.privateKeyPassphraseSecretId ? this.readSecret(config.privateKeyPassphraseSecretId) : undefined
+      privateKeyPassphrase: config.privateKeyId
+        ? this.readPrivateKeyPassphraseSecret(config.privateKeyId) ?? (config.privateKeyPassphraseSecretId ? this.readSecret(config.privateKeyPassphraseSecretId) : undefined)
+        : undefined
     };
+  }
+
+  readPrivateKeyText(privateKeyId: string): string {
+    const privateKey = this.readPrivateKeySecret(privateKeyId);
+    if (!privateKey) {
+      throw new Error("SSH key does not exist.");
+    }
+    return privateKey;
   }
 
   private async saveSecret(kind: SecretKind, value: string, existingId?: string): Promise<string> {
@@ -238,12 +261,49 @@ export class AppStorage {
     return key ? this.readSecret(key.privateKeySecretId) : undefined;
   }
 
+  private readPrivateKeyPassphraseSecret(privateKeyId: string): string | undefined {
+    const key = this.store.sshKeys.find((candidate) => candidate.id === privateKeyId);
+    return key?.privateKeyPassphraseSecretId ? this.readSecret(key.privateKeyPassphraseSecretId) : undefined;
+  }
+
+  private migrateConfigPassphrasesToKeys(): void {
+    const usedPassphraseSecretIds = new Set<string>();
+    this.store.sshKeys = this.store.sshKeys.map((key) => {
+      if (key.privateKeyPassphraseSecretId) {
+        usedPassphraseSecretIds.add(key.privateKeyPassphraseSecretId);
+        return key;
+      }
+      const configPassphrase = this.store.sshConfigs.find(
+        (config) => config.privateKeyId === key.id && config.privateKeyPassphraseSecretId
+      )?.privateKeyPassphraseSecretId;
+      if (!configPassphrase) {
+        return key;
+      }
+      usedPassphraseSecretIds.add(configPassphrase);
+      return { ...key, privateKeyPassphraseSecretId: configPassphrase };
+    });
+
+    this.store.sshConfigs = this.store.sshConfigs.map((config) => {
+      if (!config.privateKeyPassphraseSecretId) {
+        return config;
+      }
+      if (!usedPassphraseSecretIds.has(config.privateKeyPassphraseSecretId)) {
+        delete this.secrets.secrets[config.privateKeyPassphraseSecretId];
+      }
+      return { ...config, privateKeyPassphraseSecretId: undefined };
+    });
+  }
+
   private async persistStore(): Promise<void> {
-    await writeJsonAtomic(this.storePath, this.store);
+    const write = this.storePersistQueue.then(() => writeJsonAtomic(this.storePath, this.store));
+    this.storePersistQueue = write.catch(() => undefined);
+    await write;
   }
 
   private async persistSecrets(): Promise<void> {
-    await writeJsonAtomic(this.secretPath, this.secrets);
+    const write = this.secretsPersistQueue.then(() => writeJsonAtomic(this.secretPath, this.secrets));
+    this.secretsPersistQueue = write.catch(() => undefined);
+    await write;
   }
 }
 
@@ -316,10 +376,16 @@ async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   }
 }
 
-async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
-  const tmpPath = `${filePath}.${process.pid}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(tmpPath, filePath);
+export async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await rename(tmpPath, filePath);
+  } catch (error) {
+    await rm(tmpPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function createFallbackKey(dataDir: string): Buffer {

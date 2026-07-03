@@ -6,7 +6,11 @@ export const DEFAULT_CUSTOM_THEME: CustomTheme = {
   accent: { r: 246, g: 139, b: 0 },
   success: { r: 31, g: 145, b: 97 },
   danger: { r: 207, g: 63, b: 75 },
-  surface: { r: 248, g: 249, b: 251 }
+  background: { r: 237, g: 240, b: 244 },
+  surface: { r: 248, g: 249, b: 251 },
+  text: { r: 23, g: 24, b: 32 },
+  muted: { r: 104, g: 113, b: 129 },
+  border: { r: 216, g: 221, b: 230 }
 };
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -14,7 +18,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   customTheme: DEFAULT_CUSTOM_THEME,
   diagnosticsExpanded: false,
   terminalExpanded: false,
-  checkEndpoint: "youtube.com:443"
+  checkEndpoint: "youtube.com:443",
+  loggingEnabled: true,
+  diagnosticsLoggingEnabled: true,
+  fileLoggingEnabled: true,
+  closeToTrayEnabled: true
 };
 
 export function createDefaultStore(): AppStore {

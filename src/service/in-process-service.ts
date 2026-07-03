@@ -111,6 +111,10 @@ export class InProcessServiceBridge implements ServiceBridge {
     this.appendTerminal("system", "Shell channel is waiting for native SSH core.\n$ ");
   }
 
+  async closeTerminal(): Promise<void> {
+    this.appendTerminal("system", "\nShell channel closed.\n");
+  }
+
   async terminalInput(input: string): Promise<void> {
     void input;
     if (this.status.state !== "Connected") {

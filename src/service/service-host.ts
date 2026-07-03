@@ -1,4 +1,6 @@
 import net from "node:net";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
 import { createDefaultRuntimeStatus } from "../shared/defaults.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { RoutingRule, SshConfig } from "../shared/types.js";
@@ -30,6 +32,10 @@ const server = net.createServer((socket) => {
   socket.on("error", () => cleanupSocket(socket));
   socket.on("close", () => cleanupSocket(socket));
 });
+
+if (process.platform !== "win32") {
+  await mkdir(path.dirname(endpoint), { recursive: true });
+}
 
 server.listen(endpoint, () => {
   process.stdout.write(`shadow-ssh service simulator listening on ${endpoint}\n`);
@@ -81,6 +87,9 @@ async function executeCommand(command: ServiceCommand): Promise<ServiceResponseP
       return bridge.checkTunnel(command.payload.endpoint);
     case "open-terminal":
       await bridge.openTerminal();
+      return { accepted: true };
+    case "close-terminal":
+      await bridge.closeTerminal();
       return { accepted: true };
     case "terminal-input":
       await bridge.terminalInput(command.payload.input);

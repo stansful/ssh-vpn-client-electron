@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const serviceDir = path.join(root, "native", "service-go");
+const goCacheDir = path.join(root, ".cache", "go-build");
 const targets = [
   { goos: "windows", goarch: "amd64", out: path.join(root, "native", "windows", "x64", "shadow-ssh-service.exe") },
   { goos: "windows", goarch: "arm64", out: path.join(root, "native", "windows", "arm64", "shadow-ssh-service.exe") },
@@ -14,18 +15,26 @@ const targets = [
   { goos: "linux", goarch: "arm64", out: path.join(root, "native", "linux", "arm64", "shadow-ssh-service") }
 ];
 
+await mkdir(goCacheDir, { recursive: true });
+
 for (const target of targets) {
   await mkdir(path.dirname(target.out), { recursive: true });
   await run("go", ["build", "-trimpath", "-ldflags", "-s -w", "-o", target.out, "./cmd/shadow-ssh-service"], {
     cwd: serviceDir,
-    env: {
-      ...process.env,
+    env: createGoEnv({
       CGO_ENABLED: "0",
       GOOS: target.goos,
       GOARCH: target.goarch
-    }
+    })
   });
   console.log(`built ${path.relative(root, target.out)}`);
+}
+
+function createGoEnv(extra = {}) {
+  const env = { ...process.env };
+  delete env.GOROOT;
+  delete env.GOTOOLDIR;
+  return { ...env, GOCACHE: goCacheDir, ...extra };
 }
 
 function run(command, args, options) {

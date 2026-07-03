@@ -23,6 +23,7 @@ export interface SshConfig {
   authType: AuthType;
   passwordSecretId?: string;
   privateKeyId?: string;
+  /** @deprecated Private-key passphrases belong to SSH keys. Kept for migration from older stores. */
   privateKeyPassphraseSecretId?: string;
   expectedServerFingerprint: string;
   keepaliveIntervalSec: number;
@@ -40,7 +41,6 @@ export interface UpsertSshConfigInput {
   authType: AuthType;
   password?: string;
   privateKeyId?: string;
-  privateKeyPassphrase?: string;
   expectedServerFingerprint: string;
   keepaliveIntervalSec: number;
   note: string;
@@ -50,6 +50,7 @@ export interface SshKeyMetadata {
   id: string;
   name: string;
   privateKeySecretId: string;
+  privateKeyPassphraseSecretId?: string;
   fingerprint: string;
   createdAt: string;
   updatedAt: string;
@@ -59,6 +60,7 @@ export interface UpsertSshKeyInput {
   id?: string;
   name: string;
   privateKey?: string;
+  privateKeyPassphrase?: string;
 }
 
 export interface RoutingRule {
@@ -80,7 +82,11 @@ export interface CustomTheme {
   accent: RgbColor;
   success: RgbColor;
   danger: RgbColor;
+  background: RgbColor;
   surface: RgbColor;
+  text: RgbColor;
+  muted: RgbColor;
+  border: RgbColor;
 }
 
 export interface AppSettings {
@@ -89,6 +95,10 @@ export interface AppSettings {
   diagnosticsExpanded: boolean;
   terminalExpanded: boolean;
   checkEndpoint: string;
+  loggingEnabled: boolean;
+  diagnosticsLoggingEnabled: boolean;
+  fileLoggingEnabled: boolean;
+  closeToTrayEnabled: boolean;
 }
 
 export interface AppStore {
@@ -160,5 +170,6 @@ export interface AppSnapshot {
   runtime: RuntimeStatus;
   diagnostics: DiagnosticsEntry[];
   terminal: TerminalLine[];
+  logFilePaths: string[];
   lastTunnelCheck?: TunnelCheckResult;
 }

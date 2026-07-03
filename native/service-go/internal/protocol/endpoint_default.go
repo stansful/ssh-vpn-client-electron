@@ -13,10 +13,13 @@ import (
 )
 
 func DefaultEndpoint() string {
-	return filepath.Join(os.TempDir(), "shadow-ssh-"+strconv.Itoa(os.Getuid())+".sock")
+	return filepath.Join(defaultRuntimeDirectory(), "shadow-ssh-"+strconv.Itoa(os.Getuid())+".sock")
 }
 
 func ServeEndpoint(ctx context.Context, endpoint string, handler Handler) error {
+	if err := os.MkdirAll(filepath.Dir(endpoint), 0o700); err != nil {
+		return err
+	}
 	if err := os.Remove(endpoint); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -60,4 +63,18 @@ func ServeEndpoint(ctx context.Context, endpoint string, handler Handler) error 
 			}
 		}()
 	}
+}
+
+func defaultRuntimeDirectory() string {
+	if value := os.Getenv("SHADOW_SSH_RUNTIME_DIR"); value != "" {
+		return value
+	}
+	if value := os.Getenv("XDG_RUNTIME_DIR"); value != "" {
+		return value
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "."
+	}
+	return filepath.Join(home, ".shadow-ssh", "run")
 }

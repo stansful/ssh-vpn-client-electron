@@ -9,9 +9,11 @@ export type ServiceCommand = { id: string; authToken?: string } & (
   | { type: "disconnect" }
   | { type: "check-tunnel"; payload: { endpoint: string } }
   | { type: "open-terminal" }
+  | { type: "close-terminal" }
   | { type: "terminal-input"; payload: { input: string } }
   | { type: "update-config"; payload: { config: SshConfig } }
   | { type: "update-routing-rules"; payload: { rules: RoutingRule[] } }
+  | { type: "list-process-connections" }
   | { type: "shutdown" }
 );
 
@@ -29,7 +31,8 @@ export function defaultServiceEndpoint(appName = "shadow-ssh"): string {
   }
 
   const userId = typeof process.getuid === "function" ? process.getuid() : os.userInfo().username;
-  return path.join(os.tmpdir(), `${appName}-${userId}.sock`);
+  const runtimeDirectory = process.env.SHADOW_SSH_RUNTIME_DIR || process.env.XDG_RUNTIME_DIR || path.join(os.homedir(), ".shadow-ssh", "run");
+  return path.join(runtimeDirectory, `${appName}-${userId}.sock`);
 }
 
 export function encodeWireMessage(message: ServiceWireMessage): string {

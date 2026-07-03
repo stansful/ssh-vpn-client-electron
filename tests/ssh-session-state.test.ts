@@ -3,7 +3,10 @@ import { SshBinaryReader, SshBinaryWriter } from "../src/core/ssh/binary.js";
 import {
   SSH_MSG_CHANNEL_CLOSE,
   SSH_MSG_CHANNEL_DATA,
+  SSH_MSG_CHANNEL_EOF,
+  SSH_MSG_CHANNEL_FAILURE,
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+  SSH_MSG_CHANNEL_SUCCESS,
   SSH_MSG_CHANNEL_WINDOW_ADJUST,
   SSH_MSG_NEWKEYS,
   SSH_MSG_SERVICE_ACCEPT,
@@ -146,6 +149,58 @@ describe("SSH session state machine", () => {
     expect(session.getChannel(0)).toBeUndefined();
   });
 
+  it("chunks outbound channel data by remote packet size and remote window", () => {
+    const session = authenticatedReadySession("authenticated");
+    const opened = session.openDirectTcpIpChannel({
+      hostToConnect: "download.example.com",
+      portToConnect: 443,
+      originatorIpAddress: "127.0.0.1",
+      originatorPort: 50000
+    });
+    session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(opened.channel.localId)
+        .uint32(12)
+        .uint32(10)
+        .uint32(4)
+        .toBuffer()
+    );
+
+    const result = session.buildChannelDataFrames(opened.channel.localId, Buffer.from("abcdefghijklmnop"));
+    expect(result.bytesWritten).toBe(10);
+    expect(result.payloads).toHaveLength(3);
+    const frameSizes = result.payloads.map((payload) => {
+      const reader = new SshBinaryReader(payload);
+      expect(reader.byte()).toBe(SSH_MSG_CHANNEL_DATA);
+      expect(reader.uint32()).toBe(12);
+      return reader.string().length;
+    });
+    expect(frameSizes).toEqual([4, 4, 2]);
+    expect(session.getChannel(opened.channel.localId)?.remoteWindow).toBe(0);
+  });
+
+  it("rejects single outbound channel data frames larger than the remote packet size", () => {
+    const session = authenticatedReadySession("authenticated");
+    const opened = session.openDirectTcpIpChannel({
+      hostToConnect: "download.example.com",
+      portToConnect: 443,
+      originatorIpAddress: "127.0.0.1",
+      originatorPort: 50000
+    });
+    session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(opened.channel.localId)
+        .uint32(12)
+        .uint32(10)
+        .uint32(4)
+        .toBuffer()
+    );
+
+    expect(() => session.buildChannelData(opened.channel.localId, Buffer.from("abcde"))).toThrow("maximum packet size exceeded");
+  });
+
   it("treats remote channel id zero as a valid confirmed channel", () => {
     const session = authenticatedReadySession("authenticated");
     const opened = session.openDirectTcpIpChannel({
@@ -168,6 +223,76 @@ describe("SSH session state machine", () => {
     const reader = new SshBinaryReader(payload);
     reader.byte();
     expect(reader.uint32()).toBe(0);
+  });
+
+  it("sends window adjust when inbound streaming data drains the local window", () => {
+    const session = authenticatedReadySession("authenticated");
+    const opened = session.openDirectTcpIpChannel({
+      hostToConnect: "video-edge.example.com",
+      portToConnect: 443,
+      originatorIpAddress: "127.0.0.1",
+      originatorPort: 50000
+    });
+    session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(opened.channel.localId)
+        .uint32(7)
+        .uint32(1024 * 1024)
+        .uint32(65536)
+        .toBuffer()
+    );
+
+    const chunk = Buffer.alloc(9 * 1024 * 1024);
+    const event = session.receiveChannelMessage(
+      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(opened.channel.localId).string(chunk).toBuffer()
+    );
+
+    expect(event.type).toBe("data");
+    expect(event.windowAdjustPayload).toBeDefined();
+    const adjust = new SshBinaryReader(event.windowAdjustPayload!);
+    expect(adjust.byte()).toBe(SSH_MSG_CHANNEL_WINDOW_ADJUST);
+    expect(adjust.uint32()).toBe(7);
+    expect(adjust.uint32()).toBe(9 * 1024 * 1024);
+    expect(session.getChannel(opened.channel.localId)?.localWindow).toBe(16 * 1024 * 1024);
+  });
+
+  it("ignores late channel messages for locally closed direct-tcpip checks", () => {
+    const session = authenticatedReadySession("authenticated");
+    const opened = session.openDirectTcpIpChannel({
+      hostToConnect: "example.com",
+      portToConnect: 443,
+      originatorIpAddress: "127.0.0.1",
+      originatorPort: 50000
+    });
+    session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(opened.channel.localId)
+        .uint32(7)
+        .uint32(1024 * 1024)
+        .uint32(65536)
+        .toBuffer()
+    );
+
+    session.buildChannelClose(opened.channel.localId);
+    expect(session.getChannel(opened.channel.localId)).toBeUndefined();
+
+    const lateMessages = [
+      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_EOF).uint32(opened.channel.localId).toBuffer(),
+      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_CLOSE).uint32(opened.channel.localId).toBuffer(),
+      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(opened.channel.localId).string(Buffer.from("late")).toBuffer(),
+      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_WINDOW_ADJUST).uint32(opened.channel.localId).uint32(1024).toBuffer(),
+      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_SUCCESS).uint32(opened.channel.localId).toBuffer(),
+      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_FAILURE).uint32(opened.channel.localId).toBuffer()
+    ];
+
+    for (const payload of lateMessages) {
+      expect(session.receiveChannelMessage(payload)).toMatchObject({
+        type: "ignored",
+        localChannel: opened.channel.localId
+      });
+    }
   });
 });
 

@@ -4,32 +4,73 @@
   "private": true,
   "description": "Desktop client for shadow-ssh with Electron, TypeScript, and a platform-ready service boundary.",
   "type": "module",
-  "main": "dist/main/main.js",
+  "main": "dist/main/bootstrap.cjs",
+  "desktopName": "shadow-ssh",
   "author": "shadow-ssh",
   "license": "UNLICENSED",
   "scripts": {
-    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"tsc -p tsconfig.node.json --watch --preserveWatchOutput\" \"wait-on tcp:5173 dist/main/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"tsc -p tsconfig.node.json --watch --preserveWatchOutput\" \"wait-on tcp:5173 dist/main/bootstrap.cjs dist/main/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build:node": "tsc -p tsconfig.node.json",
     "build": "npm run typecheck && vite build && tsc -p tsconfig.node.json",
-    "build:dev-exe": "cross-env NODE_ENV=development SHADOW_SSH_BUILD_CHANNEL=development npm run build && electron-builder --win nsis --config.productName=\"Shadow SSH Dev\" --config.artifactName=\"shadow-ssh-dev-${version}-${arch}.${ext}\"",
-    "build:prod-exe": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run build && electron-builder --win nsis",
+    "package:prepare": "npm run native:build-service && npm run build",
+    "build:dev-exe": "cross-env NODE_ENV=development SHADOW_SSH_BUILD_CHANNEL=development npm run package:prepare && npm run pack:dev-win-exe-x64 && npm run pack:dev-win-exe-arm64",
+    "build:prod": "npm run build:portable",
+    "build:prod-all": "npm run build:portable-all",
+    "build:prod-win": "npm run build:portable-win",
+    "build:prod-exe": "npm run build:portable-win-exe",
+    "build:prod-mac": "npm run build:portable-mac",
+    "build:prod-macos": "npm run build:portable-mac",
+    "build:prod-linux": "npm run build:portable-linux",
+    "build:portable": "npm run clean:release && npm run build:portable-all",
+    "build:portable-all": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:portable-win && npm run pack:portable-mac && npm run pack:portable-linux",
+    "build:portable-win": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:portable-win",
+    "build:portable-win-dir": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:portable-win-dir",
+    "build:portable-win-exe": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:portable-win-exe",
+    "build:portable-mac": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:portable-mac",
+    "build:portable-macos": "npm run build:portable-mac",
+    "build:portable-linux": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:portable-linux",
+    "build:installer-win": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:installer-win",
+    "build:package-mac": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:mac-dmg",
+    "build:package-linux": "cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:linux-deb",
+    "pack:portable-win": "npm run pack:portable-win-dir && npm run pack:portable-win-exe",
+    "pack:portable-win-dir": "npm run pack:win-dir-x64 && npm run pack:win-dir-arm64",
+    "pack:portable-win-exe": "npm run pack:win-exe-x64 && npm run pack:win-exe-arm64",
+    "pack:portable-mac": "npm run pack:mac-dir-x64 && npm run pack:mac-dir-arm64",
+    "pack:portable-linux": "npm run pack:linux-appimage-x64 && npm run pack:linux-appimage-arm64",
+    "pack:installer-win": "npm run pack:win-nsis-x64 && npm run pack:win-nsis-arm64",
+    "pack:mac-dmg": "npm run pack:mac-dmg-x64 && npm run pack:mac-dmg-arm64",
+    "pack:linux-deb": "npm run pack:linux-deb-x64 && npm run pack:linux-deb-arm64",
+    "pack:win-dir-x64": "node scripts/electron-builder-with-local-dist.mjs --win dir --x64",
+    "pack:win-dir-arm64": "node scripts/electron-builder-with-local-dist.mjs --win dir --arm64",
+    "pack:win-exe-x64": "node scripts/electron-builder-with-local-dist.mjs --win portable --x64",
+    "pack:win-exe-arm64": "node scripts/electron-builder-with-local-dist.mjs --win portable --arm64",
+    "pack:win-nsis-x64": "node scripts/electron-builder-with-local-dist.mjs --win nsis --x64",
+    "pack:win-nsis-arm64": "node scripts/electron-builder-with-local-dist.mjs --win nsis --arm64",
+    "pack:dev-win-exe-x64": "node scripts/electron-builder-with-local-dist.mjs --win portable --x64 --config.productName=\"Shadow SSH Dev\" --config.artifactName=\"shadow-ssh-dev-${version}-windows-portable-${arch}.${ext}\"",
+    "pack:dev-win-exe-arm64": "node scripts/electron-builder-with-local-dist.mjs --win portable --arm64 --config.productName=\"Shadow SSH Dev\" --config.artifactName=\"shadow-ssh-dev-${version}-windows-portable-${arch}.${ext}\"",
+    "pack:mac-dir-x64": "node scripts/electron-builder-with-local-dist.mjs --mac dir --x64",
+    "pack:mac-dir-arm64": "node scripts/electron-builder-with-local-dist.mjs --mac dir --arm64",
+    "pack:mac-dmg-x64": "node scripts/electron-builder-with-local-dist.mjs --mac dmg --x64",
+    "pack:mac-dmg-arm64": "node scripts/electron-builder-with-local-dist.mjs --mac dmg --arm64",
+    "pack:linux-appimage-x64": "node scripts/electron-builder-with-local-dist.mjs --linux AppImage --x64",
+    "pack:linux-appimage-arm64": "node scripts/electron-builder-with-local-dist.mjs --linux AppImage --arm64",
+    "pack:linux-deb-x64": "node scripts/electron-builder-with-local-dist.mjs --linux deb --x64",
+    "pack:linux-deb-arm64": "node scripts/electron-builder-with-local-dist.mjs --linux deb --arm64",
     "service:simulator": "npm run build:node && node dist/service/service-host.js",
     "service:install": "powershell -ExecutionPolicy Bypass -File scripts/install-service.ps1",
     "service:uninstall": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-service.ps1",
     "service:start": "powershell -ExecutionPolicy Bypass -File scripts/start-service.ps1",
     "service:stop": "powershell -ExecutionPolicy Bypass -File scripts/stop-service.ps1",
     "signing:check": "powershell -ExecutionPolicy Bypass -File scripts/check-signing-env.ps1",
+    "icons:transparent": "node scripts/ensure-transparent-icons.mjs && node scripts/generate-macos-icon.mjs",
+    "icons:mac": "node scripts/generate-macos-icon.mjs",
     "native:test-service": "node scripts/test-native-service.mjs",
     "native:build-service": "node scripts/build-native-service.mjs",
     "test": "vitest run",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "clean:release": "rimraf release",
     "clean": "rimraf dist release coverage .vite"
-  },
-  "dependencies": {
-    "lucide-react": "^0.468.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
@@ -42,6 +83,9 @@
     "electron": "^42.3.3",
     "electron-builder": "^26.15.2",
     "eslint": "^9.17.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "rimraf": "^6.0.1",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.2",
@@ -52,47 +96,123 @@
   "build": {
     "appId": "app.shadowssh.desktop",
     "productName": "Shadow SSH",
+    "compression": "maximum",
+    "electronLanguages": [
+      "en-US"
+    ],
     "directories": {
       "output": "release",
       "buildResources": "resources"
     },
     "files": [
       "dist/**/*",
+      "resources/icons/icon.png",
       "package.json",
-      "icon.svg",
-      "native/**/*"
-    ],
-    "extraResources": [
-      {
-        "from": "native",
-        "to": "native",
-        "filter": [
-          "**/*"
-        ]
-      }
+      "icon.svg"
     ],
     "win": {
       "target": [
-        "nsis"
+        {
+          "target": "dir",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ],
       "icon": "resources/icons/icon.ico",
-      "requestedExecutionLevel": "asInvoker"
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "shadow-ssh-${version}-windows-portable-${arch}.${ext}",
+      "extraResources": [
+        {
+          "from": "resources/icons/icon.ico",
+          "to": "icons/icon.ico"
+        },
+        {
+          "from": "resources/icons/icon.png",
+          "to": "icons/icon.png"
+        },
+        {
+          "from": "native/windows/${arch}",
+          "to": "native/windows/${arch}",
+          "filter": [
+            "**/*",
+            "!**/.DS_Store"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "shadow-ssh-${version}-windows-installer-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "shadow-ssh-${version}-windows-portable-${arch}.${ext}"
     },
     "mac": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
       "category": "public.app-category.utilities",
-      "icon": "icon.svg"
+      "icon": "resources/icons/icon.icns",
+      "artifactName": "shadow-ssh-${version}-macos-portable-${arch}.${ext}",
+      "extraResources": [
+        {
+          "from": "resources/icons/icon.png",
+          "to": "icons/icon.png"
+        },
+        {
+          "from": "native/macos/${arch}",
+          "to": "native/macos/${arch}",
+          "filter": [
+            "**/*",
+            "!**/.DS_Store"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "artifactName": "shadow-ssh-${version}-macos-dmg-${arch}.${ext}"
     },
     "linux": {
       "target": [
-        "AppImage"
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ],
       "category": "Network",
-      "icon": "resources/icons/icon.png"
+      "icon": "resources/icons/icon.png",
+      "syncDesktopName": true,
+      "artifactName": "shadow-ssh-${version}-linux-portable-${arch}.${ext}",
+      "extraResources": [
+        {
+          "from": "resources/icons/icon.png",
+          "to": "icons/icon.png"
+        },
+        {
+          "from": "native/linux/${arch}",
+          "to": "native/linux/${arch}",
+          "filter": [
+            "**/*",
+            "!**/.DS_Store"
+          ]
+        }
+      ]
+    },
+    "deb": {
+      "artifactName": "shadow-ssh-${version}-linux-package-${arch}.${ext}"
     }
   }
 }

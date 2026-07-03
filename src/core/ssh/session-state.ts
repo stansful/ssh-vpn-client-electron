@@ -26,6 +26,7 @@ import {
   encodeChannelClose,
   encodeChannelData,
   encodeChannelEof,
+  encodeChannelWindowAdjust,
   encodeDirectTcpIpChannelOpen,
   encodePtyRequest,
   encodeSessionChannelOpen,
@@ -92,10 +93,11 @@ export interface AuthFailureResult {
 }
 
 export interface ChannelEvent {
-  type: "open-confirmed" | "open-failed" | "window-adjust" | "data" | "eof" | "close" | "success" | "failure";
+  type: "open-confirmed" | "open-failed" | "window-adjust" | "data" | "eof" | "close" | "success" | "failure" | "ignored";
   localChannel?: number;
   data?: Buffer;
   description?: string;
+  windowAdjustPayload?: Buffer;
 }
 
 export class SshSessionStateMachine {
@@ -276,8 +278,29 @@ export class SshSessionStateMachine {
     if (!channel || channel.remoteId === undefined) {
       throw new Error(`Channel ${localChannel} is not confirmed.`);
     }
+    if (data.length > channel.maximumPacketSize) {
+      throw new Error(`Channel ${localChannel} maximum packet size exceeded.`);
+    }
     this.channels.consumeRemoteWindow(localChannel, data.length);
     return encodeChannelData({ recipientChannel: channel.remoteId, data });
+  }
+
+  buildChannelDataFrames(localChannel: number, data: Buffer): { payloads: Buffer[]; bytesWritten: number } {
+    const payloads: Buffer[] = [];
+    let offset = 0;
+    while (offset < data.length) {
+      const channel = this.channels.get(localChannel);
+      if (!channel || channel.remoteId === undefined) {
+        throw new Error(`Channel ${localChannel} is not confirmed.`);
+      }
+      const chunkLength = Math.min(channel.maximumPacketSize, channel.remoteWindow, data.length - offset);
+      if (chunkLength <= 0) {
+        break;
+      }
+      payloads.push(this.buildChannelData(localChannel, data.subarray(offset, offset + chunkLength)));
+      offset += chunkLength;
+    }
+    return { payloads, bytesWritten: offset };
   }
 
   buildWindowChange(localChannel: number, columns: number, rows: number): Buffer {
@@ -332,28 +355,62 @@ export class SshSessionStateMachine {
     }
     if (number === SSH_MSG_CHANNEL_WINDOW_ADJUST) {
       const adjust = decodeChannelWindowAdjust(payload);
+      if (!this.channels.get(adjust.recipientChannel)) {
+        return { type: "ignored", localChannel: adjust.recipientChannel, description: "window-adjust for unknown channel" };
+      }
       this.channels.expandRemoteWindow(adjust.recipientChannel, adjust.bytesToAdd);
       return { type: "window-adjust", localChannel: adjust.recipientChannel };
     }
     if (number === SSH_MSG_CHANNEL_DATA) {
       const data = decodeChannelData(payload);
+      if (!this.channels.get(data.recipientChannel)) {
+        return { type: "ignored", localChannel: data.recipientChannel, description: "data for unknown channel" };
+      }
+      const channel = this.channels.consumeLocalWindow(data.recipientChannel, data.data.length);
+      const replenishThreshold = Math.floor(channel.localWindowMaximum / 2);
+      if (channel.localWindow <= replenishThreshold) {
+        const bytesToAdd = channel.localWindowMaximum - channel.localWindow;
+        const replenished = this.channels.replenishLocalWindow(data.recipientChannel, bytesToAdd);
+        if (replenished.remoteId !== undefined) {
+          return {
+            type: "data",
+            localChannel: data.recipientChannel,
+            data: data.data,
+            windowAdjustPayload: encodeChannelWindowAdjust(replenished.remoteId, bytesToAdd)
+          };
+        }
+      }
       return { type: "data", localChannel: data.recipientChannel, data: data.data };
     }
     if (number === SSH_MSG_CHANNEL_EOF) {
       const localChannel = decodeChannelEndpoint(payload, SSH_MSG_CHANNEL_EOF);
+      if (!this.channels.get(localChannel)) {
+        return { type: "ignored", localChannel, description: "eof for unknown channel" };
+      }
       this.channels.markEofReceived(localChannel);
       return { type: "eof", localChannel };
     }
     if (number === SSH_MSG_CHANNEL_CLOSE) {
       const localChannel = decodeChannelEndpoint(payload, SSH_MSG_CHANNEL_CLOSE);
+      if (!this.channels.get(localChannel)) {
+        return { type: "ignored", localChannel, description: "close for unknown channel" };
+      }
       this.channels.close(localChannel);
       return { type: "close", localChannel };
     }
     if (number === SSH_MSG_CHANNEL_SUCCESS) {
-      return { type: "success", localChannel: decodeChannelEndpoint(payload, SSH_MSG_CHANNEL_SUCCESS) };
+      const localChannel = decodeChannelEndpoint(payload, SSH_MSG_CHANNEL_SUCCESS);
+      if (!this.channels.get(localChannel)) {
+        return { type: "ignored", localChannel, description: "success for unknown channel" };
+      }
+      return { type: "success", localChannel };
     }
     if (number === SSH_MSG_CHANNEL_FAILURE) {
-      return { type: "failure", localChannel: decodeChannelEndpoint(payload, SSH_MSG_CHANNEL_FAILURE) };
+      const localChannel = decodeChannelEndpoint(payload, SSH_MSG_CHANNEL_FAILURE);
+      if (!this.channels.get(localChannel)) {
+        return { type: "ignored", localChannel, description: "failure for unknown channel" };
+      }
+      return { type: "failure", localChannel };
     }
     throw new Error(`Unexpected SSH channel message ${number}.`);
   }

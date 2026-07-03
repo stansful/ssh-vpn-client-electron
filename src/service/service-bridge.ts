@@ -10,6 +10,7 @@ export interface ServiceBridge {
   disconnect(): Promise<void>;
   checkTunnel(endpoint: string): Promise<TunnelCheckResult>;
   openTerminal(): Promise<void>;
+  closeTerminal(): Promise<void>;
   terminalInput(input: string): Promise<void>;
   dispose?(): Promise<void>;
 }

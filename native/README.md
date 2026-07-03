@@ -16,13 +16,13 @@ native/
 ```
 
 The Electron main process resolves the active platform and architecture through `src/main/platform/targets.ts`.
-When a binary is missing, the app uses the development simulator transport. The simulator exercises UI, storage,
-IPC, diagnostics, terminal plumbing, and routing-rule validation, but it does not create an SSH tunnel or OS routes.
+By default Electron uses the built-in live SSH service. Set `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1` to force Electron
+to start the matching native binary over `--stdio`.
 
-Future service contract:
+Service contract:
 
 - local-only IPC endpoint;
-- commands: connect, disconnect, status, update config, update routing rules, check tunnel, open terminal, terminal input;
+- commands: connect, disconnect, status, update config, update routing rules, check tunnel, open terminal, terminal input, list process connections;
 - events: status changed, diagnostics appended, tunnel check result, terminal output, error;
 - privileged routing/core implementation per platform;
 - reusable custom SSH core shared by platform-specific service shells.
@@ -34,7 +34,7 @@ npm run service:simulator
 ```
 
 Then start Electron with `SHADOW_SSH_SERVICE_ENDPOINT` pointing to that endpoint. If the endpoint is not available,
-Electron falls back to the in-process simulator and records a startup diagnostic warning.
+Electron falls back to the built-in live SSH service and records a startup diagnostic warning.
 
 Native service host:
 
@@ -49,9 +49,9 @@ The Go service host builds without external modules for:
 - `macos/x64` and `macos/arm64`
 - `linux/x64` and `linux/arm64`
 
-Electron starts the matching native binary over `--stdio` when it is present and no
+Electron starts the matching native binary over `--stdio` when `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1` is set and no
 `SHADOW_SSH_SERVICE_ENDPOINT` is configured. The process bridge sends `shutdown` and kills the child on app quit if it
 does not exit quickly, so local runs do not leave a service process hanging.
 
-The native host intentionally fails closed for `connect` until the live SSH engine and platform routing drivers are
-linked into that binary. It does not report a connected tunnel without real SSH/direct-tcpip/shell support.
+The native host includes Windows SCM service mode, named-pipe ACLs, routing capability contracts, and Windows TCP
+process-to-connection attribution. The default live SSH tunnel path is implemented in Electron main.

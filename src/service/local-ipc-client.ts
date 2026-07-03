@@ -86,6 +86,10 @@ export class LocalIpcServiceBridge implements ServiceBridge {
     await this.send({ id: randomUUID(), type: "open-terminal" });
   }
 
+  async closeTerminal(): Promise<void> {
+    await this.send({ id: randomUUID(), type: "close-terminal" });
+  }
+
   async terminalInput(input: string): Promise<void> {
     await this.send({ id: randomUUID(), type: "terminal-input", payload: { input } });
   }

@@ -14,6 +14,9 @@ import type {
   UpsertSshKeyInput
 } from "../shared/types.js";
 
+const MAX_PREVIEW_DIAGNOSTICS = 500;
+const MAX_PREVIEW_TERMINAL_LINES = 2000;
+
 export function createBrowserPreviewApi(): ShadowSshApi {
   const listeners = new Set<(event: ServiceEvent) => void>();
   let store = createDefaultStore();
@@ -27,6 +30,7 @@ export function createBrowserPreviewApi(): ShadowSshApi {
   let diagnostics: DiagnosticsEntry[] = [];
   let terminal: TerminalLine[] = [];
   let lastTunnelCheck: TunnelCheckResult | undefined;
+  let fileLog = "";
 
   runtime = {
     ...runtime,
@@ -35,15 +39,19 @@ export function createBrowserPreviewApi(): ShadowSshApi {
     realTunnelAvailable: false
   };
 
-  const snapshot = (): AppSnapshot => structuredClone({ store, runtime, diagnostics, terminal, lastTunnelCheck });
+  const snapshot = (): AppSnapshot =>
+    structuredClone({ store, runtime, diagnostics, terminal, logFilePaths: ["browser-preview://main.log"], lastTunnelCheck });
   const emit = (event: ServiceEvent): void => {
     for (const listener of listeners) {
       listener(event);
     }
   };
   const appendDiagnostic = (level: DiagnosticsEntry["level"], message: string): void => {
+    if (!store.settings.loggingEnabled || !store.settings.diagnosticsLoggingEnabled) {
+      return;
+    }
     const entry: DiagnosticsEntry = { id: crypto.randomUUID(), at: new Date().toISOString(), level, message };
-    diagnostics = [...diagnostics, entry];
+    diagnostics = [...diagnostics, entry].slice(-MAX_PREVIEW_DIAGNOSTICS);
     emit({ type: "diagnostics-appended", entry });
   };
   const setRuntime = (patch: Partial<typeof runtime>): void => {
@@ -52,7 +60,7 @@ export function createBrowserPreviewApi(): ShadowSshApi {
   };
   const appendTerminal = (text: string): void => {
     const line: TerminalLine = { id: crypto.randomUUID(), at: new Date().toISOString(), stream: "system", text };
-    terminal = [...terminal, line];
+    terminal = [...terminal, line].slice(-MAX_PREVIEW_TERMINAL_LINES);
     emit({ type: "terminal-output", line });
   };
 
@@ -72,7 +80,7 @@ export function createBrowserPreviewApi(): ShadowSshApi {
         authType: input.authType,
         passwordSecretId: input.password ? `preview-password-${crypto.randomUUID()}` : existing?.passwordSecretId,
         privateKeyId: input.privateKeyId,
-        privateKeyPassphraseSecretId: input.privateKeyPassphrase ? `preview-passphrase-${crypto.randomUUID()}` : existing?.privateKeyPassphraseSecretId,
+        privateKeyPassphraseSecretId: undefined,
         expectedServerFingerprint: input.expectedServerFingerprint.trim(),
         keepaliveIntervalSec: Number(input.keepaliveIntervalSec),
         note: input.note.trim(),
@@ -107,6 +115,9 @@ export function createBrowserPreviewApi(): ShadowSshApi {
         id: existing?.id ?? crypto.randomUUID(),
         name: input.name.trim(),
         privateKeySecretId: input.privateKey ? `preview-key-${crypto.randomUUID()}` : existing?.privateKeySecretId ?? `preview-key-${crypto.randomUUID()}`,
+        privateKeyPassphraseSecretId: input.privateKeyPassphrase
+          ? `preview-passphrase-${crypto.randomUUID()}`
+          : existing?.privateKeyPassphraseSecretId,
         fingerprint: existing?.fingerprint ?? `sha256:preview-${crypto.randomUUID().slice(0, 8)}`,
         createdAt: existing?.createdAt ?? now,
         updatedAt: now
@@ -116,6 +127,12 @@ export function createBrowserPreviewApi(): ShadowSshApi {
         sshKeys: existing ? store.sshKeys.map((candidate) => (candidate.id === key.id ? key : candidate)) : [...store.sshKeys, key]
       };
       return snapshot();
+    },
+    async copyPrivateKey(id: string) {
+      if (!store.sshKeys.some((key) => key.id === id)) {
+        throw new Error("SSH key does not exist.");
+      }
+      return true;
     },
     async deleteKey(id: string) {
       if (store.sshConfigs.some((config) => config.privateKeyId === id)) {
@@ -135,6 +152,17 @@ export function createBrowserPreviewApi(): ShadowSshApi {
     async updateRoutingRules(rules: RoutingRule[]) {
       store = { ...store, routingRules: rules };
       return snapshot();
+    },
+    async clearDiagnostics() {
+      diagnostics = [];
+      return snapshot();
+    },
+    async readLogFile() {
+      return store.settings.loggingEnabled && store.settings.fileLoggingEnabled ? fileLog : "";
+    },
+    async clearLogFile() {
+      fileLog = "";
+      return fileLog;
     },
     async listProcesses() {
       return ["chrome.exe", "msedge.exe", "telegram.exe", "discord.exe", "code.exe", "powershell.exe"];
@@ -173,6 +201,10 @@ export function createBrowserPreviewApi(): ShadowSshApi {
     },
     async openTerminal() {
       appendTerminal("Preview shell is open.\n$ ");
+      return snapshot();
+    },
+    async closeTerminal() {
+      appendTerminal("\nPreview shell is closed.\n");
       return snapshot();
     },
     async terminalInput() {

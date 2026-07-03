@@ -2,6 +2,7 @@ import { SshBinaryWriter } from "./binary.js";
 
 export const SSH_MSG_CHANNEL_OPEN = 90;
 export const SSH_MSG_CHANNEL_DATA = 94;
+export const SSH_MSG_CHANNEL_WINDOW_ADJUST = 93;
 export const SSH_MSG_CHANNEL_EOF = 96;
 export const SSH_MSG_CHANNEL_CLOSE = 97;
 export const SSH_MSG_CHANNEL_REQUEST = 98;
@@ -115,6 +116,10 @@ export function encodeWindowChangeRequest(request: WindowChangeRequest): Buffer 
 
 export function encodeChannelData(request: ChannelData): Buffer {
   return new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(request.recipientChannel).string(request.data).toBuffer();
+}
+
+export function encodeChannelWindowAdjust(recipientChannel: number, bytesToAdd: number): Buffer {
+  return new SshBinaryWriter().byte(SSH_MSG_CHANNEL_WINDOW_ADJUST).uint32(recipientChannel).uint32(bytesToAdd).toBuffer();
 }
 
 export function encodeChannelEof(recipientChannel: number): Buffer {

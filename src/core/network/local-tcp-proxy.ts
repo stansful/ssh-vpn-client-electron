@@ -102,20 +102,34 @@ export class LocalTcpProxy {
     try {
       const channel = await this.options.connectChannel(this.options.target, originator);
       const offData = channel.onData((data) => {
-        if (!socket.destroyed) {
+        if (isSocketWritable(socket)) {
           socket.write(data);
         }
       });
-      const offClose = channel.onClose(() => socket.end());
+      const offClose = channel.onClose(() => {
+        if (isSocketWritable(socket)) {
+          socket.end();
+        }
+      });
       const offError = channel.onError((error) => {
         this.events.emit("event", { type: "error", message: error.message } satisfies LocalTcpProxyConnectionEvent);
         socket.destroy(error);
       });
 
       socket.on("data", (data) => {
-        void channel.write(data).catch((error: unknown) => {
-          socket.destroy(error instanceof Error ? error : new Error(String(error)));
-        });
+        socket.pause();
+        void channel
+          .write(data)
+          .then(() => {
+            if (!socket.destroyed) {
+              socket.resume();
+            }
+          })
+          .catch((error: unknown) => {
+            if (!socket.destroyed) {
+              socket.destroy(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
       });
       socket.on("close", () => {
         offData();
@@ -137,4 +151,8 @@ export class LocalTcpProxy {
       } satisfies LocalTcpProxyConnectionEvent);
     }
   }
+}
+
+function isSocketWritable(socket: net.Socket): boolean {
+  return !socket.destroyed && socket.writable && !socket.writableEnded;
 }
