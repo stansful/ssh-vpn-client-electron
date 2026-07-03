@@ -23,6 +23,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   diagnosticsLoggingEnabled: true,
   fileLoggingEnabled: true,
   closeToTrayEnabled: true,
+  startWithWindowsInTray: false,
   sidebarCollapsed: false,
   activeGlobalTab: "ssh",
   xrayConsentAccepted: false,

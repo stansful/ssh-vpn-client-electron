@@ -207,6 +207,7 @@ export function AppViews({
         onOpenDownloadedUpdate={updates.openDownloadedUpdate}
         onRoutingModeChange={(mode) => void run(() => api.updateRoutingMode(mode))}
         onUpdateSettings={updateSettings}
+        platform={runtime?.platformTarget.platform}
       />
     );
   }

@@ -9,6 +9,7 @@ export interface CreateMainWindowOptions extends RuntimeFormatOptions {
   iconPath: string;
   width: number;
   height: number;
+  startHidden: boolean;
   devServerUrl?: string;
   onClosed: () => void;
   onClose: (event: Electron.Event, window: BrowserWindow) => void;
@@ -29,6 +30,7 @@ export async function createMainWindow(options: CreateMainWindowOptions): Promis
     icon: options.iconPath,
     autoHideMenuBar: true,
     backgroundColor: "#f6f7f9",
+    show: !options.startHidden,
     webPreferences: {
       preload: options.preloadPath,
       contextIsolation: true,
@@ -67,7 +69,9 @@ export async function createMainWindow(options: CreateMainWindowOptions): Promis
 
   if (options.devServerUrl) {
     await window.loadURL(options.devServerUrl);
-    window.webContents.openDevTools({ mode: "detach" });
+    if (!options.startHidden) {
+      window.webContents.openDevTools({ mode: "detach" });
+    }
   } else {
     try {
       await window.loadFile(path.join(options.rendererDist, "index.html"));
@@ -77,6 +81,10 @@ export async function createMainWindow(options: CreateMainWindowOptions): Promis
       await options.writeLog(message);
       await window.loadURL(createErrorDataUrl(message));
     }
+  }
+
+  if (!options.startHidden && !window.isVisible()) {
+    window.show();
   }
 
   return window;

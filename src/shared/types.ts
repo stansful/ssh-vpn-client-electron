@@ -105,6 +105,7 @@ export interface AppSettings {
   diagnosticsLoggingEnabled: boolean;
   fileLoggingEnabled: boolean;
   closeToTrayEnabled: boolean;
+  startWithWindowsInTray: boolean;
   sidebarCollapsed: boolean;
   activeGlobalTab: GlobalTab;
   xrayConsentAccepted: boolean;

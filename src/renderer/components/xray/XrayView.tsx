@@ -152,7 +152,7 @@ export function XrayView({
           </div>
         </div>
 
-        <dl className="facts">
+        <dl className="facts single-facts">
           <div><dt>Routing mode</dt><dd>{store.routingMode === "proxy-all" ? "Proxy all" : "Selected rules"}</dd></div>
         </dl>
       </section>

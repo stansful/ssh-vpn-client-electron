@@ -2,6 +2,46 @@
 
 ## 2026-07-03
 
+### Start: SSH Main routing mode ordering
+
+- User requested moving Main > SSH `Routing mode` below `Check tunnel endpoint`, matching the Xray tab ordering.
+- Current focus: reorder the existing SSH Main fields without changing behavior.
+
+### End: SSH Main routing mode ordering
+
+- Moved Main > SSH `Routing mode` below the editable `Check tunnel endpoint` row to match Main > Xray.
+- Verification passed: `npm run typecheck`, `npm run lint`, and `npm run build`.
+
+### Start: Xray routing mode card width fix
+
+- User reported that Main > Xray `Routing mode` does not fit correctly after previous UI cleanup.
+- Current focus: make the remaining Xray routing-mode summary use the full available width instead of the generic two-column facts layout.
+
+### End: Xray routing mode card width fix
+
+- Added a `single-facts` layout variant and applied it to Main > Xray routing-mode summary.
+- The Xray `Routing mode` card now spans the full connection panel width instead of occupying one half of the old two-column facts grid.
+- Verification passed: `npm run typecheck`, `npm run lint`, and `npm run build`.
+
+### Start: Windows startup-to-tray setting
+
+- User requested a setting to auto-start the app with Windows in minimized-to-tray mode.
+- Setting must be disabled by default.
+- Current focus: add persisted setting, Settings UI toggle, Windows login-item synchronization, and startup argument handling so autostart launches hidden in tray.
+
+### End: Windows startup-to-tray setting
+
+- Added persisted `startWithWindowsInTray` setting, defaulting to `false`.
+- Added Settings > Window toggle: `Start with Windows in tray`.
+- Toggle is enabled only on Windows; non-Windows builds show it disabled.
+- Added Windows login-item synchronization through Electron `app.setLoginItemSettings`.
+- Startup registration uses the real portable executable path from `PORTABLE_EXECUTABLE_FILE` when available, falling back to `process.execPath`.
+- Added `--shadow-ssh-start-minimized-to-tray` startup argument handling:
+  - app creates the BrowserWindow hidden;
+  - devtools are not opened for hidden startup;
+  - tray remains available for hidden startup even if `Close to tray` is off.
+- Verification passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 92 tests), and `npm run build`.
+
 ### Start: Main SSH/Xray routing and endpoint UI cleanup
 
 - User requested showing the current Settings routing mode on Main > SSH.

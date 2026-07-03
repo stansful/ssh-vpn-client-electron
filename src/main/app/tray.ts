@@ -5,6 +5,7 @@ export interface TrayControllerOptions {
   appName: string;
   iconPaths: string[];
   isCloseToTrayEnabled: () => boolean;
+  isTrayRequired: () => boolean;
   isQuitting: () => boolean;
   onQuit: () => void;
 }
@@ -15,7 +16,7 @@ export class TrayController {
   constructor(private readonly options: TrayControllerOptions) {}
 
   sync(): void {
-    if (!this.options.isCloseToTrayEnabled()) {
+    if (!this.options.isTrayRequired()) {
       this.destroy();
       return;
     }

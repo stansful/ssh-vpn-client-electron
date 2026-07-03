@@ -55,8 +55,10 @@ const DEFAULT_WINDOW_WIDTH = 980;
 const DEFAULT_WINDOW_HEIGHT = 680;
 const MAX_DIAGNOSTICS_IN_MEMORY = 500;
 const MAX_TERMINAL_LINES_IN_MEMORY = 2000;
+const START_MINIMIZED_TO_TRAY_ARG = "--shadow-ssh-start-minimized-to-tray";
 
 const formatRuntimePath = (value: string): string => formatRuntimePathValue(runtimeFormatOptions, value);
+const startMinimizedToTray = process.argv.includes(START_MINIMIZED_TO_TRAY_ARG);
 
 let runtime: RuntimeStatus;
 let diagnostics: DiagnosticsEntry[] = [];
@@ -115,6 +117,7 @@ const trayController = new TrayController({
   appName: appDisplayName,
   iconPaths: trayIconPaths,
   isCloseToTrayEnabled: () => storage.getStore().settings.closeToTrayEnabled,
+  isTrayRequired: () => startMinimizedToTray || storage.getStore().settings.closeToTrayEnabled,
   isQuitting: () => applicationQuitting,
   onQuit: () => {
     applicationQuitting = true;
@@ -166,6 +169,7 @@ async function createWindow(): Promise<void> {
     iconPath,
     width: DEFAULT_WINDOW_WIDTH,
     height: DEFAULT_WINDOW_HEIGHT,
+    startHidden: startMinimizedToTray,
     devServerUrl: process.env.VITE_DEV_SERVER_URL,
     onClosed: () => undefined,
     onClose: (event, window) => trayController.handleWindowClose(event, window),
@@ -193,6 +197,7 @@ async function initializeApplicationServices(): Promise<void> {
     await writeMainLog("Initializing storage.");
     await storage.init();
     applyLoggingSettings(storage.getStore().settings);
+    syncWindowsStartupSetting(storage.getStore().settings);
     trayController.sync();
     const initialRuntime: RuntimeStatus = {
       ...createDefaultRuntimeStatus(platformTarget),
@@ -302,6 +307,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.updateSettings, async (_event, settings: AppSettings) => {
     applyLoggingSettings(settings);
     await storage.updateSettings(settings);
+    syncWindowsStartupSetting(settings);
     trayController.sync();
     return createSnapshot();
   });
@@ -753,4 +759,30 @@ async function ensureExplicitUserDataPath(): Promise<void> {
   } catch (error) {
     await writeMainLog(`Unable to set explicit userData path ${explicitUserDataPath}: ${formatError(error)}`);
   }
+}
+
+function syncWindowsStartupSetting(settings: AppSettings): void {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: settings.startWithWindowsInTray,
+      path: resolveWindowsStartupExecutablePath(),
+      args: settings.startWithWindowsInTray ? [START_MINIMIZED_TO_TRAY_ARG] : []
+    });
+  } catch (error) {
+    const message = `Unable to sync Windows startup setting: ${formatError(error)}`;
+    appendError(message);
+    void writeMainLog(message);
+  }
+}
+
+function resolveWindowsStartupExecutablePath(): string {
+  const portableExecutable = process.env.PORTABLE_EXECUTABLE_FILE;
+  if (portableExecutable && path.isAbsolute(portableExecutable)) {
+    return portableExecutable;
+  }
+  return process.execPath;
 }

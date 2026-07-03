@@ -689,6 +689,10 @@ textarea {
   margin: 0;
 }
 
+.single-facts {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .facts div {
   padding: 12px;
   border: 1px solid var(--border);

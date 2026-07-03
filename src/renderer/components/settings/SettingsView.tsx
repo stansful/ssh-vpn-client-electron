@@ -1,4 +1,4 @@
-import type { AppSettings, AppSnapshot, RoutingMode, ThemeMode } from "../../../shared/types.js";
+import type { AppSettings, AppSnapshot, DesktopPlatform, RoutingMode, ThemeMode } from "../../../shared/types.js";
 import { Segmented } from "../ui/index.js";
 import { ThemeDesigner } from "./ThemeDesigner.js";
 
@@ -11,7 +11,8 @@ export function SettingsView({
   onDownloadUpdate,
   onOpenDownloadedUpdate,
   onRoutingModeChange,
-  onUpdateSettings
+  onUpdateSettings,
+  platform
 }: {
   store: AppSnapshot["store"];
   loggingEnabled: boolean;
@@ -22,8 +23,10 @@ export function SettingsView({
   onOpenDownloadedUpdate: () => void;
   onRoutingModeChange: (mode: RoutingMode) => void;
   onUpdateSettings: (patch: Partial<AppSettings>) => void;
+  platform: DesktopPlatform | undefined;
 }): JSX.Element {
   const enabledRules = store.routingRules.filter((rule) => rule.enabled).length;
+  const windowsStartupAvailable = platform === "windows";
 
   return (
     <section className="screen two-column">
@@ -76,16 +79,27 @@ export function SettingsView({
       <section className="panel">
         <div className="section-title">
           <h2>Window</h2>
-          <span>{store.settings.closeToTrayEnabled ? "Tray close" : "Quit on close"}</span>
+          <span>{store.settings.startWithWindowsInTray ? "Startup tray" : store.settings.closeToTrayEnabled ? "Tray close" : "Quit on close"}</span>
         </div>
-        <label className="switch-row">
-          <input
-            type="checkbox"
-            checked={store.settings.closeToTrayEnabled}
-            onChange={(event) => onUpdateSettings({ closeToTrayEnabled: event.target.checked })}
-          />
-          <span>Close to tray</span>
-        </label>
+        <div className="logging-toggles">
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={store.settings.closeToTrayEnabled}
+              onChange={(event) => onUpdateSettings({ closeToTrayEnabled: event.target.checked })}
+            />
+            <span>Close to tray</span>
+          </label>
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              disabled={!windowsStartupAvailable}
+              checked={store.settings.startWithWindowsInTray}
+              onChange={(event) => onUpdateSettings({ startWithWindowsInTray: event.target.checked })}
+            />
+            <span>Start with Windows in tray</span>
+          </label>
+        </div>
       </section>
 
       <section className="panel">
