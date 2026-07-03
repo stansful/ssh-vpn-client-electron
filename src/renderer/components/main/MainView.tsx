@@ -66,6 +66,13 @@ export function MainView({
             </select>
           </label>
 
+          <div className="field">
+            <span>Routing mode</span>
+            <div className="endpoint-line">
+              <strong>{store.routingMode === "proxy-all" ? "Proxy all" : "Selected rules"}</strong>
+            </div>
+          </div>
+
           {selectedRulesBlocked && (
             <div className="warning-row">
               Selected rules mode is active in Settings and requires at least one enabled rule before Connect.

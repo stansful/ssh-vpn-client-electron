@@ -1,4 +1,4 @@
-import { Check, Download, Pin, PinOff, Plus, RefreshCw, RotateCw, ShieldAlert, Trash2, X } from "lucide-react";
+import { Check, Download, Pin, PinOff, Plus, RefreshCw, RotateCw, ShieldAlert, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 import type { AppSnapshot, ImportProxyProfilesInput, ProxyProfile, UpsertProxyProfileInput } from "../../../shared/types.js";
 import { checkButtonClass } from "../../lib/labels.js";
@@ -12,6 +12,7 @@ export function XrayView({
   onConnect,
   onDisconnect,
   onCheckTunnel,
+  onEditEndpoint,
   onRefresh,
   onUpsert,
   onImport,
@@ -28,6 +29,7 @@ export function XrayView({
   onConnect: () => void;
   onDisconnect: () => void;
   onCheckTunnel: () => void;
+  onEditEndpoint: () => void;
   onRefresh: () => Promise<void>;
   onUpsert: (input: UpsertProxyProfileInput) => Promise<void>;
   onImport: (input: ImportProxyProfilesInput) => Promise<void>;
@@ -140,11 +142,18 @@ export function XrayView({
           </button>
         </div>
 
+        <div className="field endpoint-summary">
+          <span>Check tunnel endpoint</span>
+          <div className="endpoint-line">
+            <strong>{store.settings.checkEndpoint}</strong>
+            <button type="button" className="ghost-button" onClick={onEditEndpoint}>
+              <SlidersHorizontal size={16} /> Edit
+            </button>
+          </div>
+        </div>
+
         <dl className="facts">
           <div><dt>Routing mode</dt><dd>{store.routingMode === "proxy-all" ? "Proxy all" : "Selected rules"}</dd></div>
-          <div><dt>Profiles</dt><dd>{store.proxyProfiles.length}</dd></div>
-          <div><dt>Pinned</dt><dd>{store.proxyProfiles.filter((profile) => profile.isPinned).length}</dd></div>
-          <div><dt>Endpoint</dt><dd>{store.settings.checkEndpoint}</dd></div>
         </dl>
       </section>
 

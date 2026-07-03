@@ -2,6 +2,20 @@
 
 ## 2026-07-03
 
+### Start: Main SSH/Xray routing and endpoint UI cleanup
+
+- User requested showing the current Settings routing mode on Main > SSH.
+- User requested making the check tunnel endpoint editable on Main > Xray, matching the SSH tab behavior.
+- User requested removing the `Profiles` and `Pinned` summary cards from Main > Xray.
+- Current focus: update Main tab presentation only, reusing the existing endpoint modal and persisted settings.
+
+### End: Main SSH/Xray routing and endpoint UI cleanup
+
+- Added the current routing mode row to Main > SSH, sourced from the global Settings routing mode.
+- Added editable `Check tunnel endpoint` row to Main > Xray using the existing endpoint modal and saved setting.
+- Removed the `Profiles` and `Pinned` summary cards from Main > Xray; profile management remains in the Xray profiles panel.
+- Verification passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 92 tests), and `npm run build`.
+
 ### Start: routing reconnect loop fix and Xray naming
 
 - User attached logs showing repeated SSH/Xray reconnects after changing routing mode while a tunnel is active.

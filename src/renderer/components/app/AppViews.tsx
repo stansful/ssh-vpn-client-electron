@@ -85,6 +85,7 @@ export function AppViews({
               setChecking(true);
               void run(async () => api.checkTunnel(store.settings.checkEndpoint)).finally(() => setChecking(false));
             }}
+            onEditEndpoint={openEndpointModal}
             onRefresh={xray.refreshProxyProfiles}
             onUpsert={xray.upsertProxyProfile}
             onImport={xray.importProxyProfiles}
