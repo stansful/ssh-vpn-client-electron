@@ -59,7 +59,7 @@ function createMissingPreloadApi(): ShadowSshApi {
     terminalInput: () => Promise.reject(new Error(missingPreloadMessage)),
     checkForUpdates: reject,
     downloadUpdate: reject,
-    openDownloadedUpdate: () => Promise.resolve(false),
+    revealDownloadedUpdate: () => Promise.resolve(false),
     copyText: reject,
     openExternal: reject,
     onServiceEvent: () => () => undefined

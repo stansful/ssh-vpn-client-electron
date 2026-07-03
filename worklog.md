@@ -2,6 +2,38 @@
 
 ## 2026-07-03
 
+### Start: startup auto-connect setting
+
+- User requested a Settings toggle so app startup automatically reconnects to the previously used SSH/Xray transport without pressing Connect each time.
+- The setting must default to enabled.
+- Current focus: persist the setting and last successfully connected transport, add Settings UI, and run startup auto-connect in the main process after services initialize.
+
+### End: startup auto-connect setting
+
+- Added persisted `autoConnectOnStartup`, defaulting to `true`.
+- Added persisted `lastConnectedTransport`, defaulting to `ssh` for new stores and migrating from legacy `activeGlobalTab` for old stores.
+- Added Settings > Window toggle: `Auto-connect on app start`.
+- Main process now attempts startup auto-connect after storage/service initialization:
+  - reconnects to the last successfully used SSH/Xray transport;
+  - skips cleanly without UI errors when no SSH config/Xray profile is selected;
+  - skips selected-rules mode if there are no enabled routing rules;
+  - logs startup auto-connect progress/failures without exposing secrets.
+- Successful manual SSH/Xray connects now update `lastConnectedTransport` and bring Main back to the matching transport tab.
+- Added storage tests for the new defaults and legacy migration.
+- Verification passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 93 tests), and `npm run build`.
+
+### Start: update download folder action
+
+- User requested replacing the updater action `Open downloaded file` with `Open folder with file`.
+- Current focus: reveal the downloaded portable artifact in its folder instead of launching the file directly.
+
+### End: update download folder action
+
+- Replaced the updater action with `Open folder with file` in Settings.
+- Renamed the updater IPC/API method to `revealDownloadedUpdate`.
+- Electron now uses `shell.showItemInFolder()` for the downloaded portable artifact instead of launching it.
+- Verification passed: `npm run typecheck`, `npm run lint`, and `npm run build`.
+
 ### Start: SSH Main routing mode ordering
 
 - User requested moving Main > SSH `Routing mode` below `Check tunnel endpoint`, matching the Xray tab ordering.

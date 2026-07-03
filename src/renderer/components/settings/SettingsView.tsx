@@ -9,7 +9,7 @@ export function SettingsView({
   updateDownload,
   onCheckForUpdates,
   onDownloadUpdate,
-  onOpenDownloadedUpdate,
+  onRevealDownloadedUpdate,
   onRoutingModeChange,
   onUpdateSettings,
   platform
@@ -20,7 +20,7 @@ export function SettingsView({
   updateDownload: AppSnapshot["updateDownload"];
   onCheckForUpdates: () => void;
   onDownloadUpdate: () => void;
-  onOpenDownloadedUpdate: () => void;
+  onRevealDownloadedUpdate: () => void;
   onRoutingModeChange: (mode: RoutingMode) => void;
   onUpdateSettings: (patch: Partial<AppSettings>) => void;
   platform: DesktopPlatform | undefined;
@@ -79,9 +79,17 @@ export function SettingsView({
       <section className="panel">
         <div className="section-title">
           <h2>Window</h2>
-          <span>{store.settings.startWithWindowsInTray ? "Startup tray" : store.settings.closeToTrayEnabled ? "Tray close" : "Quit on close"}</span>
+          <span>{store.settings.autoConnectOnStartup ? "Auto-connect" : store.settings.startWithWindowsInTray ? "Startup tray" : store.settings.closeToTrayEnabled ? "Tray close" : "Quit on close"}</span>
         </div>
         <div className="logging-toggles">
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={store.settings.autoConnectOnStartup}
+              onChange={(event) => onUpdateSettings({ autoConnectOnStartup: event.target.checked })}
+            />
+            <span>Auto-connect on app start</span>
+          </label>
           <label className="switch-row">
             <input
               type="checkbox"
@@ -132,7 +140,7 @@ export function SettingsView({
           <button type="button" className="primary-button" disabled={!updateInfo?.asset || updateDownload?.state === "downloading"} onClick={onDownloadUpdate}>
             {updateDownload?.state === "downloading" ? "Downloading" : "Download portable"}
           </button>
-          <button type="button" className="ghost-button" disabled={!updateDownload?.filePath} onClick={onOpenDownloadedUpdate}>Open downloaded file</button>
+          <button type="button" className="ghost-button" disabled={!updateDownload?.filePath} onClick={onRevealDownloadedUpdate}>Open folder with file</button>
         </div>
         {updateInfo && (
           <dl className="facts log-facts">

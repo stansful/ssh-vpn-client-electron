@@ -25,15 +25,19 @@ export function useUpdateController({
     });
   }
 
-  function openDownloadedUpdate(): void {
+  function revealDownloadedUpdate(): void {
     void run(async () => {
-      await api.openDownloadedUpdate();
+      const revealed = await api.revealDownloadedUpdate();
+      if (!revealed) {
+        throw new Error("No downloaded update file is available.");
+      }
+      setNotice("Opened update folder.");
     });
   }
 
   return {
     checkForUpdates,
     downloadUpdate,
-    openDownloadedUpdate
+    revealDownloadedUpdate
   };
 }

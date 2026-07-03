@@ -204,7 +204,7 @@ export function AppViews({
         updateDownload={snapshot.updateDownload}
         onCheckForUpdates={updates.checkForUpdates}
         onDownloadUpdate={updates.downloadUpdate}
-        onOpenDownloadedUpdate={updates.openDownloadedUpdate}
+        onRevealDownloadedUpdate={updates.revealDownloadedUpdate}
         onRoutingModeChange={(mode) => void run(() => api.updateRoutingMode(mode))}
         onUpdateSettings={updateSettings}
         platform={runtime?.platformTarget.platform}

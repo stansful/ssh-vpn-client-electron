@@ -41,7 +41,7 @@ const api: ShadowSshApi = {
   terminalInput: (input: string) => ipcRenderer.invoke(IPC_CHANNELS.terminalInput, input),
   checkForUpdates: (force?: boolean) => ipcRenderer.invoke(IPC_CHANNELS.checkForUpdates, force),
   downloadUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.downloadUpdate),
-  openDownloadedUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.openDownloadedUpdate),
+  revealDownloadedUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.revealDownloadedUpdate),
   copyText: (text: string) => ipcRenderer.invoke(IPC_CHANNELS.copyText, text),
   openExternal: (url: string) => ipcRenderer.invoke(IPC_CHANNELS.openExternal, url),
   onServiceEvent: (callback: (event: ServiceEvent) => void) => {

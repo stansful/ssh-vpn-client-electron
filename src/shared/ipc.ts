@@ -46,7 +46,7 @@ export const IPC_CHANNELS = {
   terminalInput: "shadow-ssh:terminal-input",
   checkForUpdates: "shadow-ssh:check-for-updates",
   downloadUpdate: "shadow-ssh:download-update",
-  openDownloadedUpdate: "shadow-ssh:open-downloaded-update",
+  revealDownloadedUpdate: "shadow-ssh:reveal-downloaded-update",
   copyText: "shadow-ssh:copy-text",
   openExternal: "shadow-ssh:open-external",
   serviceEvent: "shadow-ssh:service-event"
@@ -90,7 +90,7 @@ export interface ShadowSshApi {
   terminalInput(input: string): Promise<void>;
   checkForUpdates(force?: boolean): Promise<{ snapshot: AppSnapshot; update: AppUpdateInfo }>;
   downloadUpdate(): Promise<AppSnapshot>;
-  openDownloadedUpdate(): Promise<boolean>;
+  revealDownloadedUpdate(): Promise<boolean>;
   copyText(text: string): Promise<boolean>;
   openExternal(url: string): Promise<boolean>;
   onServiceEvent(callback: (event: ServiceEvent) => void): () => void;

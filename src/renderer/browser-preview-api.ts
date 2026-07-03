@@ -314,7 +314,7 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       updateDownload = { state: "downloaded", downloadedBytes: 1, totalBytes: 1, percent: 100, filePath: "browser-preview://update.exe" };
       return snapshot();
     },
-    async openDownloadedUpdate() {
+    async revealDownloadedUpdate() {
       return true;
     },
     async copyText(text: string) {

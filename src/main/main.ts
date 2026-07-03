@@ -24,6 +24,7 @@ import type {
   AppSettings,
   AppSnapshot,
   DiagnosticsEntry,
+  GlobalTab,
   ImportProxyProfilesInput,
   RoutingMode,
   RoutingRule,
@@ -216,6 +217,7 @@ async function initializeApplicationServices(): Promise<void> {
       await writeMainLog(`${next.startupDiagnostic.level.toUpperCase()} ${next.startupDiagnostic.message}`);
     }
     await writeMainLog("Application services initialized.");
+    await autoConnectOnStartup();
   } catch (error) {
     const message = `Startup failed: ${formatError(error)}`;
     activateService(
@@ -377,14 +379,11 @@ function registerIpcHandlers(): void {
     await portableUpdates.downloadSelected();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.openDownloadedUpdate, async () => {
+  ipcMain.handle(IPC_CHANNELS.revealDownloadedUpdate, async () => {
     if (!portableUpdates.download.filePath) {
       return false;
     }
-    const errorMessage = await shell.openPath(portableUpdates.download.filePath);
-    if (errorMessage) {
-      throw new Error(errorMessage);
-    }
+    shell.showItemInFolder(portableUpdates.download.filePath);
     return true;
   });
   ipcMain.handle(IPC_CHANNELS.copyText, (_event, text: string) => {
@@ -488,6 +487,7 @@ async function connect(): Promise<void> {
     checkEndpoint: store.settings.checkEndpoint,
     secrets: storage.resolveServiceSecrets(config)
   });
+  await rememberLastConnectedTransport("ssh");
 }
 
 async function connectProxy(): Promise<void> {
@@ -517,6 +517,61 @@ async function connectProxy(): Promise<void> {
     routingRules: store.routingRules,
     checkEndpoint: store.settings.checkEndpoint,
     secrets: storage.resolveProxySecrets(profile)
+  });
+  await rememberLastConnectedTransport("xray");
+}
+
+async function autoConnectOnStartup(): Promise<void> {
+  const store = storage.getStore();
+  if (!store.settings.autoConnectOnStartup) {
+    await writeMainLog("Auto-connect on startup is disabled.");
+    return;
+  }
+
+  const transport = store.settings.lastConnectedTransport;
+  try {
+    const enabledRules = store.routingRules.filter((rule) => rule.enabled);
+    if (store.routingMode === "selected-rules" && enabledRules.length === 0) {
+      await writeMainLog("Auto-connect skipped: selected rules mode has no enabled routing rules.");
+      return;
+    }
+
+    if (transport === "xray") {
+      const profile = store.proxyProfiles.find((candidate) => candidate.id === store.selectedProxyProfileId);
+      if (!profile) {
+        await writeMainLog("Auto-connect skipped: no selected Xray profile.");
+        return;
+      }
+      await writeMainLog(`Auto-connect starting Xray profile "${profile.name}".`);
+      await connectProxy();
+      await writeMainLog(`Auto-connect completed with Xray profile "${profile.name}".`);
+      return;
+    }
+
+    const config = store.sshConfigs.find((candidate) => candidate.id === store.selectedConfigId);
+    if (!config) {
+      await writeMainLog("Auto-connect skipped: no selected SSH configuration.");
+      return;
+    }
+    await writeMainLog(`Auto-connect starting SSH configuration "${config.name}".`);
+    await connect();
+    await writeMainLog(`Auto-connect completed with SSH configuration "${config.name}".`);
+  } catch (error) {
+    const message = `Auto-connect failed: ${formatError(error)}`;
+    appendError(message);
+    await writeMainLog(message);
+  }
+}
+
+async function rememberLastConnectedTransport(transport: GlobalTab): Promise<void> {
+  const settings = storage.getStore().settings;
+  if (settings.lastConnectedTransport === transport && settings.activeGlobalTab === transport) {
+    return;
+  }
+  await storage.updateSettings({
+    ...settings,
+    activeGlobalTab: transport,
+    lastConnectedTransport: transport
   });
 }
 

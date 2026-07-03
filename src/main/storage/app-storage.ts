@@ -496,6 +496,9 @@ function normalizeStore(input: AppStore): AppStore {
     : rawSettings?.activeGlobalTab === "xray" || rawSettings?.activeGlobalTab === "ssh"
       ? rawSettings.activeGlobalTab
       : defaults.settings.activeGlobalTab;
+  const lastConnectedTransport = inputSettings.lastConnectedTransport === "xray" || inputSettings.lastConnectedTransport === "ssh"
+    ? inputSettings.lastConnectedTransport
+    : activeGlobalTab;
   return {
     ...defaults,
     ...input,
@@ -504,6 +507,7 @@ function normalizeStore(input: AppStore): AppStore {
       ...defaults.settings,
       ...inputSettings,
       activeGlobalTab,
+      lastConnectedTransport,
       xrayConsentAccepted: inputSettings.xrayConsentAccepted ?? inputSettings.openSourceConsentAccepted ?? defaults.settings.xrayConsentAccepted,
       showXrayWarningOnEnter: inputSettings.showXrayWarningOnEnter ?? inputSettings.showOpenSourceWarningOnEnter ?? defaults.settings.showXrayWarningOnEnter,
       xrayRiskBannerExpanded: inputSettings.xrayRiskBannerExpanded ?? inputSettings.openSourceRiskBannerExpanded ?? defaults.settings.xrayRiskBannerExpanded,

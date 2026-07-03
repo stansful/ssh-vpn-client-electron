@@ -24,8 +24,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   fileLoggingEnabled: true,
   closeToTrayEnabled: true,
   startWithWindowsInTray: false,
+  autoConnectOnStartup: true,
   sidebarCollapsed: false,
   activeGlobalTab: "ssh",
+  lastConnectedTransport: "ssh",
   xrayConsentAccepted: false,
   showXrayWarningOnEnter: true,
   xrayRiskBannerExpanded: true

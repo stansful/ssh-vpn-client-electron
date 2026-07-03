@@ -25,6 +25,13 @@ describe("AppStorage persistence", () => {
     await Promise.all(cleanupDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
+  it("defaults startup auto-connect to enabled", () => {
+    const defaults = createDefaultStore().settings;
+
+    expect(defaults.autoConnectOnStartup).toBe(true);
+    expect(defaults.lastConnectedTransport).toBe("ssh");
+  });
+
   it("uses independent temp files for concurrent atomic writes", async () => {
     const dir = await makeTempDir(cleanupDirs);
     const filePath = path.join(dir, "store.json");
@@ -101,6 +108,8 @@ describe("AppStorage persistence", () => {
   it("migrates legacy proxy settings names to Xray settings", async () => {
     const dir = await makeTempDir(cleanupDirs);
     const legacySettings = { ...createDefaultStore().settings } as Record<string, unknown>;
+    delete legacySettings.autoConnectOnStartup;
+    delete legacySettings.lastConnectedTransport;
     delete legacySettings.xrayConsentAccepted;
     delete legacySettings.showXrayWarningOnEnter;
     delete legacySettings.xrayRiskBannerExpanded;
@@ -120,6 +129,7 @@ describe("AppStorage persistence", () => {
     await storage.init();
 
     expect(storage.getStore().settings.activeGlobalTab).toBe("xray");
+    expect(storage.getStore().settings.lastConnectedTransport).toBe("xray");
     expect(storage.getStore().settings.xrayConsentAccepted).toBe(true);
     expect(storage.getStore().settings.showXrayWarningOnEnter).toBe(false);
     expect(storage.getStore().settings.xrayRiskBannerExpanded).toBe(false);

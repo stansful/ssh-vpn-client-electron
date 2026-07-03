@@ -106,8 +106,10 @@ export interface AppSettings {
   fileLoggingEnabled: boolean;
   closeToTrayEnabled: boolean;
   startWithWindowsInTray: boolean;
+  autoConnectOnStartup: boolean;
   sidebarCollapsed: boolean;
   activeGlobalTab: GlobalTab;
+  lastConnectedTransport: GlobalTab;
   xrayConsentAccepted: boolean;
   showXrayWarningOnEnter: boolean;
   xrayRiskBannerExpanded: boolean;
