@@ -1,16 +1,30 @@
-import type { AppSettings, AppSnapshot, ThemeMode } from "../../../shared/types.js";
+import type { AppSettings, AppSnapshot, RoutingMode, ThemeMode } from "../../../shared/types.js";
 import { Segmented } from "../ui/index.js";
 import { ThemeDesigner } from "./ThemeDesigner.js";
 
 export function SettingsView({
   store,
   loggingEnabled,
+  updateInfo,
+  updateDownload,
+  onCheckForUpdates,
+  onDownloadUpdate,
+  onOpenDownloadedUpdate,
+  onRoutingModeChange,
   onUpdateSettings
 }: {
   store: AppSnapshot["store"];
   loggingEnabled: boolean;
+  updateInfo: AppSnapshot["updateInfo"];
+  updateDownload: AppSnapshot["updateDownload"];
+  onCheckForUpdates: () => void;
+  onDownloadUpdate: () => void;
+  onOpenDownloadedUpdate: () => void;
+  onRoutingModeChange: (mode: RoutingMode) => void;
   onUpdateSettings: (patch: Partial<AppSettings>) => void;
 }): JSX.Element {
+  const enabledRules = store.routingRules.filter((rule) => rule.enabled).length;
+
   return (
     <section className="screen two-column">
       <section className="panel">
@@ -72,6 +86,48 @@ export function SettingsView({
           />
           <span>Close to tray</span>
         </label>
+      </section>
+
+      <section className="panel">
+        <div className="section-title">
+          <h2>Routing</h2>
+          <span>{store.routingMode === "proxy-all" ? "Proxy all" : `${enabledRules} rules`}</span>
+        </div>
+        <Segmented<RoutingMode>
+          value={store.routingMode}
+          options={[
+            ["proxy-all", "Proxy all"],
+            ["selected-rules", "Selected rules"]
+          ]}
+          onChange={onRoutingModeChange}
+        />
+        {store.routingMode === "selected-rules" && enabledRules === 0 && (
+          <div className="warning-row spaced">
+            Selected rules mode requires at least one enabled rule before Connect.
+          </div>
+        )}
+      </section>
+
+      <section className="panel settings-wide">
+        <div className="section-title">
+          <h2>Updates</h2>
+          <span>{updateInfo?.latestVersion ? `Latest ${updateInfo.latestVersion}` : "Portable"}</span>
+        </div>
+        <div className="toolbar">
+          <button type="button" className="ghost-button" onClick={onCheckForUpdates}>Check for updates</button>
+          <button type="button" className="primary-button" disabled={!updateInfo?.asset || updateDownload?.state === "downloading"} onClick={onDownloadUpdate}>
+            {updateDownload?.state === "downloading" ? "Downloading" : "Download portable"}
+          </button>
+          <button type="button" className="ghost-button" disabled={!updateDownload?.filePath} onClick={onOpenDownloadedUpdate}>Open downloaded file</button>
+        </div>
+        {updateInfo && (
+          <dl className="facts log-facts">
+            <div><dt>Status</dt><dd>{updateInfo.message}</dd></div>
+            <div><dt>Current</dt><dd>{updateInfo.currentVersion}</dd></div>
+            <div><dt>Downloaded</dt><dd>{updateDownload?.message ?? "Not downloaded"}</dd></div>
+            <div><dt>Progress</dt><dd>{updateDownload?.percent !== undefined ? `${Math.round(updateDownload.percent)}%` : updateDownload?.state ?? "idle"}</dd></div>
+          </dl>
+        )}
       </section>
 
       <section className="panel settings-wide">

@@ -1,11 +1,15 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "./local-tcp-proxy.js";
+import { configureLowLatencySocket, isSocketWritable, writeSocketWithBackpressure } from "./socket-io.js";
 
 export interface Socks5ProxyOptions {
   listenHost?: string;
   listenPort?: number;
   idleTimeoutMs?: number;
+  handshakeTimeoutMs?: number;
+  socketWriteTimeoutMs?: number;
+  maxQueuedSocketBytes?: number;
   connectChannel(target: DirectTcpIpTarget, originator: { address: string; port: number }): Promise<DirectTcpIpChannel>;
 }
 
@@ -88,6 +92,11 @@ export class Socks5Proxy {
 
   private async handleSocket(socket: net.Socket): Promise<void> {
     this.sockets.add(socket);
+    configureLowLatencySocket(socket);
+    const handshakeTimeoutMs = this.options.handshakeTimeoutMs ?? 30_000;
+    socket.setTimeout(handshakeTimeoutMs, () => {
+      socket.destroy(new ProxyHandshakeError("SOCKS/HTTP proxy handshake timed out.", "unknown"));
+    });
     const onHandshakeSocketError = (error: Error): void => {
       this.events.emit("event", { type: "error", message: error.message } satisfies Socks5ProxyEvent);
     };
@@ -95,6 +104,7 @@ export class Socks5Proxy {
 
     try {
       const request = await readProxyConnectRequest(socket);
+      socket.setTimeout(0);
       const originator = {
         address: socket.remoteAddress ?? "127.0.0.1",
         port: socket.remotePort ?? 0
@@ -117,16 +127,44 @@ export class Socks5Proxy {
         idleTimer = this.createIdleTimer(socket);
       };
       socket.off("error", onHandshakeSocketError);
+      let queuedSocketBytes = 0;
+      let socketWriteQueue = Promise.resolve();
+      const maxQueuedSocketBytes = this.options.maxQueuedSocketBytes ?? 32 * 1024 * 1024;
+      const socketWriteTimeoutMs = this.options.socketWriteTimeoutMs ?? 120_000;
+      const enqueueSocketWrite = (data: Buffer): void => {
+        if (!isSocketWritable(socket)) {
+          return;
+        }
+        queuedSocketBytes += data.length;
+        if (queuedSocketBytes > maxQueuedSocketBytes) {
+          socket.destroy(new Error("Local client is not reading proxied data fast enough."));
+          return;
+        }
+        socketWriteQueue = socketWriteQueue
+          .then(async () => {
+            queuedSocketBytes -= data.length;
+            await writeSocketWithBackpressure(socket, data, { timeoutMs: socketWriteTimeoutMs });
+          })
+          .catch((error: unknown) => {
+            queuedSocketBytes = 0;
+            if (!socket.destroyed) {
+              socket.destroy(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
+      };
+      const endSocketAfterQueuedWrites = (): void => {
+        void socketWriteQueue.finally(() => {
+          if (isSocketWritable(socket)) {
+            socket.end();
+          }
+        });
+      };
       const offData = channel.onData((data) => {
         refreshIdleTimer();
-        if (isSocketWritable(socket)) {
-          socket.write(data);
-        }
+        enqueueSocketWrite(data);
       });
       const offClose = channel.onClose(() => {
-        if (isSocketWritable(socket)) {
-          socket.end();
-        }
+        endSocketAfterQueuedWrites();
       });
       const offError = channel.onError((error) => {
         this.events.emit("event", { type: "error", message: error.message } satisfies Socks5ProxyEvent);
@@ -175,6 +213,7 @@ export class Socks5Proxy {
         writeToChannel(request.initialData);
       }
     } catch (error) {
+      socket.setTimeout(0);
       socket.off("error", onHandshakeSocketError);
       this.sockets.delete(socket);
       writeProxyFailure(socket, isHttpHandshakeError(error) ? "http" : "socks5");
@@ -205,9 +244,12 @@ export async function readProxyConnectRequest(socket: net.Socket): Promise<Proxy
   const reader = new ProxySocketReader(socket);
   const firstByte = (await reader.read(1))[0];
   if (firstByte === 0x05) {
+    const target = await readSocksConnectRequestFromReader(reader, firstByte);
+    const rest = reader.takeBuffered();
     return {
       protocol: "socks5",
-      target: await readSocksConnectRequestFromReader(reader, firstByte)
+      target,
+      initialData: rest.length > 0 ? rest : undefined
     };
   }
   if (isHttpMethodStart(firstByte)) {
@@ -357,7 +399,7 @@ class ProxySocketReader {
     });
   }
 
-  private takeBuffered(): Buffer {
+  takeBuffered(): Buffer {
     const chunk = this.buffer;
     this.buffer = Buffer.alloc(0);
     return chunk;
@@ -399,10 +441,6 @@ function formatProtocol(protocol: ProxyProtocol): string {
     return "HTTP CONNECT";
   }
   return "HTTP proxy";
-}
-
-function isSocketWritable(socket: net.Socket): boolean {
-  return !socket.destroyed && socket.writable && !socket.writableEnded;
 }
 
 function isHttpMethodStart(byte: number): boolean {

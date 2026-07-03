@@ -6,7 +6,7 @@ import { WindowsSystemProxyManager } from "../core/network/windows-system-proxy.
 import { listWindowsProcessConnections } from "../core/network/windows-process-connections.js";
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
 import type { ServiceEvent } from "../shared/ipc.js";
-import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
+import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
 import { normalizeRuleValue } from "../shared/validation.js";
 import type { ServiceBridge } from "./service-bridge.js";
 
@@ -15,6 +15,7 @@ export interface LiveSshServiceBridgeOptions {
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
+const PROCESS_ROUTE_REFRESH_INTERVAL_MS = 30 * 1000;
 
 export class LiveSshServiceBridge implements ServiceBridge {
   private readonly events = new EventEmitter();
@@ -34,6 +35,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private processRoutingIps = new Map<string, number>();
   private processRoutingLastSignature = "";
   private processRoutingWarningEmitted = false;
+  private ignoreNextClientClose = false;
 
   constructor(initialStatus: RuntimeStatus, options: LiveSshServiceBridgeOptions = {}) {
     this.systemProxy = new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
@@ -82,6 +84,42 @@ export class LiveSshServiceBridge implements ServiceBridge {
     );
   }
 
+  async updateRouting(update: RoutingUpdateRequest): Promise<void> {
+    this.routingRules = update.routingRules;
+    if (this.lastRequest) {
+      this.lastRequest = {
+        ...this.lastRequest,
+        routingMode: update.routingMode,
+        routingRules: update.routingRules,
+        checkEndpoint: update.checkEndpoint
+      };
+    }
+    const summary = new RoutingMatcher(update.routingMode, update.routingRules).summary();
+    if (this.status.state === "Connected" && this.lastRequest && this.socksEndpoint) {
+      const unsupportedRouting = describeUnsupportedSelectedRouting(this.lastRequest);
+      if (unsupportedRouting) {
+        this.setStatus({
+          state: "Error",
+          activeConfigId: this.lastRequest.config.id,
+          realTunnelAvailable: false,
+          message: unsupportedRouting
+        });
+        this.appendDiagnostic("error", unsupportedRouting);
+        return;
+      }
+      this.appendDiagnostic(
+        "info",
+        `Routing mode changed while connected: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing without SSH reconnect.`
+      );
+      await this.applySystemRouting(this.lastRequest, this.socksEndpoint);
+      return;
+    }
+    this.appendDiagnostic(
+      "info",
+      `Routing prepared for live SSH service: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
+    );
+  }
+
   async connect(request: ConnectRequest): Promise<void> {
     this.clearReconnectTimer();
     this.lastRequest = request;
@@ -94,8 +132,12 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.processRoutingWarningEmitted = false;
     this.shellOpen = false;
     await this.stopRouting();
-    await this.client?.disconnect("Replacing SSH session.");
+    const existingClient = this.client;
     this.client = undefined;
+    if (existingClient) {
+      this.ignoreNextClientClose = true;
+      await existingClient.disconnect("Replacing SSH session.");
+    }
 
     this.setStatus({
       state: "Connecting",
@@ -132,7 +174,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         privateKeyPassphrase: request.secrets?.privateKeyPassphrase,
         keepaliveIntervalSec: request.config.keepaliveIntervalSec,
         connectTimeoutMs: 10000,
-        operationTimeoutMs: 15000
+        operationTimeoutMs: 60000
       });
       this.client = client;
       client.onEvent((event) => this.handleClientEvent(event));
@@ -263,6 +305,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
       this.scheduleReconnect(event.error.message);
       return;
     }
+    if (event.type === "close" && this.ignoreNextClientClose) {
+      this.ignoreNextClientClose = false;
+      return;
+    }
     if (event.type === "close" && !this.disconnectRequested) {
       this.scheduleReconnect("SSH transport closed.");
     }
@@ -380,7 +426,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
     this.processRoutingMonitor = setInterval(() => {
       void this.refreshProcessRouting(request, socksEndpoint);
-    }, 10_000);
+    }, PROCESS_ROUTE_REFRESH_INTERVAL_MS);
     this.processRoutingMonitor.unref();
   }
 

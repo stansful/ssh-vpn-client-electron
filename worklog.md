@@ -2,6 +2,218 @@
 
 ## 2026-07-03
 
+### Start: routing reconnect loop fix and Xray naming
+
+- User attached logs showing repeated SSH/Xray reconnects after changing routing mode while a tunnel is active.
+- Log pattern shows controlled restarts are being interpreted as failures, especially Xray `SIGTERM`, which schedules reconnect again.
+- User requested replacing OpenSource naming with Xray everywhere.
+- Current focus: apply routing mode changes in-place for active tunnels, suppress self-induced reconnects, preserve persisted settings through migration, and rename user-facing OpenSource labels/messages to Xray.
+
+### End: routing reconnect loop fix and Xray naming
+
+- Fixed routing-mode changes while connected:
+  - `updateRoutingMode` no longer calls full SSH/Xray `connect()` when a tunnel is active;
+  - active SSH/Xray transports now re-apply system proxy/PAC routing in place with the existing local proxy endpoint;
+  - switching to `Selected rules` with zero enabled rules still disconnects and surfaces an error, preserving the previous guard.
+- Added service-side `updateRouting()` plumbing for in-process, local IPC, and native-process service bridges.
+- Hardened controlled restarts:
+  - SSH replacement disconnects no longer schedule reconnect from the expected close event;
+  - Xray `SIGTERM` caused by our own stop/restart is no longer treated as runtime failure.
+- Replaced user-facing `OpenSource` naming with `Xray` in UI labels, notices, runtime diagnostics, and renderer module names.
+- Migrated persisted settings:
+  - old `activeGlobalTab: "opensource"` becomes `"xray"`;
+  - old `openSource...` risk fields are read into the new `xray...` settings.
+- Added storage regression coverage for legacy OpenSource-to-Xray settings migration.
+- Verification passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 92 tests), and `npm run build`.
+
+### Start: sidebar GitHub link, collapsible navigation, and optimization pass
+
+- User requested a bottom-left GitHub link for `stansful/ssh-vpn-client-electron` with icon/name opening the site and a copy button copying the URL.
+- User requested the left navigation panel to be collapsible or icon-only with animation to free content space.
+- User requested tech-debt cleanup plus performance/battery/memory/file-size optimization.
+- Current focus: implement persistent collapsible sidebar UX, add GitHub affordance, reduce packaged runtime bloat where safe, and inspect hot paths for low-risk performance/memory fixes.
+
+### End: sidebar GitHub link, collapsible navigation, and optimization pass
+
+- Added a bottom-left GitHub repository action in the sidebar:
+  - icon/name opens `https://github.com/stansful/ssh-vpn-client-electron`;
+  - copy button copies the repository URL through main-process clipboard IPC.
+- Added a main-process allowlist for external URLs so the renderer can only open the project GitHub URL through the new IPC surface.
+- Added a persistent `settings.sidebarCollapsed` flag and an animated icon-only sidebar mode, with mobile layout safeguards so narrow windows keep readable navigation.
+- Added accessible labels/titles/current-page state for compact sidebar navigation.
+- Reduced packaged Xray resource weight by changing electron-builder filters to include only the executable runtime (`xray.exe`/`xray`) instead of also shipping unused `geoip.dat` and `geosite.dat`.
+- Updated the Xray downloader so geo data files are optional via `--include-geo`; the default runtime download now installs only the executable needed by the current generated Xray config.
+- Reduced background process-name routing polling from every 10 seconds to every 30 seconds for both SSH and Xray transports to lower idle CPU/battery overhead.
+- Explicitly enabled Electron background throttling for the renderer window.
+- Verification passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 91 tests), `npm run build`, and `npm run xray:ensure -- --all`.
+- Packaging was not rerun in this pass to avoid the known long signing/electron-builder step; the next portable build will apply the smaller Xray resource filter.
+
+### Start: upload/download stall hardening
+
+- User reports intermittent stalls before file uploads start, and the same class of stall can happen during downloads.
+- Current focus: inspect the local proxy byte-pump and SSH/Xray forwarding paths, then harden stream piping/backpressure/timeouts so large or idle-transfer setup does not hang indefinitely.
+
+### End: upload/download stall hardening
+
+- Fixed a SOCKS5 parser bug that could drop early application bytes when a client sent the SOCKS5 CONNECT request and the first TLS/HTTP payload in the same TCP chunk. This can manifest as uploads/downloads hanging before the transfer visibly starts.
+- Added a regression test proving SOCKS5 early bytes are preserved as `initialData`.
+- Added low-latency TCP socket configuration (`setNoDelay`, `setKeepAlive`) for local proxy sockets and the SSH TCP transport.
+- Added a SOCKS/HTTP proxy handshake timeout so half-open or malformed proxy handshakes cannot hang forever before transfer setup.
+- Added backpressure-aware socket writing for both `Socks5Proxy` and `LocalTcpProxy`:
+  - waits for local socket drain when needed;
+  - caps queued local-socket output to avoid unbounded memory growth;
+  - waits for queued remote data to flush before ending the local socket.
+- Increased live SSH operation timeout from 15 seconds to 60 seconds, reducing false timeouts while slow remote endpoints or large uploads wait for SSH channel window updates.
+- Checks passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 91 tests), and `npm run build`.
+- Rebuilt Windows portable artifacts with the stall hardening:
+  - `release/shadow-ssh-0.1.0-windows-portable-x64.exe`;
+  - `release/shadow-ssh-0.1.0-windows-portable-arm64.exe`.
+- Checked for leftover Electron/Vite/electron-builder/signtool/shadow-ssh processes with `pgrep`; none were running.
+
+### Start: routing mode live reconnect
+
+- User reported that changing Settings > Routing mode between `Proxy all` and `Selected rules` does not affect the active connection until reconnect.
+- Current focus: make routing mode changes apply to the active SSH/Xray lifecycle immediately, using reconnect or service-side routing reapply as appropriate.
+
+### End: routing mode live reconnect
+
+- Updated the main-process `updateRoutingMode` IPC handler so a changed routing mode reconnects the currently active transport when SSH/Xray is connected, connecting, or reconnecting.
+- SSH mode changes reconnect through the existing SSH connect lifecycle; OpenSource mode changes reconnect through the Xray connect lifecycle.
+- If the user switches to `Selected rules` with zero enabled rules while connected, the active tunnel is disconnected and an error is surfaced instead of leaving stale `Proxy all` routing active.
+- Checks passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 90 tests), and `npm run build`.
+- Checked for leftover Electron/Vite/electron-builder/signtool/shadow-ssh processes with `pgrep`; none were running.
+
+### Start: macOS/Linux Xray runtime packaging fix
+
+- User hit packaging preflight while running macOS portable packaging: `resources/xray/macos/x64/xray` was missing.
+- Current focus: download official Xray runtime binaries for the remaining macOS/Linux x64/arm64 targets and verify macOS packaging passes with embedded runtime.
+
+### End: macOS/Linux Xray runtime packaging fix
+
+- Ran `npm run xray:download-all` and installed official Xray-core `v26.3.27` runtime binaries for all supported desktop targets:
+  - Windows x64/arm64;
+  - macOS x64/arm64;
+  - Linux x64/arm64.
+- Verified runtime preflight with `npm run xray:ensure -- --all`.
+- Re-ran `npm run pack:portable-mac`; macOS x64 and arm64 `.app` directory packaging now passes and includes embedded Xray runtime.
+- Ran `npm run pack:portable-linux`; Linux x64 and arm64 AppImage packaging also passes and includes embedded Xray runtime.
+- Produced Linux artifacts:
+  - `release/shadow-ssh-0.1.0-linux-portable-x86_64.AppImage`;
+  - `release/shadow-ssh-0.1.0-linux-portable-arm64.AppImage`.
+- macOS packaging is unsigned as expected on this host because no Developer ID identity is installed.
+- Checked for leftover Electron/Vite/electron-builder/signtool/shadow-ssh processes with `pgrep`; none were running.
+
+### Start: bundled Xray runtime and routing mode settings move
+
+- User reported packaged Windows portable cannot find Xray at `resources/xray/windows/x64/xray.exe` after extraction.
+- User asked to embed Xray into the portable exe.
+- User asked to move the now-global `Routing mode` selector from Main to Settings.
+- Current focus: inspect current resource packaging/runtime lookup, make Xray packaging preflight explicit, add a supported way to bundle runtime binaries into artifacts, and move routing mode control into Settings without changing routing behavior.
+
+### End: bundled Xray runtime and routing mode settings move
+
+- Confirmed `resources/xray/...` only contained placeholder `.gitkeep` files, so previous portable builds had no real Xray binary to embed.
+- Added Xray runtime tooling:
+  - `npm run xray:download` for a specific/current target;
+  - `npm run xray:download-win` for Windows x64/arm64;
+  - `npm run xray:download-all` for all supported desktop targets;
+  - `npm run xray:ensure` for packaging preflight checks.
+- Added electron-builder preflight in `scripts/electron-builder-with-local-dist.mjs` so packaging fails early if the target Xray runtime is missing instead of producing an exe that fails at runtime.
+- Downloaded official Xray-core `v26.3.27` Windows runtimes and installed:
+  - `resources/xray/windows/x64/xray.exe`, `geoip.dat`, `geosite.dat`;
+  - `resources/xray/windows/arm64/xray.exe`, `geoip.dat`, `geosite.dat`.
+- Moved the global `Routing mode` segmented control from Main to Settings > Routing.
+- Removed the redundant Main routing facts/control surface while keeping selected-rules blocking logic intact.
+- Checks passed: `npm run xray:ensure -- --target windows/x64 --target windows/arm64`, `npm run typecheck`, `npm run lint`, `npm test` (17 files, 90 tests), and `npm run build`.
+- Packaging verification passed:
+  - `npm run pack:win-dir-x64`;
+  - `npm run pack:win-exe-x64`;
+  - `npm run pack:win-exe-arm64`;
+  - verified `release/win-unpacked/resources/xray/windows/x64/xray.exe`;
+  - verified `release/win-arm64-unpacked/resources/xray/windows/arm64/xray.exe`;
+  - rebuilt `release/shadow-ssh-0.1.0-windows-portable-x64.exe` with embedded Xray runtime;
+  - rebuilt `release/shadow-ssh-0.1.0-windows-portable-arm64.exe` with embedded Xray runtime.
+- Checked for leftover Electron/Vite/electron-builder/signtool/shadow-ssh processes with `pgrep`; none were running.
+
+### Start: Main unused facts cleanup
+
+- User pointed at the Main facts row with `Check endpoint` and `Reconnect attempts` and asked to remove it from the UI because it is unused.
+- Current focus: remove the redundant Main facts without touching the underlying endpoint/reconnect runtime data.
+
+### End: Main unused facts cleanup
+
+- Removed the redundant `Check endpoint` and `Reconnect attempts` cards from the Main facts grid.
+- Kept the editable check endpoint control and runtime reconnect data intact.
+- Checks passed: `npm run typecheck`, `npm run lint`, and `npm run build`.
+- Checked for leftover Electron/Vite/electron-builder/shadow-ssh processes with `pgrep`; none were running.
+
+### Start: OpenSource transport support and Main transport switch
+
+- User reported OpenSource profiles with `xhttp` are blocked as unsupported and asked to add support, plus broader protocol/transport support.
+- User asked to move the SSH/OpenSource choice inside the Main tab instead of showing OpenSource as a separate left-sidebar item.
+- Current focus: expand Xray stream config generation for currently parsed transports, remove the sidebar OpenSource entry, and add a Main-level transport switch that renders SSH or OpenSource connection UI.
+
+### End: OpenSource transport support and Main transport switch
+
+- Removed the hard UI/core block that treated `xhttp`, `httpupgrade`, `mkcp`, and `hysteria` as unsupported OpenSource/Xray transports.
+- Expanded Xray stream config generation:
+  - `xhttpSettings` with `host`, `path`, and `mode`;
+  - `httpupgradeSettings` with `host` and `path`;
+  - `kcpSettings` for `mkcp`/`kcp`, including `seed` and `headerType`;
+  - `httpSettings` for `http`/`h2` transport aliases;
+  - best-effort `hysteriaSettings` for parsed Hysteria transport parameters.
+- Added transport alias normalization for `kcp -> mkcp`, `h2/http2 -> http`, and `http_upgrade/http-upgrade -> httpupgrade`.
+- Moved the SSH/OpenSource selection into the Main tab using the persisted `settings.activeGlobalTab` setting.
+- Removed the OpenSource item from the left sidebar and removed it from the renderer `View` route type/labels.
+- Kept SSH and OpenSource runtime controls separated inside Main so an active Xray session is not displayed as an SSH connection.
+- Added regression tests for parser alias normalization and Xray config generation for XHTTP, HTTPUpgrade, KCP, and HTTP/H2 transports.
+- Checks passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 90 tests), and `npm run build`.
+- Checked for leftover Electron/Vite/electron-builder/shadow-ssh processes with `pgrep`; none were running.
+
+### Start: renderer SOLID split and large-file cleanup
+
+- User pointed out that `src/renderer/App.tsx` is about 800 lines and asked to split similar places according to SOLID/patterns.
+- Initial size scan shows the largest files are `src/main/main.ts`, `src/renderer/App.tsx`, SSH/Xray service/core files, and storage.
+- Current focus: safely split the renderer orchestration first into feature hooks/components so `App.tsx` becomes a small composition root, then re-run typecheck/lint/tests/build before touching backend-heavy files.
+
+### End: renderer SOLID split and large-file cleanup
+
+- Reduced `src/renderer/App.tsx` from 794 lines to 109 lines. It is now a composition root that wires shell, hooks, views, and modals.
+- Split renderer orchestration into feature hooks:
+  - `useSnapshot`, `useAsyncAction`, `useRoutingController`, `useSshEntitiesController`, `useEndpointController`, `useTerminalController`, `useLogsController`, `useOpenSourceController`, and `useUpdateController`.
+- Split renderer app composition into `components/app/AppViews.tsx` and `components/app/AppModals.tsx`.
+- Reduced `src/main/main.ts` from 979 lines to 700 lines by extracting:
+  - `app/main-window.ts` for BrowserWindow lifecycle and renderer mount diagnostics;
+  - `app/paths.ts` for user-data and Xray binary path resolution;
+  - `app/runtime-format.ts` for packaged path/url formatting and startup error HTML;
+  - `app/public-proxy-refresh.ts` for manual public config refresh;
+  - `app/portable-update-controller.ts` for portable update state/check/download logic.
+- Reduced `src/service/xray-service.ts` from 617 lines to 490 lines by extracting process helpers into `service/xray/process-utils.ts` and SOCKS check helpers into `core/network/socks5-check.ts`.
+- Left the remaining large protocol/core files (`live-client`, `live-ssh-service`, `socks5-proxy`, `session-state`, storage) intact for now because they need narrower protocol/storage-specific refactors with regression tests, not a broad move-only pass.
+- Checks passed: `npm run typecheck`, `npm run lint`, `npm test` (17 files, 88 tests), and `npm run build`.
+
+### Start: desktop updater and OpenSource proxy transport
+
+- User approved a custom GitHub updater for portable Windows `.exe` assets, initially Windows x64/arm64 only.
+- User requested VLESS, VMess, and Trojan support, not VLESS-only.
+- User requested the OpenSource/VLESS transport to preserve the current desktop business logic: mutual SSH/Xray transport lifecycle, existing routing modes/rules, checks, diagnostics, and graceful disconnect.
+- User rejected periodic auto-sync, but requested a manual Refresh action that pulls public configs plus pinning and "delete all except pinned".
+- Current focus: add shared proxy/update models, encrypted proxy profile storage, share-link parsers, manual public refresh, OpenSource UI tab, and an Xray child-process runtime path that reuses current local proxy/routing infrastructure.
+
+### End: desktop updater and OpenSource proxy transport
+
+- Added shared OpenSource proxy models for VLESS, VMess, and Trojan profiles, including protocol, transport/security metadata, encrypted raw URI storage, selected/pinned/stale flags, and import result reporting.
+- Added share-link parsing for `vless://`, `vmess://`, and `trojan://`, plus Xray outbound/config generation for supported `tcp`, `ws`, and `grpc` transports with `none`, `tls`, and `reality` security modes.
+- Added an Xray service bridge that starts a child Xray runtime, writes a service-side config under app user data, exposes local HTTP and SOCKS endpoints, routes Windows system proxy/PAC through the HTTP endpoint, keeps SOCKS for check-tunnel/direct use, reuses selected-rules flow, keeps SSH and Xray mutually exclusive, reconnects the Xray child process after unexpected exit, and restores routing on disconnect/delete/quit.
+- Added production runtime path conventions without bundling heavy binaries by default: `SHADOW_SSH_XRAY_PATH` for development/override, and packaged `resources/xray/<platform>/<arch>/xray(.exe)` locations for Windows/macOS/Linux x64/arm64 when binaries are supplied.
+- Added the OpenSource UI screen with Add profile, bulk Import links, manual Refresh public configs, pin/unpin, delete profile, delete all unpinned, selected-profile connect/disconnect, check tunnel, risk acknowledgement, and profile search.
+- Optimized bulk OpenSource import and delete-unpinned secret persistence so Refresh/import does not rewrite the encrypted secret store once per profile.
+- Added a custom GitHub portable updater for Windows x64/arm64 assets from `stansful/ssh-vpn-client-electron`, including SemVer comparison, release asset selection, ETag cache storage, trusted download URL checks, SHA-256 digest verification, and Settings controls for check/download/open downloaded file.
+- Kept auto-sync disabled by design; public configs are pulled only by the Refresh button.
+- Added tests for proxy share-link parsing, Xray config generation, unsupported transport rejection, and portable update asset/version handling.
+- Checks passed: `npm run typecheck`, `npm test` (17 files, 88 tests), `npm run lint`, and `npm run build`.
+- Note: actual OpenSource connection on a client requires real Xray binaries to be placed into `resources/xray/<platform>/<arch>/` or supplied through `SHADOW_SSH_XRAY_PATH`; the repo now has placeholder directories so packaging paths are stable.
+
 ### Start: tray icon packaged path fix
 
 - User reported the Windows tray entry has a tooltip but no visible icon.

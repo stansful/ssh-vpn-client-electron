@@ -22,7 +22,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   loggingEnabled: true,
   diagnosticsLoggingEnabled: true,
   fileLoggingEnabled: true,
-  closeToTrayEnabled: true
+  closeToTrayEnabled: true,
+  sidebarCollapsed: false,
+  activeGlobalTab: "ssh",
+  xrayConsentAccepted: false,
+  showXrayWarningOnEnter: true,
+  xrayRiskBannerExpanded: true
 };
 
 export function createDefaultStore(): AppStore {
@@ -30,6 +35,7 @@ export function createDefaultStore(): AppStore {
     schemaVersion: STORE_SCHEMA_VERSION,
     sshConfigs: [],
     sshKeys: [],
+    proxyProfiles: [],
     settings: DEFAULT_SETTINGS,
     routingMode: "proxy-all",
     routingRules: []

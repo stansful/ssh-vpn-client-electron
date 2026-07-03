@@ -12,6 +12,7 @@ export interface SystemProxyApplyRequest {
   rules: RoutingRule[];
   socksHost: string;
   socksPort: number;
+  proxyProtocol?: "mixed" | "http" | "socks";
 }
 
 export interface SystemProxyApplyResult {
@@ -54,14 +55,14 @@ export class WindowsSystemProxyManager {
     if (request.mode === "proxy-all") {
       await this.stopPacServer();
       await regAddDword("ProxyEnable", "1");
-      await regAddString("ProxyServer", buildWindowsProxyServer(request.socksHost, request.socksPort));
+      await regAddString("ProxyServer", buildWindowsProxyServer(request.socksHost, request.socksPort, request.proxyProtocol ?? "mixed"));
       await regDeleteValue("AutoConfigURL");
       await regAddDword("AutoDetect", "0");
       await refreshWindowsProxy();
       return { applied: true, message: `Windows system HTTP/SOCKS proxy enabled at ${request.socksHost}:${request.socksPort}.` };
     }
 
-    const pac = buildProxyPac(request.rules, request.socksHost, request.socksPort);
+    const pac = buildProxyPac(request.rules, request.socksHost, request.socksPort, request.proxyProtocol ?? "mixed");
     await mkdir(this.pacDirectory, { recursive: true });
     await writeFile(this.pacPath, pac, "utf8");
     const pacUrl = await this.startPacServer(pac);
@@ -153,8 +154,8 @@ export class WindowsSystemProxyManager {
   }
 }
 
-export function buildProxyPac(rules: RoutingRule[], socksHost: string, socksPort: number): string {
-  const proxy = `PROXY ${socksHost}:${socksPort}; SOCKS5 ${socksHost}:${socksPort}; SOCKS ${socksHost}:${socksPort}`;
+export function buildProxyPac(rules: RoutingRule[], socksHost: string, socksPort: number, proxyProtocol: "mixed" | "http" | "socks" = "mixed"): string {
+  const proxy = buildPacProxyReturn(socksHost, socksPort, proxyProtocol);
   const domainRules = rules.filter((rule) => rule.enabled && rule.type === "domain").map((rule) => normalizeDomainRule(rule.value));
   const ipRules = rules.filter((rule) => rule.enabled && rule.type === "ip").map((rule) => rule.value.trim()).filter(Boolean);
 
@@ -283,9 +284,26 @@ function defaultPacDirectory(): string {
   return path.join(userData, "routing");
 }
 
-function buildWindowsProxyServer(host: string, port: number): string {
+function buildWindowsProxyServer(host: string, port: number, proxyProtocol: "mixed" | "http" | "socks"): string {
   const endpoint = `${host}:${port}`;
+  if (proxyProtocol === "http") {
+    return `http=${endpoint};https=${endpoint}`;
+  }
+  if (proxyProtocol === "socks") {
+    return `socks=${endpoint}`;
+  }
   return `http=${endpoint};https=${endpoint};socks=${endpoint}`;
+}
+
+function buildPacProxyReturn(host: string, port: number, proxyProtocol: "mixed" | "http" | "socks"): string {
+  const endpoint = `${host}:${port}`;
+  if (proxyProtocol === "http") {
+    return `PROXY ${endpoint}`;
+  }
+  if (proxyProtocol === "socks") {
+    return `SOCKS5 ${endpoint}; SOCKS ${endpoint}`;
+  }
+  return `PROXY ${endpoint}; SOCKS5 ${endpoint}; SOCKS ${endpoint}`;
 }
 
 function closeServer(server: Server): Promise<void> {

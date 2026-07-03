@@ -7,6 +7,11 @@ const platformMap = new Map([
   ["--mac", "darwin"],
   ["--linux", "linux"]
 ]);
+const xrayPlatformMap = new Map([
+  ["--win", "windows"],
+  ["--mac", "macos"],
+  ["--linux", "linux"]
+]);
 
 const args = process.argv.slice(2);
 const platformFlag = args.find((arg) => platformMap.has(arg));
@@ -22,6 +27,23 @@ if (!hasElectronDist && platformFlag && archFlag) {
     builderArgs.push(`--config.electronDist=${electronDist}`);
   } else {
     console.warn(`[electron-builder] Local Electron runtime not found at ${electronDist}; electron-builder may download it.`);
+  }
+}
+
+if (platformFlag && archFlag) {
+  const xrayPlatform = xrayPlatformMap.get(platformFlag);
+  const arch = archFlag.slice(2);
+  const executableName = platformFlag === "--win" ? "xray.exe" : "xray";
+  const runtimePath = path.join("resources", "xray", xrayPlatform, arch, executableName);
+  if (!existsSync(runtimePath)) {
+    console.error([
+      `[electron-builder] Xray runtime is missing at ${runtimePath}.`,
+      "The packaged Xray transport would fail at runtime without it.",
+      platformFlag === "--win"
+        ? "Run `npm run xray:download-win` before building Windows portable artifacts."
+        : "Run `npm run xray:download-all` or `npm run xray:download -- --target <platform>/<arch>` before packaging."
+    ].join("\n"));
+    process.exit(1);
   }
 }
 

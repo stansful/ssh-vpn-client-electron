@@ -1,9 +1,8 @@
-import { app, BrowserWindow, clipboard, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, clipboard, ipcMain, Menu, shell } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import os from "node:os";
 import { AppStorage } from "./storage/app-storage.js";
 import { listActiveProcesses } from "./processes.js";
 import { createPlatformTarget, nativeServiceExists, resolveNativeServicePath } from "./platform/targets.js";
@@ -13,16 +12,25 @@ import { LocalIpcServiceBridge } from "../service/local-ipc-client.js";
 import { defaultServiceEndpoint } from "../service/local-ipc-protocol.js";
 import { NativeProcessServiceBridge } from "../service/native-process-client.js";
 import { LiveSshServiceBridge } from "../service/live-ssh-service.js";
+import { XrayServiceBridge } from "../service/xray-service.js";
+import { createMainWindow } from "./app/main-window.js";
+import { resolveUserDataPath, resolveXrayExecutablePath } from "./app/paths.js";
+import { PortableUpdateController } from "./app/portable-update-controller.js";
+import { refreshPublicProxyProfiles } from "./app/public-proxy-refresh.js";
+import { formatError, formatRuntimePath as formatRuntimePathValue } from "./app/runtime-format.js";
 import { TrayController, resolveTrayIconPaths } from "./app/tray.js";
+import { GITHUB_REPOSITORY_URL } from "../shared/links.js";
 import type {
   AppSettings,
   AppSnapshot,
   DiagnosticsEntry,
+  ImportProxyProfilesInput,
   RoutingMode,
   RoutingRule,
   RuntimeStatus,
   TerminalLine,
   TunnelCheckResult,
+  UpsertProxyProfileInput,
   UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "../shared/types.js";
@@ -34,18 +42,22 @@ const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname
 const rendererDist = path.join(__dirname, "..", "renderer");
 const preloadPath = path.join(__dirname, "..", "preload", "preload.js");
 const iconPath = app.isPackaged ? path.join(rendererDist, "icon.svg") : path.join(projectRoot, "icon.svg");
+const runtimeFormatOptions = { packaged: app.isPackaged, resourcesPath: process.resourcesPath };
 const trayIconPaths = resolveTrayIconPaths({ packaged: app.isPackaged, projectRoot, resourcesPath: process.resourcesPath });
 const appDisplayName = process.env.SHADOW_SSH_BUILD_CHANNEL === "development" ? "Shadow SSH Dev" : "Shadow SSH";
 const explicitUserDataPath = resolveUserDataPath(appDisplayName);
 const persistedStorePath = path.join(explicitUserDataPath, "storage", "app-store.v1.json");
 const mainLogPath = path.join(explicitUserDataPath, "logs", "main.log");
 const routingDataPath = path.join(explicitUserDataPath, "routing");
+const xrayRuntimeDataPath = path.join(explicitUserDataPath, "xray");
+const updateDownloadPath = path.join(explicitUserDataPath, "updates");
 const DEFAULT_WINDOW_WIDTH = 980;
 const DEFAULT_WINDOW_HEIGHT = 680;
 const MAX_DIAGNOSTICS_IN_MEMORY = 500;
 const MAX_TERMINAL_LINES_IN_MEMORY = 2000;
 
-let mainWindow: BrowserWindow | undefined;
+const formatRuntimePath = (value: string): string => formatRuntimePathValue(runtimeFormatOptions, value);
+
 let runtime: RuntimeStatus;
 let diagnostics: DiagnosticsEntry[] = [];
 let terminal: TerminalLine[] = [];
@@ -56,6 +68,8 @@ let diagnosticsLoggingEnabled = true;
 let fileLoggingEnabled = true;
 let loggingMasterEnabled = true;
 let applicationQuitting = false;
+let activeTransport: "ssh" | "xray" = "ssh";
+const portableUpdates = new PortableUpdateController(updateDownloadPath);
 
 app.setName(appDisplayName);
 registerProcessErrorHandlers();
@@ -80,6 +94,23 @@ runtime = {
 const storage = new AppStorage();
 service = new InProcessServiceBridge(runtime);
 serviceEventUnsubscribe = service.onEvent(handleServiceEvent);
+const xrayService = new XrayServiceBridge(
+  {
+    ...createDefaultRuntimeStatus(platformTarget),
+    transport: "xray",
+    message: "Xray transport is ready."
+  },
+  {
+    pacDirectory: path.join(routingDataPath, "xray"),
+    runtimeDirectory: xrayRuntimeDataPath,
+    executablePath: resolveXrayExecutablePath({
+      packaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      projectRoot
+    })
+  }
+);
+const xrayEventUnsubscribe = xrayService.onEvent(handleXrayServiceEvent);
 const trayController = new TrayController({
   appName: appDisplayName,
   iconPaths: trayIconPaths,
@@ -113,85 +144,34 @@ app.on("window-all-closed", () => {
 let serviceDisposeStarted = false;
 app.on("before-quit", (event) => {
   applicationQuitting = true;
-  if (!service.dispose || serviceDisposeStarted) {
+  if (serviceDisposeStarted) {
     return;
   }
   event.preventDefault();
   serviceDisposeStarted = true;
-  void service.dispose().finally(() => {
+  void Promise.all([service.dispose?.() ?? Promise.resolve(), xrayService.dispose()]).finally(() => {
     trayController.destroy();
+    serviceEventUnsubscribe?.();
+    xrayEventUnsubscribe?.();
     app.quit();
   });
 });
 
 async function createWindow(): Promise<void> {
-  await writeMainLog(
-    `Creating window. renderer=${formatRuntimePath(path.join(rendererDist, "index.html"))}, preload=${formatRuntimePath(preloadPath)}, icon=${formatRuntimePath(iconPath)}`
-  );
-  mainWindow = new BrowserWindow({
+  await createMainWindow({
+    ...runtimeFormatOptions,
+    appName: app.getName(),
+    rendererDist,
+    preloadPath,
+    iconPath,
     width: DEFAULT_WINDOW_WIDTH,
     height: DEFAULT_WINDOW_HEIGHT,
-    minWidth: DEFAULT_WINDOW_WIDTH,
-    minHeight: DEFAULT_WINDOW_HEIGHT,
-    title: app.getName(),
-    icon: iconPath,
-    autoHideMenuBar: true,
-    backgroundColor: "#f6f7f9",
-    webPreferences: {
-      preload: preloadPath,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false
-    }
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+    onClosed: () => undefined,
+    onClose: (event, window) => trayController.handleWindowClose(event, window),
+    appendError,
+    writeLog: writeMainLog
   });
-
-  mainWindow.on("closed", () => {
-    mainWindow = undefined;
-  });
-  mainWindow.on("close", (event) => {
-    const window = mainWindow;
-    if (window) {
-      trayController.handleWindowClose(event, window);
-    }
-  });
-  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
-    const message = `Renderer failed to load ${formatRuntimeUrl(validatedURL)}: ${errorCode} ${errorDescription}`;
-    appendError(message);
-    void writeMainLog(message);
-  });
-  mainWindow.webContents.on("render-process-gone", (_event, details) => {
-    const message = `Renderer process gone: reason=${details.reason}, exitCode=${details.exitCode}`;
-    appendError(message);
-    void writeMainLog(message);
-  });
-  mainWindow.webContents.on("preload-error", (_event, failedPreloadPath, error) => {
-    const message = `Preload failed ${formatRuntimePath(failedPreloadPath)}: ${formatError(error)}`;
-    appendError(message);
-    void writeMainLog(message);
-  });
-  mainWindow.webContents.on("did-finish-load", () => {
-    const message = `Renderer finished load: ${formatRuntimeUrl(mainWindow?.webContents.getURL() ?? "unknown")}`;
-    void writeMainLog(message);
-    scheduleRendererMountCheck();
-  });
-  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    const levelName = ["debug", "info", "warning", "error"][level] ?? `level-${level}`;
-    void writeMainLog(`Renderer console ${levelName}: ${message}${sourceId ? ` (${formatRuntimeUrl(sourceId)}:${line})` : ""}`);
-  });
-
-  if (process.env.VITE_DEV_SERVER_URL) {
-    await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-    mainWindow.webContents.openDevTools({ mode: "detach" });
-  } else {
-    try {
-      await mainWindow.loadFile(path.join(rendererDist, "index.html"));
-    } catch (error) {
-      const message = `Unable to load renderer: ${formatError(error)}`;
-      appendError(message);
-      await writeMainLog(message);
-      await mainWindow.loadURL(createErrorDataUrl(message));
-    }
-  }
 }
 
 function registerProcessErrorHandlers(): void {
@@ -206,41 +186,6 @@ function registerProcessErrorHandlers(): void {
     appendError(message);
     void writeMainLog(message);
   });
-}
-
-function scheduleRendererMountCheck(): void {
-  const window = mainWindow;
-  if (!window) {
-    return;
-  }
-  setTimeout(() => {
-    if (window.isDestroyed() || window.webContents.isDestroyed()) {
-      return;
-    }
-    void window.webContents
-      .executeJavaScript(
-        `(() => {
-          const root = document.getElementById("root");
-          return {
-            url: location.href,
-            readyState: document.readyState,
-            rootChildCount: root ? root.childElementCount : -1,
-            bodyTextLength: document.body ? document.body.innerText.length : -1
-          };
-        })();`,
-        true
-      )
-      .then((status: { url: string; readyState: string; rootChildCount: number; bodyTextLength: number }) => {
-        const message = `Renderer mount status: url=${formatRuntimeUrl(status.url)}, readyState=${status.readyState}, rootChildCount=${status.rootChildCount}, bodyTextLength=${status.bodyTextLength}`;
-        void writeMainLog(message);
-        if (status.rootChildCount <= 0) {
-          appendError(`Renderer did not mount React root. ${message}`);
-        }
-      })
-      .catch((error: unknown) => {
-        void writeMainLog(`Renderer mount check failed: ${formatError(error)}`);
-      });
-  }, 1500);
 }
 
 async function initializeApplicationServices(): Promise<void> {
@@ -320,6 +265,40 @@ function registerIpcHandlers(): void {
     await storage.deleteKey(id);
     return createSnapshot();
   });
+  ipcMain.handle(IPC_CHANNELS.upsertProxyProfile, async (_event, input: UpsertProxyProfileInput) => {
+    await storage.upsertProxyProfile(input);
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.importProxyProfiles, async (_event, input: ImportProxyProfilesInput) => {
+    const result = await storage.importProxyProfiles(input);
+    return { snapshot: createSnapshot(), result: result.result };
+  });
+  ipcMain.handle(IPC_CHANNELS.refreshProxyProfiles, async () => {
+    const result = await refreshPublicProxyProfiles(storage);
+    return { snapshot: createSnapshot(), result };
+  });
+  ipcMain.handle(IPC_CHANNELS.selectProxyProfile, async (_event, id: string) => {
+    await storage.selectProxyProfile(id);
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.toggleProxyProfilePin, async (_event, id: string) => {
+    await storage.toggleProxyProfilePin(id);
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.deleteProxyProfile, async (_event, id: string) => {
+    if (activeTransport === "xray" && xrayService.getStatus().activeConfigId === id) {
+      await xrayService.disconnect();
+    }
+    await storage.deleteProxyProfile(id);
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.deleteUnpinnedProxyProfiles, async () => {
+    if (activeTransport === "xray") {
+      await xrayService.disconnect();
+    }
+    await storage.deleteUnpinnedProxyProfiles();
+    return createSnapshot();
+  });
   ipcMain.handle(IPC_CHANNELS.updateSettings, async (_event, settings: AppSettings) => {
     applyLoggingSettings(settings);
     await storage.updateSettings(settings);
@@ -327,12 +306,21 @@ function registerIpcHandlers(): void {
     return createSnapshot();
   });
   ipcMain.handle(IPC_CHANNELS.updateRoutingMode, async (_event, mode: RoutingMode) => {
+    const previousMode = storage.getStore().routingMode;
+    const previousStatus = activeTunnelService().getStatus();
     await storage.updateRoutingMode(mode);
+    if (mode !== previousMode && shouldReconnectForRoutingModeChange(previousStatus)) {
+      await applyActiveTransportRoutingChange(mode);
+    }
     return createSnapshot();
   });
   ipcMain.handle(IPC_CHANNELS.updateRoutingRules, async (_event, rules: RoutingRule[]) => {
     await storage.updateRoutingRules(rules);
-    await service.updateRoutingRules(rules);
+    if (activeTransport === "xray") {
+      await xrayService.updateRoutingRules(rules);
+    } else {
+      await service.updateRoutingRules(rules);
+    }
     return createSnapshot();
   });
   ipcMain.handle(IPC_CHANNELS.clearDiagnostics, () => {
@@ -346,25 +334,63 @@ function registerIpcHandlers(): void {
     await connect();
     return createSnapshot();
   });
+  ipcMain.handle(IPC_CHANNELS.connectProxy, async () => {
+    await connectProxy();
+    return createSnapshot();
+  });
   ipcMain.handle(IPC_CHANNELS.disconnect, async () => {
-    await service.disconnect();
+    await disconnectActiveTransport();
     return createSnapshot();
   });
   ipcMain.handle(IPC_CHANNELS.checkTunnel, async (_event, endpoint?: string) => {
     const store = storage.getStore();
-    lastTunnelCheck = await service.checkTunnel(endpoint ?? store.settings.checkEndpoint);
+    lastTunnelCheck = await activeTunnelService().checkTunnel(endpoint ?? store.settings.checkEndpoint);
     return createSnapshot();
   });
   ipcMain.handle(IPC_CHANNELS.openTerminal, async () => {
-    await service.openTerminal();
+    await activeTunnelService().openTerminal();
     return createSnapshot();
   });
   ipcMain.handle(IPC_CHANNELS.closeTerminal, async () => {
-    await service.closeTerminal();
+    await activeTunnelService().closeTerminal();
     return createSnapshot();
   });
   ipcMain.handle(IPC_CHANNELS.terminalInput, async (_event, input: string) => {
-    await service.terminalInput(input);
+    await activeTunnelService().terminalInput(input);
+  });
+  ipcMain.handle(IPC_CHANNELS.checkForUpdates, async (_event, force?: boolean) => {
+    const update = await portableUpdates.check({
+      currentVersion: app.getVersion(),
+      platformTarget,
+      storage,
+      force: Boolean(force)
+    });
+    return { snapshot: createSnapshot(), update };
+  });
+  ipcMain.handle(IPC_CHANNELS.downloadUpdate, async () => {
+    await portableUpdates.downloadSelected();
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.openDownloadedUpdate, async () => {
+    if (!portableUpdates.download.filePath) {
+      return false;
+    }
+    const errorMessage = await shell.openPath(portableUpdates.download.filePath);
+    if (errorMessage) {
+      throw new Error(errorMessage);
+    }
+    return true;
+  });
+  ipcMain.handle(IPC_CHANNELS.copyText, (_event, text: string) => {
+    if (typeof text !== "string" || text.length > 10_000) {
+      throw new Error("Clipboard payload is invalid.");
+    }
+    clipboard.writeText(text);
+    return true;
+  });
+  ipcMain.handle(IPC_CHANNELS.openExternal, async (_event, url: string) => {
+    await shell.openExternal(assertAllowedExternalUrl(url));
+    return true;
   });
 }
 
@@ -445,6 +471,10 @@ async function connect(): Promise<void> {
   diagnostics = [];
   terminal = [];
   lastTunnelCheck = undefined;
+  if (activeTransport === "xray") {
+    await xrayService.disconnect();
+  }
+  activeTransport = "ssh";
   await service.connect({
     config,
     routingMode: store.routingMode,
@@ -454,20 +484,104 @@ async function connect(): Promise<void> {
   });
 }
 
+async function connectProxy(): Promise<void> {
+  const store = storage.getStore();
+  const profile = store.proxyProfiles.find((candidate) => candidate.id === store.selectedProxyProfileId);
+  if (!profile) {
+    appendError("Select or import an Xray profile before connecting.");
+    return;
+  }
+
+  const enabledRules = store.routingRules.filter((rule) => rule.enabled);
+  if (store.routingMode === "selected-rules" && enabledRules.length === 0) {
+    appendError("Selected rules mode requires at least one enabled routing rule.");
+    return;
+  }
+
+  diagnostics = [];
+  terminal = [];
+  lastTunnelCheck = undefined;
+  if (activeTransport === "ssh") {
+    await service.disconnect();
+  }
+  activeTransport = "xray";
+  await xrayService.connect({
+    profile,
+    routingMode: store.routingMode,
+    routingRules: store.routingRules,
+    checkEndpoint: store.settings.checkEndpoint,
+    secrets: storage.resolveProxySecrets(profile)
+  });
+}
+
+async function disconnectActiveTransport(): Promise<void> {
+  if (activeTransport === "xray") {
+    await xrayService.disconnect();
+  } else {
+    await service.disconnect();
+  }
+}
+
+async function applyActiveTransportRoutingChange(mode: RoutingMode): Promise<void> {
+  const store = storage.getStore();
+  const enabledRules = store.routingRules.filter((rule) => rule.enabled);
+  if (mode === "selected-rules" && enabledRules.length === 0) {
+    await disconnectActiveTransport();
+    appendError("Selected rules mode requires at least one enabled routing rule. Active tunnel was disconnected because routing mode changed.");
+    return;
+  }
+
+  if (activeTransport === "xray") {
+    await xrayService.updateRouting({
+      routingMode: mode,
+      routingRules: store.routingRules,
+      checkEndpoint: store.settings.checkEndpoint
+    });
+  } else {
+    await service.updateRouting({
+      routingMode: mode,
+      routingRules: store.routingRules,
+      checkEndpoint: store.settings.checkEndpoint
+    });
+  }
+}
+
+function shouldReconnectForRoutingModeChange(status: RuntimeStatus): boolean {
+  return status.state === "Connected" || status.state === "Connecting" || status.state === "Reconnecting";
+}
+
+function activeTunnelService(): ServiceBridge | XrayServiceBridge {
+  return activeTransport === "xray" ? xrayService : service;
+}
+
 function createSnapshot(): AppSnapshot {
-  runtime = service.getStatus();
+  runtime = activeTransport === "xray" ? xrayService.getStatus() : service.getStatus();
   return {
     store: storage.getStore(),
     runtime,
     diagnostics: structuredClone(diagnostics),
     logFilePaths: uniqueLogPaths(),
     terminal: structuredClone(terminal),
-    lastTunnelCheck
+    lastTunnelCheck,
+    updateInfo: portableUpdates.info,
+    updateDownload: portableUpdates.download
   };
 }
 
 function handleServiceEvent(event: ServiceEvent): void {
+  handleRuntimeEvent("ssh", event);
+}
+
+function handleXrayServiceEvent(event: ServiceEvent): void {
+  handleRuntimeEvent("xray", event);
+}
+
+function handleRuntimeEvent(source: "ssh" | "xray", event: ServiceEvent): void {
+  const isActive = activeTransport === source;
   if (event.type === "status-changed") {
+    if (!isActive) {
+      return;
+    }
     runtime = event.status;
   }
   if (event.type === "diagnostics-appended") {
@@ -479,12 +593,18 @@ function handleServiceEvent(event: ServiceEvent): void {
     }
   }
   if (event.type === "terminal-output") {
+    if (!isActive) {
+      return;
+    }
     terminal.push(event.line);
     if (terminal.length > MAX_TERMINAL_LINES_IN_MEMORY) {
       terminal = terminal.slice(-MAX_TERMINAL_LINES_IN_MEMORY);
     }
   }
   if (event.type === "tunnel-check-result") {
+    if (!isActive) {
+      return;
+    }
     lastTunnelCheck = event.result;
   }
   if (event.type === "error") {
@@ -492,7 +612,9 @@ function handleServiceEvent(event: ServiceEvent): void {
     appendError(event.message);
     return;
   }
-  broadcast(event);
+  if (isActive || event.type === "diagnostics-appended") {
+    broadcast(event);
+  }
 }
 
 function appendError(message: string): void {
@@ -613,91 +735,22 @@ function uniqueLogPaths(): string[] {
   return [mainLogPath];
 }
 
+function assertAllowedExternalUrl(value: string): string {
+  const url = new URL(value);
+  const repositoryUrl = new URL(GITHUB_REPOSITORY_URL);
+  const repositoryPath = repositoryUrl.pathname.replace(/\/$/u, "");
+  const requestedPath = url.pathname.replace(/\/$/u, "");
+  if (url.protocol !== "https:" || url.hostname !== repositoryUrl.hostname || requestedPath !== repositoryPath) {
+    throw new Error("External URL is not allowed.");
+  }
+  return url.toString();
+}
+
 async function ensureExplicitUserDataPath(): Promise<void> {
   try {
     await mkdir(explicitUserDataPath, { recursive: true });
     app.setPath("userData", explicitUserDataPath);
   } catch (error) {
     await writeMainLog(`Unable to set explicit userData path ${explicitUserDataPath}: ${formatError(error)}`);
-  }
-}
-
-function resolveUserDataPath(name: string): string {
-  if (process.env.SHADOW_SSH_USER_DATA_DIR) {
-    return process.env.SHADOW_SSH_USER_DATA_DIR;
-  }
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(appData, name);
-  }
-  if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", name);
-  }
-  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return path.join(configHome, name);
-}
-
-function formatError(error: unknown): string {
-  if (error instanceof Error) {
-    return `${error.message}${error.stack ? `\n${error.stack}` : ""}`;
-  }
-  return String(error);
-}
-
-function createErrorDataUrl(message: string): string {
-  const html = `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>Shadow SSH startup error</title>
-    <style>
-      body { margin: 0; font: 14px system-ui, sans-serif; color: #20242a; background: #f6f7f9; }
-      main { padding: 32px; max-width: 860px; }
-      h1 { margin: 0 0 12px; font-size: 24px; }
-      pre { white-space: pre-wrap; background: #fff; border: 1px solid #d6dae0; padding: 16px; border-radius: 8px; }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>Shadow SSH could not load the UI</h1>
-      <p>Check the main process log under the application data directory.</p>
-      <pre>${escapeHtml(message)}</pre>
-    </main>
-  </body>
-</html>`;
-  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
-}
-
-function escapeHtml(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
-}
-
-function formatRuntimePath(value: string): string {
-  if (!app.isPackaged || !value) {
-    return value;
-  }
-  const resourcesPath = path.normalize(process.resourcesPath);
-  const normalized = path.normalize(value);
-  if (normalized === resourcesPath) {
-    return "[app-resources]";
-  }
-  if (normalized.startsWith(`${resourcesPath}${path.sep}`)) {
-    return path.join("[app-resources]", path.relative(resourcesPath, normalized));
-  }
-  return value;
-}
-
-function formatRuntimeUrl(value: string): string {
-  if (!app.isPackaged || !value) {
-    return value;
-  }
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "file:") {
-      return value;
-    }
-    return `file://${formatRuntimePath(fileURLToPath(url))}`;
-  } catch {
-    return formatRuntimePath(value);
   }
 }

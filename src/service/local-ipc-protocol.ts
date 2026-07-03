@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import type { ServiceEvent } from "../shared/ipc.js";
-import type { ConnectRequest, RoutingRule, RuntimeStatus, SshConfig, TunnelCheckResult } from "../shared/types.js";
+import type { ConnectRequest, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TunnelCheckResult } from "../shared/types.js";
 
 export type ServiceCommand = { id: string; authToken?: string } & (
   | { type: "get-status" }
@@ -13,6 +13,7 @@ export type ServiceCommand = { id: string; authToken?: string } & (
   | { type: "terminal-input"; payload: { input: string } }
   | { type: "update-config"; payload: { config: SshConfig } }
   | { type: "update-routing-rules"; payload: { rules: RoutingRule[] } }
+  | { type: "update-routing"; payload: RoutingUpdateRequest }
   | { type: "list-process-connections" }
   | { type: "shutdown" }
 );

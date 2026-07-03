@@ -3,21 +3,27 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID }
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parseProxyShareLink, parseProxyShareLinks } from "../../core/proxy/share-link-parser.js";
 import { assertSshPrivateKeyText, normalizeSshPrivateKeyText } from "../../core/ssh/private-key.js";
 import { createDefaultStore, STORE_SCHEMA_VERSION } from "../../shared/defaults.js";
 import type {
+  ImportProxyProfilesInput,
+  ImportProxyProfilesResult,
   AppSettings,
   AppStore,
+  ProxyProfile,
+  ProxyServiceSecrets,
   RoutingMode,
   RoutingRule,
   SshServiceSecrets,
   SshConfig,
   SshKeyMetadata,
+  UpsertProxyProfileInput,
   UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "../../shared/types.js";
 
-type SecretKind = "ssh-password" | "private-key" | "private-key-passphrase";
+type SecretKind = "ssh-password" | "private-key" | "private-key-passphrase" | "proxy-uri";
 
 interface SecretRecord {
   id: string;
@@ -53,6 +59,7 @@ export class AppStorage {
     this.store = normalizeStore(await readJson<AppStore>(this.storePath, createDefaultStore()));
     this.secrets = await readJson<SecretStore>(this.secretPath, { schemaVersion: 1, secrets: {} });
     this.migrateConfigPassphrasesToKeys();
+    this.ensureProxySelection();
     await this.persistStore();
     await this.persistSecrets();
   }
@@ -209,6 +216,154 @@ export class AppStorage {
     return this.getStore();
   }
 
+  async upsertProxyProfile(input: UpsertProxyProfileInput): Promise<AppStore> {
+    const parsed = parseProxyShareLink(input.rawUri.trim());
+    const now = new Date().toISOString();
+    const existingById = input.id ? this.store.proxyProfiles.find((profile) => profile.id === input.id) : undefined;
+    const existingByFingerprint = this.store.proxyProfiles.find((profile) => profile.fingerprint === parsed.fingerprint);
+    const existing = existingById ?? existingByFingerprint;
+    const rawUriSecretId = await this.saveSecret("proxy-uri", parsed.rawUri, existing?.rawUriSecretId);
+    const profile: ProxyProfile = {
+      id: existing?.id ?? randomUUID(),
+      name: input.name.trim() || parsed.name,
+      protocol: parsed.protocol,
+      host: parsed.host,
+      port: parsed.port,
+      transport: parsed.transport,
+      security: parsed.security,
+      flow: parsed.flow,
+      source: input.source ?? existing?.source ?? "manual",
+      sourceUrl: existing?.sourceUrl,
+      rawUriSecretId,
+      fingerprint: parsed.fingerprint,
+      isSelected: existing?.isSelected ?? false,
+      isPinned: existing?.isPinned ?? false,
+      isStale: false,
+      lastTestStatus: existing?.lastTestStatus ?? "unknown",
+      lastLatencyMs: existing?.lastLatencyMs,
+      lastTestAt: existing?.lastTestAt,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      lastSeenAt: now
+    };
+
+    this.store.proxyProfiles = existing
+      ? this.store.proxyProfiles.map((candidate) => (candidate.id === existing.id ? profile : candidate))
+      : [...this.store.proxyProfiles, profile];
+    this.ensureProxySelection();
+    await this.persistStore();
+    return this.getStore();
+  }
+
+  async importProxyProfiles(input: ImportProxyProfilesInput): Promise<{ store: AppStore; result: ImportProxyProfilesResult }> {
+    const parsed = parseProxyShareLinks(input.text);
+    const now = new Date().toISOString();
+    let imported = 0;
+    let updated = 0;
+
+    for (const profileInput of parsed.profiles) {
+      const existing = this.store.proxyProfiles.find((profile) => profile.fingerprint === profileInput.fingerprint);
+      const rawUriSecretId = await this.saveSecret("proxy-uri", profileInput.rawUri, existing?.rawUriSecretId, false);
+      const profile: ProxyProfile = {
+        id: existing?.id ?? randomUUID(),
+        name: existing?.name || profileInput.name,
+        protocol: profileInput.protocol,
+        host: profileInput.host,
+        port: profileInput.port,
+        transport: profileInput.transport,
+        security: profileInput.security,
+        flow: profileInput.flow,
+        source: input.source,
+        sourceUrl: input.sourceUrl,
+        rawUriSecretId,
+        fingerprint: profileInput.fingerprint,
+        isSelected: existing?.isSelected ?? false,
+        isPinned: existing?.isPinned ?? false,
+        isStale: false,
+        lastTestStatus: existing?.lastTestStatus ?? "unknown",
+        lastLatencyMs: existing?.lastLatencyMs,
+        lastTestAt: existing?.lastTestAt,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        lastSeenAt: now
+      };
+      if (existing) {
+        updated += 1;
+        this.store.proxyProfiles = this.store.proxyProfiles.map((candidate) => (candidate.id === existing.id ? profile : candidate));
+      } else {
+        imported += 1;
+        this.store.proxyProfiles = [...this.store.proxyProfiles, profile];
+      }
+    }
+
+    if (input.source === "remote" && input.sourceUrl) {
+      const fingerprints = new Set(parsed.profiles.map((profile) => profile.fingerprint));
+      this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
+        profile.source === "remote" && profile.sourceUrl === input.sourceUrl && !fingerprints.has(profile.fingerprint)
+          ? { ...profile, isStale: true, updatedAt: now }
+          : profile
+      );
+    }
+
+    if (parsed.profiles.length > 0) {
+      await this.persistSecrets();
+    }
+    this.ensureProxySelection();
+    await this.persistStore();
+    const result: ImportProxyProfilesResult = {
+      imported,
+      updated,
+      skipped: parsed.skipped,
+      failed: parsed.errors.length,
+      errors: parsed.errors.slice(0, 20)
+    };
+    return { store: this.getStore(), result };
+  }
+
+  async selectProxyProfile(id: string): Promise<AppStore> {
+    if (!this.store.proxyProfiles.some((profile) => profile.id === id)) {
+      throw new Error("Proxy profile does not exist.");
+    }
+    this.store.selectedProxyProfileId = id;
+    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) => ({ ...profile, isSelected: profile.id === id }));
+    await this.persistStore();
+    return this.getStore();
+  }
+
+  async toggleProxyProfilePin(id: string): Promise<AppStore> {
+    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
+      profile.id === id ? { ...profile, isPinned: !profile.isPinned, updatedAt: new Date().toISOString() } : profile
+    );
+    await this.persistStore();
+    return this.getStore();
+  }
+
+  async deleteProxyProfile(id: string): Promise<AppStore> {
+    const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
+    if (!existing) {
+      return this.getStore();
+    }
+    this.store.proxyProfiles = this.store.proxyProfiles.filter((profile) => profile.id !== id);
+    await this.deleteSecret(existing.rawUriSecretId);
+    this.ensureProxySelection();
+    await this.persistStore();
+    return this.getStore();
+  }
+
+  async deleteUnpinnedProxyProfiles(): Promise<AppStore> {
+    const deleted = this.store.proxyProfiles.filter((profile) => !profile.isPinned);
+    this.store.proxyProfiles = this.store.proxyProfiles.filter((profile) => profile.isPinned);
+    for (const profile of deleted) {
+      await this.deleteSecret(profile.rawUriSecretId, false);
+    }
+    if (deleted.length > 0) {
+      await this.persistSecrets();
+    }
+    this.ensureProxySelection();
+    await this.persistStore();
+    return this.getStore();
+  }
+
   resolveServiceSecrets(config: SshConfig): SshServiceSecrets {
     return {
       password: config.passwordSecretId ? this.readSecret(config.passwordSecretId) : undefined,
@@ -216,6 +371,12 @@ export class AppStorage {
       privateKeyPassphrase: config.privateKeyId
         ? this.readPrivateKeyPassphraseSecret(config.privateKeyId) ?? (config.privateKeyPassphraseSecretId ? this.readSecret(config.privateKeyPassphraseSecretId) : undefined)
         : undefined
+    };
+  }
+
+  resolveProxySecrets(profile: ProxyProfile): ProxyServiceSecrets {
+    return {
+      rawUri: this.readSecret(profile.rawUriSecretId)
     };
   }
 
@@ -227,7 +388,7 @@ export class AppStorage {
     return privateKey;
   }
 
-  private async saveSecret(kind: SecretKind, value: string, existingId?: string): Promise<string> {
+  private async saveSecret(kind: SecretKind, value: string, existingId?: string, persist = true): Promise<string> {
     const now = new Date().toISOString();
     const id = existingId ?? randomUUID();
     const encrypted = encryptSecret(value, this.dataDir);
@@ -239,13 +400,17 @@ export class AppStorage {
       createdAt: this.secrets.secrets[id]?.createdAt ?? now,
       updatedAt: now
     };
-    await this.persistSecrets();
+    if (persist) {
+      await this.persistSecrets();
+    }
     return id;
   }
 
-  private async deleteSecret(id: string): Promise<void> {
+  private async deleteSecret(id: string, persist = true): Promise<void> {
     delete this.secrets.secrets[id];
-    await this.persistSecrets();
+    if (persist) {
+      await this.persistSecrets();
+    }
   }
 
   private readSecret(id: string): string {
@@ -294,6 +459,17 @@ export class AppStorage {
     });
   }
 
+  private ensureProxySelection(): void {
+    const selectable = this.store.proxyProfiles.filter((profile) => !profile.isStale);
+    const selectedExists = selectable.some((profile) => profile.id === this.store.selectedProxyProfileId);
+    const selectedId = selectedExists ? this.store.selectedProxyProfileId : selectable[0]?.id;
+    this.store.selectedProxyProfileId = selectedId;
+    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) => ({
+      ...profile,
+      isSelected: Boolean(selectedId) && profile.id === selectedId
+    }));
+  }
+
   private async persistStore(): Promise<void> {
     const write = this.storePersistQueue.then(() => writeJsonAtomic(this.storePath, this.store));
     this.storePersistQueue = write.catch(() => undefined);
@@ -309,20 +485,37 @@ export class AppStorage {
 
 function normalizeStore(input: AppStore): AppStore {
   const defaults = createDefaultStore();
+  const rawSettings = input.settings as unknown as ({ activeGlobalTab?: string } & Record<string, unknown>) | undefined;
+  const inputSettings = (input.settings ?? {}) as Partial<AppSettings> & {
+    openSourceConsentAccepted?: boolean;
+    showOpenSourceWarningOnEnter?: boolean;
+    openSourceRiskBannerExpanded?: boolean;
+  };
+  const activeGlobalTab = rawSettings?.activeGlobalTab === "opensource"
+    ? "xray"
+    : rawSettings?.activeGlobalTab === "xray" || rawSettings?.activeGlobalTab === "ssh"
+      ? rawSettings.activeGlobalTab
+      : defaults.settings.activeGlobalTab;
   return {
     ...defaults,
     ...input,
     schemaVersion: STORE_SCHEMA_VERSION,
     settings: {
       ...defaults.settings,
-      ...input.settings,
+      ...inputSettings,
+      activeGlobalTab,
+      xrayConsentAccepted: inputSettings.xrayConsentAccepted ?? inputSettings.openSourceConsentAccepted ?? defaults.settings.xrayConsentAccepted,
+      showXrayWarningOnEnter: inputSettings.showXrayWarningOnEnter ?? inputSettings.showOpenSourceWarningOnEnter ?? defaults.settings.showXrayWarningOnEnter,
+      xrayRiskBannerExpanded: inputSettings.xrayRiskBannerExpanded ?? inputSettings.openSourceRiskBannerExpanded ?? defaults.settings.xrayRiskBannerExpanded,
       customTheme: {
         ...defaults.settings.customTheme,
-        ...input.settings?.customTheme
+        ...inputSettings.customTheme
       }
     },
     sshConfigs: Array.isArray(input.sshConfigs) ? input.sshConfigs : [],
     sshKeys: Array.isArray(input.sshKeys) ? input.sshKeys : [],
+    proxyProfiles: Array.isArray(input.proxyProfiles) ? input.proxyProfiles : [],
+    selectedProxyProfileId: input.selectedProxyProfileId,
     routingRules: Array.isArray(input.routingRules) ? input.routingRules : []
   };
 }

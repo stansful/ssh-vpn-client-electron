@@ -1,8 +1,7 @@
 import { Check, Power, RefreshCw, SlidersHorizontal, Terminal, X } from "lucide-react";
 import type { Dispatch, FormEvent, SetStateAction } from "react";
 import { checkButtonClass } from "../../lib/labels.js";
-import type { AppSnapshot, RoutingMode, RuntimeStatus, SshConfig, TunnelCheckResult } from "../../../shared/types.js";
-import { Segmented } from "../ui/index.js";
+import type { AppSnapshot, RuntimeStatus, SshConfig, TunnelCheckResult } from "../../../shared/types.js";
 
 export function MainView({
   store,
@@ -12,12 +11,10 @@ export function MainView({
   busy,
   checking,
   lastTunnelCheck,
-  enabledRulesCount,
   terminalText,
   terminalInput,
   terminalOpening,
   onSelectConfig,
-  onRoutingModeChange,
   onConnect,
   onDisconnect,
   onCheckTunnel,
@@ -34,12 +31,10 @@ export function MainView({
   busy: boolean;
   checking: boolean;
   lastTunnelCheck: TunnelCheckResult | undefined;
-  enabledRulesCount: number;
   terminalText: string;
   terminalInput: string;
   terminalOpening: boolean;
   onSelectConfig: (id: string) => void;
-  onRoutingModeChange: (mode: RoutingMode) => void;
   onConnect: () => void;
   onDisconnect: () => void;
   onCheckTunnel: () => void;
@@ -49,7 +44,8 @@ export function MainView({
   onTerminalInputChange: Dispatch<SetStateAction<string>>;
   onTerminalSubmit: (event: FormEvent) => void;
 }): JSX.Element {
-  const connected = runtime?.state === "Connected" || runtime?.state === "Connecting" || runtime?.state === "Reconnecting";
+  const sshRuntimeActive = runtime?.transport !== "xray";
+  const connected = sshRuntimeActive && (runtime?.state === "Connected" || runtime?.state === "Connecting" || runtime?.state === "Reconnecting");
 
   return (
     <section className="screen">
@@ -70,23 +66,9 @@ export function MainView({
             </select>
           </label>
 
-          <div className="main-routing-controls">
-            <div className="field">
-              <span>Routing mode</span>
-              <Segmented<RoutingMode>
-                value={store.routingMode}
-                options={[
-                  ["proxy-all", "Proxy all"],
-                  ["selected-rules", "Selected rules"]
-                ]}
-                onChange={onRoutingModeChange}
-              />
-            </div>
-          </div>
-
           {selectedRulesBlocked && (
             <div className="warning-row">
-              Selected rules mode requires at least one enabled rule before Connect.
+              Selected rules mode is active in Settings and requires at least one enabled rule before Connect.
             </div>
           )}
 
@@ -103,7 +85,7 @@ export function MainView({
             <button
               className={checkButtonClass(lastTunnelCheck?.ok, checking)}
               type="button"
-              disabled={checking || runtime?.state !== "Connected"}
+              disabled={checking || !sshRuntimeActive || runtime?.state !== "Connected"}
               onClick={onCheckTunnel}
             >
               {checking ? <RefreshCw className="spin" size={18} /> : lastTunnelCheck?.ok ? <Check size={18} /> : lastTunnelCheck ? <X size={18} /> : <RefreshCw size={18} />}
@@ -120,13 +102,6 @@ export function MainView({
               </button>
             </div>
           </div>
-
-          <dl className="facts">
-            <div><dt>Routing mode</dt><dd>{store.routingMode === "proxy-all" ? "Proxy all" : "Selected rules"}</dd></div>
-            <div><dt>Enabled rules</dt><dd>{enabledRulesCount}</dd></div>
-            <div><dt>Check endpoint</dt><dd>{store.settings.checkEndpoint}</dd></div>
-            <div><dt>Reconnect attempts</dt><dd>{runtime?.reconnectAttempt ?? 0}</dd></div>
-          </dl>
         </section>
 
         <section className="panel terminal-panel">

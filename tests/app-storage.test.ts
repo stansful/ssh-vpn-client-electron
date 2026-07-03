@@ -98,6 +98,33 @@ describe("AppStorage persistence", () => {
     expect(key ? storage.readPrivateKeyText(key.id) : undefined).toBe(keyPem.trimEnd());
   });
 
+  it("migrates legacy proxy settings names to Xray settings", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const legacySettings = { ...createDefaultStore().settings } as Record<string, unknown>;
+    delete legacySettings.xrayConsentAccepted;
+    delete legacySettings.showXrayWarningOnEnter;
+    delete legacySettings.xrayRiskBannerExpanded;
+    const legacyStore = {
+      ...createDefaultStore(),
+      settings: {
+        ...legacySettings,
+        activeGlobalTab: "opensource",
+        openSourceConsentAccepted: true,
+        showOpenSourceWarningOnEnter: false,
+        openSourceRiskBannerExpanded: false
+      }
+    };
+    await writeFile(path.join(dir, "app-store.v1.json"), `${JSON.stringify(legacyStore, null, 2)}\n`, "utf8");
+
+    const storage = new AppStorage(dir);
+    await storage.init();
+
+    expect(storage.getStore().settings.activeGlobalTab).toBe("xray");
+    expect(storage.getStore().settings.xrayConsentAccepted).toBe(true);
+    expect(storage.getStore().settings.showXrayWarningOnEnter).toBe(false);
+    expect(storage.getStore().settings.xrayRiskBannerExpanded).toBe(false);
+  });
+
   it("migrates legacy config private-key passphrases onto SSH keys", async () => {
     const dir = await makeTempDir(cleanupDirs);
     const storage = new AppStorage(dir);

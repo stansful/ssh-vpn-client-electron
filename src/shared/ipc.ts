@@ -1,12 +1,16 @@
 import type {
   AppSettings,
   AppSnapshot,
+  AppUpdateInfo,
+  ImportProxyProfilesInput,
+  ImportProxyProfilesResult,
   DiagnosticsEntry,
   RoutingMode,
   RoutingRule,
   RuntimeStatus,
   TerminalLine,
   TunnelCheckResult,
+  UpsertProxyProfileInput,
   UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "./types.js";
@@ -19,6 +23,13 @@ export const IPC_CHANNELS = {
   upsertKey: "shadow-ssh:upsert-key",
   copyPrivateKey: "shadow-ssh:copy-private-key",
   deleteKey: "shadow-ssh:delete-key",
+  upsertProxyProfile: "shadow-ssh:upsert-proxy-profile",
+  importProxyProfiles: "shadow-ssh:import-proxy-profiles",
+  refreshProxyProfiles: "shadow-ssh:refresh-proxy-profiles",
+  selectProxyProfile: "shadow-ssh:select-proxy-profile",
+  toggleProxyProfilePin: "shadow-ssh:toggle-proxy-profile-pin",
+  deleteProxyProfile: "shadow-ssh:delete-proxy-profile",
+  deleteUnpinnedProxyProfiles: "shadow-ssh:delete-unpinned-proxy-profiles",
   updateSettings: "shadow-ssh:update-settings",
   updateRoutingMode: "shadow-ssh:update-routing-mode",
   updateRoutingRules: "shadow-ssh:update-routing-rules",
@@ -27,11 +38,17 @@ export const IPC_CHANNELS = {
   clearLogFile: "shadow-ssh:clear-log-file",
   listProcesses: "shadow-ssh:list-processes",
   connect: "shadow-ssh:connect",
+  connectProxy: "shadow-ssh:connect-proxy",
   disconnect: "shadow-ssh:disconnect",
   checkTunnel: "shadow-ssh:check-tunnel",
   openTerminal: "shadow-ssh:open-terminal",
   closeTerminal: "shadow-ssh:close-terminal",
   terminalInput: "shadow-ssh:terminal-input",
+  checkForUpdates: "shadow-ssh:check-for-updates",
+  downloadUpdate: "shadow-ssh:download-update",
+  openDownloadedUpdate: "shadow-ssh:open-downloaded-update",
+  copyText: "shadow-ssh:copy-text",
+  openExternal: "shadow-ssh:open-external",
   serviceEvent: "shadow-ssh:service-event"
 } as const;
 
@@ -50,6 +67,13 @@ export interface ShadowSshApi {
   upsertKey(input: UpsertSshKeyInput): Promise<AppSnapshot>;
   copyPrivateKey(id: string): Promise<boolean>;
   deleteKey(id: string): Promise<AppSnapshot>;
+  upsertProxyProfile(input: UpsertProxyProfileInput): Promise<AppSnapshot>;
+  importProxyProfiles(input: ImportProxyProfilesInput): Promise<{ snapshot: AppSnapshot; result: ImportProxyProfilesResult }>;
+  refreshProxyProfiles(): Promise<{ snapshot: AppSnapshot; result: ImportProxyProfilesResult }>;
+  selectProxyProfile(id: string): Promise<AppSnapshot>;
+  toggleProxyProfilePin(id: string): Promise<AppSnapshot>;
+  deleteProxyProfile(id: string): Promise<AppSnapshot>;
+  deleteUnpinnedProxyProfiles(): Promise<AppSnapshot>;
   updateSettings(settings: AppSettings): Promise<AppSnapshot>;
   updateRoutingMode(mode: RoutingMode): Promise<AppSnapshot>;
   updateRoutingRules(rules: RoutingRule[]): Promise<AppSnapshot>;
@@ -58,10 +82,16 @@ export interface ShadowSshApi {
   clearLogFile(): Promise<string>;
   listProcesses(): Promise<string[]>;
   connect(): Promise<AppSnapshot>;
+  connectProxy(): Promise<AppSnapshot>;
   disconnect(): Promise<AppSnapshot>;
   checkTunnel(endpoint?: string): Promise<AppSnapshot>;
   openTerminal(): Promise<AppSnapshot>;
   closeTerminal(): Promise<AppSnapshot>;
   terminalInput(input: string): Promise<void>;
+  checkForUpdates(force?: boolean): Promise<{ snapshot: AppSnapshot; update: AppUpdateInfo }>;
+  downloadUpdate(): Promise<AppSnapshot>;
+  openDownloadedUpdate(): Promise<boolean>;
+  copyText(text: string): Promise<boolean>;
+  openExternal(url: string): Promise<boolean>;
   onServiceEvent(callback: (event: ServiceEvent) => void): () => void;
 }

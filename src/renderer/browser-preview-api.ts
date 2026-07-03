@@ -2,14 +2,19 @@ import { createDefaultRuntimeStatus, createDefaultStore } from "../shared/defaul
 import type { ServiceEvent, ShadowSshApi } from "../shared/ipc.js";
 import type {
   AppSettings,
+  AppUpdateDownload,
+  AppUpdateInfo,
   AppSnapshot,
   DiagnosticsEntry,
+  ImportProxyProfilesInput,
   RoutingMode,
   RoutingRule,
+  ProxyProfile,
   SshConfig,
   SshKeyMetadata,
   TerminalLine,
   TunnelCheckResult,
+  UpsertProxyProfileInput,
   UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "../shared/types.js";
@@ -30,6 +35,8 @@ export function createBrowserPreviewApi(): ShadowSshApi {
   let diagnostics: DiagnosticsEntry[] = [];
   let terminal: TerminalLine[] = [];
   let lastTunnelCheck: TunnelCheckResult | undefined;
+  let updateInfo: AppUpdateInfo | undefined;
+  let updateDownload: AppUpdateDownload = { state: "idle", downloadedBytes: 0 };
   let fileLog = "";
 
   runtime = {
@@ -40,7 +47,7 @@ export function createBrowserPreviewApi(): ShadowSshApi {
   };
 
   const snapshot = (): AppSnapshot =>
-    structuredClone({ store, runtime, diagnostics, terminal, logFilePaths: ["browser-preview://main.log"], lastTunnelCheck });
+    structuredClone({ store, runtime, diagnostics, terminal, logFilePaths: ["browser-preview://main.log"], lastTunnelCheck, updateInfo, updateDownload });
   const emit = (event: ServiceEvent): void => {
     for (const listener of listeners) {
       listener(event);
@@ -141,6 +148,73 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       store = { ...store, sshKeys: store.sshKeys.filter((key) => key.id !== id) };
       return snapshot();
     },
+    async upsertProxyProfile(input: UpsertProxyProfileInput) {
+      const now = new Date().toISOString();
+      const existing = input.id ? store.proxyProfiles.find((profile) => profile.id === input.id) : undefined;
+      const profile = makePreviewProxyProfile(input.rawUri, input.name, existing, input.source ?? "manual");
+      store = {
+        ...store,
+        proxyProfiles: existing
+          ? store.proxyProfiles.map((candidate) => (candidate.id === profile.id ? profile : candidate))
+          : [...store.proxyProfiles, profile],
+        selectedProxyProfileId: store.selectedProxyProfileId ?? profile.id
+      };
+      store = {
+        ...store,
+        proxyProfiles: store.proxyProfiles.map((candidate) => ({ ...candidate, isSelected: candidate.id === store.selectedProxyProfileId, updatedAt: now }))
+      };
+      return snapshot();
+    },
+    async importProxyProfiles(input: ImportProxyProfilesInput) {
+      const links = input.text.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+      const profiles = links.map((line) => makePreviewProxyProfile(line, "", undefined, input.source));
+      store = {
+        ...store,
+        proxyProfiles: [...store.proxyProfiles, ...profiles],
+        selectedProxyProfileId: store.selectedProxyProfileId ?? profiles[0]?.id
+      };
+      return {
+        snapshot: snapshot(),
+        result: { imported: profiles.length, updated: 0, skipped: 0, failed: 0, errors: [] }
+      };
+    },
+    async refreshProxyProfiles() {
+      const profile = makePreviewProxyProfile("vless://preview@example.com:443?security=tls&type=tcp#Preview", "Preview", undefined, "remote");
+      store = {
+        ...store,
+        proxyProfiles: store.proxyProfiles.some((candidate) => candidate.fingerprint === profile.fingerprint)
+          ? store.proxyProfiles
+          : [...store.proxyProfiles, profile],
+        selectedProxyProfileId: store.selectedProxyProfileId ?? profile.id
+      };
+      return {
+        snapshot: snapshot(),
+        result: { imported: 1, updated: 0, skipped: 0, failed: 0, errors: [] }
+      };
+    },
+    async selectProxyProfile(id: string) {
+      store = {
+        ...store,
+        selectedProxyProfileId: id,
+        proxyProfiles: store.proxyProfiles.map((profile) => ({ ...profile, isSelected: profile.id === id }))
+      };
+      return snapshot();
+    },
+    async toggleProxyProfilePin(id: string) {
+      store = {
+        ...store,
+        proxyProfiles: store.proxyProfiles.map((profile) => (profile.id === id ? { ...profile, isPinned: !profile.isPinned } : profile))
+      };
+      return snapshot();
+    },
+    async deleteProxyProfile(id: string) {
+      store = { ...store, proxyProfiles: store.proxyProfiles.filter((profile) => profile.id !== id) };
+      return snapshot();
+    },
+    async deleteUnpinnedProxyProfiles() {
+      store = { ...store, proxyProfiles: store.proxyProfiles.filter((profile) => profile.isPinned) };
+      return snapshot();
+    },
     async updateSettings(settings: AppSettings) {
       store = { ...store, settings };
       return snapshot();
@@ -184,6 +258,23 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       appendDiagnostic("warning", "Browser preview does not create an SSH tunnel or OS routes.");
       return snapshot();
     },
+    async connectProxy() {
+      const selectedProfile = store.proxyProfiles.find((profile) => profile.id === store.selectedProxyProfileId);
+      if (!selectedProfile) {
+        appendDiagnostic("error", "Select or import a proxy profile before connecting.");
+        return snapshot();
+      }
+      setRuntime({
+        state: "Connected",
+        activeConfigId: selectedProfile.id,
+        connectedAt: new Date().toISOString(),
+        message: `Browser preview connected to ${selectedProfile.protocol.toUpperCase()} simulator.`,
+        transport: "xray",
+        realTunnelAvailable: false
+      });
+      appendDiagnostic("warning", "Browser preview does not start Xray or OS routes.");
+      return snapshot();
+    },
     async disconnect() {
       setRuntime({ state: "Disconnected", activeConfigId: undefined, connectedAt: undefined, message: "Disconnected." });
       appendDiagnostic("info", "Disconnected by user.");
@@ -210,9 +301,74 @@ export function createBrowserPreviewApi(): ShadowSshApi {
     async terminalInput() {
       appendTerminal("\n[preview] Command input is hidden and was not sent to a remote shell.\n$ ");
     },
+    async checkForUpdates() {
+      updateInfo = {
+        available: false,
+        currentVersion: "0.1.0",
+        checkedAt: new Date().toISOString(),
+        message: "Browser preview update check is simulated."
+      };
+      return { snapshot: snapshot(), update: updateInfo };
+    },
+    async downloadUpdate() {
+      updateDownload = { state: "downloaded", downloadedBytes: 1, totalBytes: 1, percent: 100, filePath: "browser-preview://update.exe" };
+      return snapshot();
+    },
+    async openDownloadedUpdate() {
+      return true;
+    },
+    async copyText(text: string) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    async openExternal(url: string) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return true;
+    },
     onServiceEvent(callback: (event: ServiceEvent) => void) {
       listeners.add(callback);
       return () => listeners.delete(callback);
     }
+  };
+}
+
+function makePreviewProxyProfile(rawUri: string, name: string, existing: ProxyProfile | undefined, source: ProxyProfile["source"]): ProxyProfile {
+  const now = new Date().toISOString();
+  const protocol = rawUri.startsWith("vmess://") ? "vmess" : rawUri.startsWith("trojan://") ? "trojan" : "vless";
+  let host = "example.com";
+  let port = 443;
+  try {
+    if (protocol !== "vmess") {
+      const url = new URL(rawUri);
+      host = url.hostname || host;
+      port = Number(url.port) || port;
+      name ||= decodeURIComponent(url.hash.replace(/^#/u, "")) || `${protocol}-${host}:${port}`;
+    }
+  } catch {
+    name ||= `${protocol}-${host}:${port}`;
+  }
+  return {
+    id: existing?.id ?? crypto.randomUUID(),
+    name: name || `${protocol}-${host}:${port}`,
+    protocol,
+    host,
+    port,
+    transport: "tcp",
+    security: "tls",
+    flow: "",
+    source,
+    rawUriSecretId: existing?.rawUriSecretId ?? `preview-proxy-${crypto.randomUUID()}`,
+    fingerprint: existing?.fingerprint ?? `sha256:preview-${crypto.randomUUID()}`,
+    isSelected: existing?.isSelected ?? false,
+    isPinned: existing?.isPinned ?? false,
+    isStale: false,
+    lastTestStatus: existing?.lastTestStatus ?? "unknown",
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    lastSeenAt: now
   };
 }

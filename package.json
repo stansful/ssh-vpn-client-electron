@@ -62,6 +62,10 @@
     "service:start": "powershell -ExecutionPolicy Bypass -File scripts/start-service.ps1",
     "service:stop": "powershell -ExecutionPolicy Bypass -File scripts/stop-service.ps1",
     "signing:check": "powershell -ExecutionPolicy Bypass -File scripts/check-signing-env.ps1",
+    "xray:download": "node scripts/download-xray-runtime.mjs",
+    "xray:download-win": "node scripts/download-xray-runtime.mjs --platform windows --arch all",
+    "xray:download-all": "node scripts/download-xray-runtime.mjs --all",
+    "xray:ensure": "node scripts/ensure-xray-runtime.mjs",
     "icons:transparent": "node scripts/ensure-transparent-icons.mjs && node scripts/generate-macos-icon.mjs",
     "icons:mac": "node scripts/generate-macos-icon.mjs",
     "native:test-service": "node scripts/test-native-service.mjs",
@@ -139,6 +143,14 @@
             "**/*",
             "!**/.DS_Store"
           ]
+        },
+        {
+          "from": "resources/xray/windows/${arch}",
+          "to": "xray/windows/${arch}",
+          "filter": [
+            "xray.exe",
+            "!**/.DS_Store"
+          ]
         }
       ]
     },
@@ -176,6 +188,14 @@
             "**/*",
             "!**/.DS_Store"
           ]
+        },
+        {
+          "from": "resources/xray/macos/${arch}",
+          "to": "xray/macos/${arch}",
+          "filter": [
+            "xray",
+            "!**/.DS_Store"
+          ]
         }
       ]
     },
@@ -206,6 +226,14 @@
           "to": "native/linux/${arch}",
           "filter": [
             "**/*",
+            "!**/.DS_Store"
+          ]
+        },
+        {
+          "from": "resources/xray/linux/${arch}",
+          "to": "xray/linux/${arch}",
+          "filter": [
+            "xray",
             "!**/.DS_Store"
           ]
         }

@@ -5,7 +5,7 @@ import { RoutingMatcher } from "../core/routing/routing-matcher.js";
 import { negotiateAlgorithms } from "../core/ssh/algorithms.js";
 import { transportKeyLengthsFor } from "../core/ssh/key-derivation.js";
 import { DEFAULT_KEX_INIT } from "../core/ssh/messages.js";
-import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
+import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { ServiceBridge } from "./service-bridge.js";
 
@@ -34,6 +34,11 @@ export class InProcessServiceBridge implements ServiceBridge {
   async updateRoutingRules(rules: RoutingRule[]): Promise<void> {
     const summary = new RoutingMatcher("selected-rules", rules).summary();
     this.appendDiagnostic("info", `Service routing rules updated: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`);
+  }
+
+  async updateRouting(request: RoutingUpdateRequest): Promise<void> {
+    const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
+    this.appendDiagnostic("info", `Service routing updated: mode=${request.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`);
   }
 
   async connect(request: ConnectRequest): Promise<void> {

@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 import type { ServiceEvent } from "../shared/ipc.js";
-import type { ConnectRequest, RoutingRule, RuntimeStatus, SshConfig, TunnelCheckResult } from "../shared/types.js";
+import type { ConnectRequest, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TunnelCheckResult } from "../shared/types.js";
 import { decodeWireMessage, encodeWireMessage, type ServiceCommand, type ServiceResponsePayload } from "./local-ipc-protocol.js";
 import type { ServiceBridge } from "./service-bridge.js";
 
@@ -64,6 +64,10 @@ export class LocalIpcServiceBridge implements ServiceBridge {
 
   async updateRoutingRules(rules: RoutingRule[]): Promise<void> {
     await this.send({ id: randomUUID(), type: "update-routing-rules", payload: { rules } });
+  }
+
+  async updateRouting(request: RoutingUpdateRequest): Promise<void> {
+    await this.send({ id: randomUUID(), type: "update-routing", payload: request });
   }
 
   async connect(request: ConnectRequest): Promise<void> {

@@ -1,5 +1,6 @@
 import net from "node:net";
 import { EventEmitter } from "node:events";
+import { configureLowLatencySocket } from "../network/socket-io.js";
 import { formatClientVersion, parseSshVersionLine, type ParsedSshVersion } from "./version.js";
 import {
   SshEncryptedPacketStreamReader,
@@ -40,6 +41,7 @@ export class SshSocketTransport {
 
   static async connect(options: SshTcpConnectOptions): Promise<SshSocketTransport> {
     const socket = net.createConnection({ host: options.host, port: options.port });
+    configureLowLatencySocket(socket);
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         socket.destroy(new Error("SSH TCP connect timeout."));

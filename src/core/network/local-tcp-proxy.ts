@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
+import { configureLowLatencySocket, isSocketWritable, writeSocketWithBackpressure } from "./socket-io.js";
 
 export interface DirectTcpIpTarget {
   host: string;
@@ -18,6 +19,8 @@ export interface LocalTcpProxyOptions {
   listenHost?: string;
   listenPort: number;
   target: DirectTcpIpTarget;
+  socketWriteTimeoutMs?: number;
+  maxQueuedSocketBytes?: number;
   connectChannel(target: DirectTcpIpTarget, originator: { address: string; port: number }): Promise<DirectTcpIpChannel>;
 }
 
@@ -90,6 +93,7 @@ export class LocalTcpProxy {
 
   private async handleSocket(socket: net.Socket): Promise<void> {
     this.sockets.add(socket);
+    configureLowLatencySocket(socket);
     const originator = {
       address: socket.remoteAddress ?? "127.0.0.1",
       port: socket.remotePort ?? 0
@@ -101,15 +105,43 @@ export class LocalTcpProxy {
 
     try {
       const channel = await this.options.connectChannel(this.options.target, originator);
-      const offData = channel.onData((data) => {
-        if (isSocketWritable(socket)) {
-          socket.write(data);
+      let queuedSocketBytes = 0;
+      let socketWriteQueue = Promise.resolve();
+      const maxQueuedSocketBytes = this.options.maxQueuedSocketBytes ?? 32 * 1024 * 1024;
+      const socketWriteTimeoutMs = this.options.socketWriteTimeoutMs ?? 120_000;
+      const enqueueSocketWrite = (data: Buffer): void => {
+        if (!isSocketWritable(socket)) {
+          return;
         }
+        queuedSocketBytes += data.length;
+        if (queuedSocketBytes > maxQueuedSocketBytes) {
+          socket.destroy(new Error("Local client is not reading proxied data fast enough."));
+          return;
+        }
+        socketWriteQueue = socketWriteQueue
+          .then(async () => {
+            queuedSocketBytes -= data.length;
+            await writeSocketWithBackpressure(socket, data, { timeoutMs: socketWriteTimeoutMs });
+          })
+          .catch((error: unknown) => {
+            queuedSocketBytes = 0;
+            if (!socket.destroyed) {
+              socket.destroy(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
+      };
+      const endSocketAfterQueuedWrites = (): void => {
+        void socketWriteQueue.finally(() => {
+          if (isSocketWritable(socket)) {
+            socket.end();
+          }
+        });
+      };
+      const offData = channel.onData((data) => {
+        enqueueSocketWrite(data);
       });
       const offClose = channel.onClose(() => {
-        if (isSocketWritable(socket)) {
-          socket.end();
-        }
+        endSocketAfterQueuedWrites();
       });
       const offError = channel.onError((error) => {
         this.events.emit("event", { type: "error", message: error.message } satisfies LocalTcpProxyConnectionEvent);
@@ -151,8 +183,4 @@ export class LocalTcpProxy {
       } satisfies LocalTcpProxyConnectionEvent);
     }
   }
-}
-
-function isSocketWritable(socket: net.Socket): boolean {
-  return !socket.destroyed && socket.writable && !socket.writableEnded;
 }

@@ -86,6 +86,23 @@ describe("SOCKS5 proxy", () => {
     expect(fake.writes).toEqual([Buffer.from([0x05, 0x00])]);
   });
 
+  it("preserves early bytes sent with a SOCKS5 CONNECT request", async () => {
+    const socket = new FakeSocket() as unknown as Socket;
+    const request = readProxyConnectRequest(socket);
+    const fake = socket as unknown as FakeSocket;
+    const host = Buffer.from("example.com", "utf8");
+    const early = Buffer.from("TLS-CLIENT-HELLO", "utf8");
+
+    fake.pushInput(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, host.length]), host, Buffer.from([0x01, 0xbb]), early]));
+
+    await expect(request).resolves.toEqual({
+      protocol: "socks5",
+      target: { host: "example.com", port: 443 },
+      initialData: early
+    });
+    expect(fake.writes).toEqual([Buffer.from([0x05, 0x00])]);
+  });
+
   it("parses absolute-form HTTP proxy requests and rewrites them for the origin server", async () => {
     const socket = new FakeSocket() as unknown as Socket;
     const request = readProxyConnectRequest(socket);
@@ -131,6 +148,18 @@ describe("Windows PAC generation", () => {
     expect(pac).toContain('hostNoBrackets == "192.0.2.10"');
     expect(pac).toContain('resolvedHost == "192.0.2.10"');
     expect(pac).not.toContain("disabled.test");
+  });
+
+  it("can generate HTTP-only PAC entries for Xray system proxy routing", () => {
+    const pac = buildProxyPac(
+      [{ id: "1", type: "domain", value: "youtube.com", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      19080,
+      "http"
+    );
+
+    expect(pac).toContain("PROXY 127.0.0.1:19080");
+    expect(pac).not.toContain("SOCKS5 127.0.0.1:19080");
   });
 });
 

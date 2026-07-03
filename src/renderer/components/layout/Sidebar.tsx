@@ -1,4 +1,4 @@
-import { FileText, KeyRound, Network, Power, Server, Settings as SettingsIcon } from "lucide-react";
+import { Copy, FileText, Github, KeyRound, Network, PanelLeftClose, PanelLeftOpen, Power, Server, Settings as SettingsIcon } from "lucide-react";
 import type { View } from "../../types.js";
 import { NavButton } from "../ui/index.js";
 
@@ -6,32 +6,74 @@ export function Sidebar({
   view,
   platform,
   arch,
+  collapsed,
   loggingEnabled,
+  onCopyGithub,
+  onOpenGithub,
+  onToggleCollapsed,
   onViewChange
 }: {
   view: View;
   platform: string | undefined;
   arch: string | undefined;
+  collapsed: boolean;
   loggingEnabled: boolean;
+  onCopyGithub: () => void;
+  onOpenGithub: () => void;
+  onToggleCollapsed: () => void;
   onViewChange: (view: View) => void;
 }): JSX.Element {
   return (
-    <aside className="sidebar">
-      <div className="brand">
-        <img src="./icon.svg" alt="" />
-        <div>
-          <strong>Shadow SSH</strong>
-          <span>{platform}/{arch}</span>
+    <aside className={collapsed ? "sidebar collapsed" : "sidebar"} aria-label="Application navigation">
+      <div className="sidebar-header">
+        <div className="brand">
+          <img src="./icon.svg" alt="" />
+          <div className="brand-text">
+            <strong>Shadow SSH</strong>
+            <span>{platform}/{arch}</span>
+          </div>
         </div>
+        <button
+          type="button"
+          className="icon-button sidebar-toggle"
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          onClick={onToggleCollapsed}
+        >
+          {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+        </button>
       </div>
       <nav>
-        <NavButton active={view === "main"} icon={<Power size={18} />} label="Main" onClick={() => onViewChange("main")} />
-        <NavButton active={view === "configs"} icon={<Server size={18} />} label="SSH configs" onClick={() => onViewChange("configs")} />
-        <NavButton active={view === "keys"} icon={<KeyRound size={18} />} label="SSH keys" onClick={() => onViewChange("keys")} />
-        <NavButton active={view === "routing"} icon={<Network size={18} />} label="Routing" onClick={() => onViewChange("routing")} />
-        {loggingEnabled && <NavButton active={view === "logs"} icon={<FileText size={18} />} label="Logs" onClick={() => onViewChange("logs")} />}
-        <NavButton active={view === "settings"} icon={<SettingsIcon size={18} />} label="Settings" onClick={() => onViewChange("settings")} />
+        <NavButton compact={collapsed} active={view === "main"} icon={<Power size={18} />} label="Main" onClick={() => onViewChange("main")} />
+        <NavButton
+          compact={collapsed}
+          active={view === "configs"}
+          icon={<Server size={18} />}
+          label="SSH configs"
+          onClick={() => onViewChange("configs")}
+        />
+        <NavButton compact={collapsed} active={view === "keys"} icon={<KeyRound size={18} />} label="SSH keys" onClick={() => onViewChange("keys")} />
+        <NavButton compact={collapsed} active={view === "routing"} icon={<Network size={18} />} label="Routing" onClick={() => onViewChange("routing")} />
+        {loggingEnabled && (
+          <NavButton compact={collapsed} active={view === "logs"} icon={<FileText size={18} />} label="Logs" onClick={() => onViewChange("logs")} />
+        )}
+        <NavButton
+          compact={collapsed}
+          active={view === "settings"}
+          icon={<SettingsIcon size={18} />}
+          label="Settings"
+          onClick={() => onViewChange("settings")}
+        />
       </nav>
+      <div className="sidebar-footer">
+        <button type="button" className="github-link" aria-label="Open GitHub repository" title="Open GitHub repository" onClick={onOpenGithub}>
+          <Github size={18} />
+          <span>Github</span>
+        </button>
+        <button type="button" className="icon-button github-copy" aria-label="Copy GitHub repository link" title="Copy GitHub link" onClick={onCopyGithub}>
+          <Copy size={16} />
+        </button>
+      </div>
     </aside>
   );
 }

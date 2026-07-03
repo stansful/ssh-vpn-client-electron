@@ -102,6 +102,10 @@ async function executeCommand(command: ServiceCommand): Promise<ServiceResponseP
       routingRules = command.payload.rules;
       await bridge.updateRoutingRules(routingRules);
       return { accepted: true };
+    case "update-routing":
+      routingRules = command.payload.routingRules;
+      await bridge.updateRouting(command.payload);
+      return { accepted: true };
     case "shutdown":
       await bridge.disconnect();
       server.close();
