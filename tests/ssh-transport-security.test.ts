@@ -236,6 +236,18 @@ describe("SSH channel state manager", () => {
     expect(manager.close(open.localId).lifecycle).toBe("closed");
     expect(manager.get(open.localId)).toBeUndefined();
   });
+
+  it("allows local channel writes after receiving remote EOF", () => {
+    const manager = new ChannelStateManager();
+    const opening = manager.open("direct-tcpip");
+    const open = manager.confirmOpen(opening.localId, 42, 1024, 32768);
+
+    expect(manager.markEofReceived(open.localId).lifecycle).toBe("eof-received");
+    expect(manager.consumeRemoteWindow(open.localId, 100).remoteWindow).toBe(924);
+    expect(manager.markEofSent(open.localId).lifecycle).toBe("closed");
+    expect(manager.close(open.localId).lifecycle).toBe("closed");
+    expect(manager.get(open.localId)).toBeUndefined();
+  });
 });
 
 function encodeOpenSshEd25519PrivateKey(privateKey: KeyObject): string {

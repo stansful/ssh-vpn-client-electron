@@ -44,7 +44,7 @@ export class ChannelStateManager {
   }
 
   consumeRemoteWindow(localId: number, bytes: number): ChannelState {
-    const state = this.requireOpen(localId);
+    const state = this.requireCanSend(localId);
     if (bytes < 0 || !Number.isInteger(bytes)) {
       throw new Error("Window bytes must be a non-negative integer.");
     }
@@ -65,7 +65,7 @@ export class ChannelStateManager {
   }
 
   consumeLocalWindow(localId: number, bytes: number): ChannelState {
-    const state = this.requireOpen(localId);
+    const state = this.requireCanReceive(localId);
     if (bytes < 0 || !Number.isInteger(bytes)) {
       throw new Error("Window bytes must be a non-negative integer.");
     }
@@ -77,7 +77,7 @@ export class ChannelStateManager {
   }
 
   replenishLocalWindow(localId: number, bytes: number): ChannelState {
-    const state = this.requireOpen(localId);
+    const state = this.requireCanReceive(localId);
     if (bytes < 0 || !Number.isInteger(bytes)) {
       throw new Error("Window bytes must be a non-negative integer.");
     }
@@ -113,10 +113,18 @@ export class ChannelStateManager {
     return Array.from(this.channels.values(), (state) => ({ ...state }));
   }
 
-  private requireOpen(localId: number): ChannelState {
+  private requireCanSend(localId: number): ChannelState {
     const state = this.require(localId);
-    if (state.lifecycle !== "open") {
-      throw new Error(`Channel ${localId} is not open.`);
+    if (state.lifecycle !== "open" && state.lifecycle !== "eof-received") {
+      throw new Error(`Channel ${localId} is not open for sending.`);
+    }
+    return state;
+  }
+
+  private requireCanReceive(localId: number): ChannelState {
+    const state = this.require(localId);
+    if (state.lifecycle !== "open" && state.lifecycle !== "eof-sent") {
+      throw new Error(`Channel ${localId} is not open for receiving.`);
     }
     return state;
   }

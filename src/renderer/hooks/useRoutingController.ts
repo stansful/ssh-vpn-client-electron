@@ -150,6 +150,38 @@ export function useRoutingController({
     });
   }
 
+  function updateProxyListEnabled(enabled: boolean): void {
+    void run(async () => {
+      const next = await api.updateRoutingProxyListEnabled(enabled);
+      setNotice(enabled ? "Routing proxy list enabled." : "Routing proxy list disabled.");
+      return next;
+    });
+  }
+
+  function refreshProxyList(): void {
+    void run(async () => {
+      const next = await api.refreshRoutingProxyList();
+      setNotice(`Routing proxy list refreshed: ${next.store.routingProxyList.domains.length} domains.`);
+      return next;
+    });
+  }
+
+  function updateDirectListEnabled(enabled: boolean): void {
+    void run(async () => {
+      const next = await api.updateRoutingDirectListEnabled(enabled);
+      setNotice(enabled ? "Routing direct list enabled." : "Routing direct list disabled.");
+      return next;
+    });
+  }
+
+  function refreshDirectList(): void {
+    void run(async () => {
+      const next = await api.refreshRoutingDirectList();
+      setNotice(`Routing direct list refreshed: ${next.store.routingDirectList.domains.length} domains.`);
+      return next;
+    });
+  }
+
   return {
     ruleTab,
     setRuleTab,
@@ -168,6 +200,10 @@ export function useRoutingController({
     addRule,
     importRules,
     exportRules,
-    loadProcesses
+    loadProcesses,
+    updateProxyListEnabled,
+    refreshProxyList,
+    updateDirectListEnabled,
+    refreshDirectList
   };
 }

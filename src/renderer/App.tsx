@@ -31,7 +31,10 @@ export function App(): JSX.Element {
   const runtime = snapshot?.runtime;
   const selectedConfig = store.sshConfigs.find((config) => config.id === store.selectedConfigId);
   const enabledRules = store.routingRules.filter((rule) => rule.enabled);
-  const selectedRulesBlocked = store.routingMode === "selected-rules" && enabledRules.length === 0;
+  const selectedRulesBlocked =
+    store.routingMode === "selected-rules" &&
+    enabledRules.length === 0 &&
+    (!store.routingProxyList.enabled || store.routingProxyList.domains.length === 0);
   const loggingEnabled = store.settings.loggingEnabled;
   const sidebarCollapsed = store.settings.sidebarCollapsed;
   const theme = resolveTheme(store.settings.theme);

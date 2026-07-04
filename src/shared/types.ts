@@ -78,6 +78,20 @@ export interface RoutingRule {
   updatedAt: string;
 }
 
+export interface RoutingProxyList {
+  enabled: boolean;
+  sourceUrl: string;
+  domains: string[];
+  updatedAt?: string;
+}
+
+export interface RoutingDirectList {
+  enabled: boolean;
+  sourceUrl: string;
+  domains: string[];
+  updatedAt?: string;
+}
+
 export interface RgbColor {
   r: number;
   g: number;
@@ -126,6 +140,8 @@ export interface AppStore {
   settings: AppSettings;
   routingMode: RoutingMode;
   routingRules: RoutingRule[];
+  routingProxyList: RoutingProxyList;
+  routingDirectList: RoutingDirectList;
 }
 
 export interface ProxyProfile {
@@ -264,6 +280,8 @@ export interface ConnectRequest {
   config: SshConfig;
   routingMode: RoutingMode;
   routingRules: RoutingRule[];
+  routingProxyDomains: string[];
+  routingDirectDomains: string[];
   checkEndpoint: string;
   secrets?: SshServiceSecrets;
 }
@@ -272,6 +290,8 @@ export interface ProxyConnectRequest {
   profile: ProxyProfile;
   routingMode: RoutingMode;
   routingRules: RoutingRule[];
+  routingProxyDomains: string[];
+  routingDirectDomains: string[];
   checkEndpoint: string;
   secrets: ProxyServiceSecrets;
 }
@@ -279,6 +299,8 @@ export interface ProxyConnectRequest {
 export interface RoutingUpdateRequest {
   routingMode: RoutingMode;
   routingRules: RoutingRule[];
+  routingProxyDomains: string[];
+  routingDirectDomains: string[];
   checkEndpoint: string;
 }
 

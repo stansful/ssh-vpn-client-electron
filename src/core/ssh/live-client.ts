@@ -422,7 +422,16 @@ export class SshLiveClient {
         this.events.emit("event", { type: "terminal-data", data: event.data } satisfies SshLiveClientEvent);
       }
     }
-    if (event.type === "eof" || event.type === "close" || event.type === "open-failed") {
+    if (event.type === "eof") {
+      emitter.emit("end");
+      if (event.localChannel === this.terminalChannel) {
+        emitter.emit("close");
+        this.channelEmitters.delete(event.localChannel);
+        this.terminalChannel = undefined;
+      }
+      return;
+    }
+    if (event.type === "close" || event.type === "open-failed") {
       emitter.emit("close");
       this.channelEmitters.delete(event.localChannel);
       if (event.localChannel === this.terminalChannel) {
@@ -635,6 +644,11 @@ class SshDirectTcpIpChannel implements DirectTcpIpChannel {
   onData(listener: (data: Buffer) => void): () => void {
     this.emitter.on("data", listener);
     return () => this.emitter.off("data", listener);
+  }
+
+  onEnd(listener: () => void): () => void {
+    this.emitter.on("end", listener);
+    return () => this.emitter.off("end", listener);
   }
 
   onClose(listener: () => void): () => void {

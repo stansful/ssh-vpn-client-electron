@@ -163,6 +163,9 @@ export class Socks5Proxy {
         refreshIdleTimer();
         enqueueSocketWrite(data);
       });
+      const offEnd = channel.onEnd(() => {
+        endSocketAfterQueuedWrites();
+      });
       const offClose = channel.onClose(() => {
         endSocketAfterQueuedWrites();
       });
@@ -199,6 +202,7 @@ export class Socks5Proxy {
           clearTimeout(idleTimer);
         }
         offData();
+        offEnd();
         offClose();
         offError();
         this.sockets.delete(socket);
@@ -463,12 +467,12 @@ function parseHttpHeaders(lines: string[]): Map<string, string> {
 }
 
 function parseHttpForwardTarget(requestTarget: string, hostHeader: string | undefined): { target: DirectTcpIpTarget; path: string } {
-  if (/^https?:\/\//iu.test(requestTarget)) {
+  if (/^(?:http|ws)s?:\/\//iu.test(requestTarget)) {
     const url = new URL(requestTarget);
     return {
       target: {
         host: url.hostname,
-        port: url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80
+        port: url.port ? Number(url.port) : url.protocol === "https:" || url.protocol === "wss:" ? 443 : 80
       },
       path: `${url.pathname || "/"}${url.search}`
     };

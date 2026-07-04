@@ -716,6 +716,82 @@ textarea {
   margin-top: 14px;
 }
 
+.routing-list-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.routing-list-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-alt);
+}
+
+.routing-list-main {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.routing-list-main > span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.routing-list-title {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  font-weight: 800;
+  text-align: left;
+  cursor: pointer;
+}
+
+.routing-list-title:hover {
+  color: var(--accent);
+}
+
+.compact-switch {
+  min-height: 40px;
+  padding-inline: 10px;
+}
+
+.routing-list-viewer {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+}
+
+.routing-list-viewer-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.routing-list-textarea {
+  min-height: min(58vh, 520px);
+  color: #d9f2e6;
+  background: var(--terminal);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .settings-wide {
   grid-column: 1 / -1;
 }
@@ -755,6 +831,13 @@ textarea {
 .switch-row input {
   width: 18px;
   min-height: 18px;
+}
+
+.switch-row.inline-switch span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
 }
 
 .file-log-output {
@@ -1370,5 +1453,15 @@ details[open] summary {
   .add-rule input {
     min-width: 0;
     max-width: none;
+  }
+
+  .routing-list-card {
+    grid-template-columns: 1fr;
+  }
+
+  .routing-list-card .ghost-button,
+  .routing-list-card .compact-switch {
+    width: 100%;
+    justify-content: center;
   }
 }

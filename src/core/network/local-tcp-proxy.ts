@@ -11,6 +11,7 @@ export interface DirectTcpIpChannel {
   write(data: Buffer): Promise<void>;
   close(): Promise<void>;
   onData(listener: (data: Buffer) => void): () => void;
+  onEnd(listener: () => void): () => void;
   onClose(listener: () => void): () => void;
   onError(listener: (error: Error) => void): () => void;
 }
@@ -140,6 +141,9 @@ export class LocalTcpProxy {
       const offData = channel.onData((data) => {
         enqueueSocketWrite(data);
       });
+      const offEnd = channel.onEnd(() => {
+        endSocketAfterQueuedWrites();
+      });
       const offClose = channel.onClose(() => {
         endSocketAfterQueuedWrites();
       });
@@ -165,6 +169,7 @@ export class LocalTcpProxy {
       });
       socket.on("close", () => {
         offData();
+        offEnd();
         offClose();
         offError();
         this.sockets.delete(socket);

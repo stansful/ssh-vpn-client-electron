@@ -94,6 +94,8 @@ export class XrayServiceBridge {
         ...this.lastRequest,
         routingMode: update.routingMode,
         routingRules: update.routingRules,
+        routingProxyDomains: update.routingProxyDomains,
+        routingDirectDomains: update.routingDirectDomains,
         checkEndpoint: update.checkEndpoint
       };
     }
@@ -365,6 +367,8 @@ export class XrayServiceBridge {
     const result = await this.systemProxy.apply({
       mode: request.routingMode,
       rules: effectiveRules,
+      proxyDomains: request.routingProxyDomains,
+      directDomains: request.routingDirectDomains,
       socksHost: httpEndpoint.host,
       socksPort: httpEndpoint.port,
       proxyProtocol: "http"
@@ -414,6 +418,8 @@ export class XrayServiceBridge {
     const result = await this.systemProxy.apply({
       mode: request.routingMode,
       rules: effectiveRules,
+      proxyDomains: request.routingProxyDomains,
+      directDomains: request.routingDirectDomains,
       socksHost: (this.httpEndpoint ?? socksEndpoint).host,
       socksPort: (this.httpEndpoint ?? socksEndpoint).port,
       proxyProtocol: "http"

@@ -32,6 +32,11 @@ export class MemoryDirectTcpIpChannel implements DirectTcpIpChannel {
     return () => this.events.off("data", listener);
   }
 
+  onEnd(listener: () => void): () => void {
+    this.events.on("end", listener);
+    return () => this.events.off("end", listener);
+  }
+
   onClose(listener: () => void): () => void {
     this.events.on("close", listener);
     return () => this.events.off("close", listener);

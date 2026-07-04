@@ -6,8 +6,9 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { AppStorage } from "./storage/app-storage.js";
 import { listActiveProcesses } from "./processes.js";
 import { createPlatformTarget, nativeServiceExists, resolveNativeServicePath } from "./platform/targets.js";
-import { createDefaultRuntimeStatus } from "../shared/defaults.js";
+import { createDefaultRuntimeStatus, RUSSIA_INSIDE_PROXY_LIST_URL, RUSSIA_OUTSIDE_DIRECT_LIST_URL } from "../shared/defaults.js";
 import { IPC_CHANNELS, type ServiceEvent } from "../shared/ipc.js";
+import { parseDomainProxyList } from "../core/routing/domain-proxy-list.js";
 import { LocalIpcServiceBridge } from "../service/local-ipc-client.js";
 import { defaultServiceEndpoint } from "../service/local-ipc-protocol.js";
 import { NativeProcessServiceBridge } from "../service/native-process-client.js";
@@ -23,6 +24,7 @@ import { GITHUB_REPOSITORY_URL } from "../shared/links.js";
 import type {
   AppSettings,
   AppSnapshot,
+  AppStore,
   DiagnosticsEntry,
   GlobalTab,
   ImportProxyProfilesInput,
@@ -57,6 +59,8 @@ const DEFAULT_WINDOW_HEIGHT = 680;
 const MAX_DIAGNOSTICS_IN_MEMORY = 500;
 const MAX_TERMINAL_LINES_IN_MEMORY = 2000;
 const START_MINIMIZED_TO_TRAY_ARG = "--shadow-ssh-start-minimized-to-tray";
+const ROUTING_PROXY_LIST_TIMEOUT_MS = 15_000;
+const MAX_ROUTING_PROXY_LIST_BYTES = 2 * 1024 * 1024;
 
 const formatRuntimePath = (value: string): string => formatRuntimePathValue(runtimeFormatOptions, value);
 const startMinimizedToTray = process.argv.includes(START_MINIMIZED_TO_TRAY_ARG);
@@ -331,6 +335,36 @@ function registerIpcHandlers(): void {
     }
     return createSnapshot();
   });
+  ipcMain.handle(IPC_CHANNELS.updateRoutingProxyListEnabled, async (_event, enabled: boolean) => {
+    const current = storage.getStore().routingProxyList;
+    if (enabled && current.domains.length === 0) {
+      await refreshRoutingProxyList({ enabled: true });
+    } else {
+      await storage.updateRoutingProxyList({ ...current, enabled });
+    }
+    await applyRoutingListsChange();
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.refreshRoutingProxyList, async () => {
+    await refreshRoutingProxyList();
+    await applyRoutingListsChange();
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.updateRoutingDirectListEnabled, async (_event, enabled: boolean) => {
+    const current = storage.getStore().routingDirectList;
+    if (enabled && current.domains.length === 0) {
+      await refreshRoutingDirectList({ enabled: true });
+    } else {
+      await storage.updateRoutingDirectList({ ...current, enabled });
+    }
+    await applyRoutingListsChange();
+    return createSnapshot();
+  });
+  ipcMain.handle(IPC_CHANNELS.refreshRoutingDirectList, async () => {
+    await refreshRoutingDirectList();
+    await applyRoutingListsChange();
+    return createSnapshot();
+  });
   ipcMain.handle(IPC_CHANNELS.clearDiagnostics, () => {
     diagnostics = [];
     return createSnapshot();
@@ -467,9 +501,8 @@ async function connect(): Promise<void> {
     return;
   }
 
-  const enabledRules = store.routingRules.filter((rule) => rule.enabled);
-  if (store.routingMode === "selected-rules" && enabledRules.length === 0) {
-    appendError("Selected rules mode requires at least one enabled routing rule.");
+  if (store.routingMode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
+    appendError("Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain.");
     return;
   }
 
@@ -484,6 +517,8 @@ async function connect(): Promise<void> {
     config,
     routingMode: store.routingMode,
     routingRules: store.routingRules,
+    routingProxyDomains: activeRoutingProxyDomains(),
+    routingDirectDomains: activeRoutingDirectDomains(),
     checkEndpoint: store.settings.checkEndpoint,
     secrets: storage.resolveServiceSecrets(config)
   });
@@ -498,9 +533,8 @@ async function connectProxy(): Promise<void> {
     return;
   }
 
-  const enabledRules = store.routingRules.filter((rule) => rule.enabled);
-  if (store.routingMode === "selected-rules" && enabledRules.length === 0) {
-    appendError("Selected rules mode requires at least one enabled routing rule.");
+  if (store.routingMode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
+    appendError("Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain.");
     return;
   }
 
@@ -515,6 +549,8 @@ async function connectProxy(): Promise<void> {
     profile,
     routingMode: store.routingMode,
     routingRules: store.routingRules,
+    routingProxyDomains: activeRoutingProxyDomains(),
+    routingDirectDomains: activeRoutingDirectDomains(),
     checkEndpoint: store.settings.checkEndpoint,
     secrets: storage.resolveProxySecrets(profile)
   });
@@ -530,9 +566,8 @@ async function autoConnectOnStartup(): Promise<void> {
 
   const transport = store.settings.lastConnectedTransport;
   try {
-    const enabledRules = store.routingRules.filter((rule) => rule.enabled);
-    if (store.routingMode === "selected-rules" && enabledRules.length === 0) {
-      await writeMainLog("Auto-connect skipped: selected rules mode has no enabled routing rules.");
+    if (store.routingMode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
+      await writeMainLog("Auto-connect skipped: selected rules mode has no enabled routing rules or enabled proxy-list domains.");
       return;
     }
 
@@ -585,10 +620,9 @@ async function disconnectActiveTransport(): Promise<void> {
 
 async function applyActiveTransportRoutingChange(mode: RoutingMode): Promise<void> {
   const store = storage.getStore();
-  const enabledRules = store.routingRules.filter((rule) => rule.enabled);
-  if (mode === "selected-rules" && enabledRules.length === 0) {
+  if (mode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
     await disconnectActiveTransport();
-    appendError("Selected rules mode requires at least one enabled routing rule. Active tunnel was disconnected because routing mode changed.");
+    appendError("Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain. Active tunnel was disconnected because routing mode changed.");
     return;
   }
 
@@ -596,15 +630,104 @@ async function applyActiveTransportRoutingChange(mode: RoutingMode): Promise<voi
     await xrayService.updateRouting({
       routingMode: mode,
       routingRules: store.routingRules,
+      routingProxyDomains: activeRoutingProxyDomains(),
+      routingDirectDomains: activeRoutingDirectDomains(),
       checkEndpoint: store.settings.checkEndpoint
     });
   } else {
     await service.updateRouting({
       routingMode: mode,
       routingRules: store.routingRules,
+      routingProxyDomains: activeRoutingProxyDomains(),
+      routingDirectDomains: activeRoutingDirectDomains(),
       checkEndpoint: store.settings.checkEndpoint
     });
   }
+}
+
+async function applyRoutingListsChange(): Promise<void> {
+  const store = storage.getStore();
+  await activeTunnelService().updateRouting({
+    routingMode: store.routingMode,
+    routingRules: store.routingRules,
+    routingProxyDomains: activeRoutingProxyDomains(),
+    routingDirectDomains: activeRoutingDirectDomains(),
+    checkEndpoint: store.settings.checkEndpoint
+  });
+}
+
+async function refreshRoutingProxyList(options: { enabled?: boolean } = {}): Promise<void> {
+  const current = storage.getStore().routingProxyList;
+  const sourceUrl = current.sourceUrl || RUSSIA_INSIDE_PROXY_LIST_URL;
+  const text = await fetchTextWithLimit(sourceUrl, MAX_ROUTING_PROXY_LIST_BYTES, ROUTING_PROXY_LIST_TIMEOUT_MS);
+  const domains = parseDomainProxyList(text);
+  if (domains.length === 0) {
+    throw new Error("Routing proxy list refresh returned no domains.");
+  }
+  await storage.updateRoutingProxyList({
+    enabled: options.enabled ?? current.enabled,
+    sourceUrl,
+    domains,
+    updatedAt: new Date().toISOString()
+  });
+  appendInfo(`Routing proxy list refreshed: ${domains.length} domains from ${sourceUrl}.`);
+}
+
+async function refreshRoutingDirectList(options: { enabled?: boolean } = {}): Promise<void> {
+  const current = storage.getStore().routingDirectList;
+  const sourceUrl = current.sourceUrl || RUSSIA_OUTSIDE_DIRECT_LIST_URL;
+  const text = await fetchTextWithLimit(sourceUrl, MAX_ROUTING_PROXY_LIST_BYTES, ROUTING_PROXY_LIST_TIMEOUT_MS);
+  const domains = parseDomainProxyList(text);
+  if (domains.length === 0) {
+    throw new Error("Routing direct list refresh returned no domains.");
+  }
+  await storage.updateRoutingDirectList({
+    enabled: options.enabled ?? current.enabled,
+    sourceUrl,
+    domains,
+    updatedAt: new Date().toISOString()
+  });
+  appendInfo(`Routing direct list refreshed: ${domains.length} domains from ${sourceUrl}.`);
+}
+
+async function fetchTextWithLimit(url: string, maxBytes: number, timeoutMs: number): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref();
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "shadow-ssh-desktop-routing-list" }
+    });
+    if (!response.ok) {
+      throw new Error(`Routing list download failed: ${response.status} ${response.statusText}`);
+    }
+    const contentLength = Number(response.headers.get("content-length") ?? "0");
+    if (contentLength > maxBytes) {
+      throw new Error("Routing list is larger than the allowed limit.");
+    }
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > maxBytes) {
+      throw new Error("Routing list is larger than the allowed limit.");
+    }
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function activeRoutingProxyDomains(): string[] {
+  const proxyList = storage.getStore().routingProxyList;
+  return proxyList.enabled ? proxyList.domains : [];
+}
+
+function activeRoutingDirectDomains(): string[] {
+  const directList = storage.getStore().routingDirectList;
+  return directList.enabled ? directList.domains : [];
+}
+
+function hasSelectedRoutingTargets(store: AppStore): boolean {
+  return store.routingRules.some((rule) => rule.enabled) || (store.routingProxyList.enabled && store.routingProxyList.domains.length > 0);
 }
 
 function shouldReconnectForRoutingModeChange(status: RuntimeStatus): boolean {
@@ -688,6 +811,19 @@ function appendError(message: string): void {
   if (appendDiagnosticEntry(entry)) {
     broadcast({ type: "diagnostics-appended", entry });
   }
+}
+
+function appendInfo(message: string): void {
+  const entry: DiagnosticsEntry = {
+    id: randomUUID(),
+    at: new Date().toISOString(),
+    level: "info",
+    message
+  };
+  if (appendDiagnosticEntry(entry)) {
+    broadcast({ type: "diagnostics-appended", entry });
+  }
+  void writeMainLog(`INFO ${message}`);
 }
 
 function appendDiagnosticEntry(entry: DiagnosticsEntry): boolean {

@@ -1,9 +1,9 @@
-import { Download, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
-import type { ChangeEvent, Dispatch, SetStateAction } from "react";
+import { Download, FileText, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
+import { useMemo, useState, type ChangeEvent, type Dispatch, type SetStateAction } from "react";
 import { placeholderForRule, routingSaveLabel } from "../../lib/labels.js";
 import type { RoutingSaveState } from "../../types.js";
-import type { RoutingRule, RoutingRuleType } from "../../../shared/types.js";
-import { EmptyState, Segmented } from "../ui/index.js";
+import type { RoutingDirectList, RoutingProxyList, RoutingRule, RoutingRuleType } from "../../../shared/types.js";
+import { EmptyState, Modal, Segmented } from "../ui/index.js";
 
 export function RoutingView({
   ruleTab,
@@ -13,6 +13,8 @@ export function RoutingView({
   routingSaveState,
   filteredRules,
   filteredProcesses,
+  proxyList,
+  directList,
   processSearch,
   enabledCount,
   onRuleTabChange,
@@ -23,6 +25,10 @@ export function RoutingView({
   onImportRules,
   onProcessSearchChange,
   onLoadProcesses,
+  onProxyListEnabledChange,
+  onRefreshProxyList,
+  onDirectListEnabledChange,
+  onRefreshDirectList,
   onUpdateRules
 }: {
   ruleTab: RoutingRuleType;
@@ -32,6 +38,8 @@ export function RoutingView({
   routingSaveState: RoutingSaveState;
   filteredRules: RoutingRule[];
   filteredProcesses: string[];
+  proxyList: RoutingProxyList;
+  directList: RoutingDirectList;
   processSearch: string;
   enabledCount: number;
   onRuleTabChange: Dispatch<SetStateAction<RoutingRuleType>>;
@@ -42,10 +50,89 @@ export function RoutingView({
   onImportRules: (event: ChangeEvent<HTMLInputElement>) => void;
   onProcessSearchChange: Dispatch<SetStateAction<string>>;
   onLoadProcesses: () => void;
+  onProxyListEnabledChange: (enabled: boolean) => void;
+  onRefreshProxyList: () => void;
+  onDirectListEnabledChange: (enabled: boolean) => void;
+  onRefreshDirectList: () => void;
   onUpdateRules: (mutator: (rules: RoutingRule[]) => RoutingRule[]) => void;
 }): JSX.Element {
+  const [openList, setOpenList] = useState<{ title: string; domains: string[] } | undefined>();
+  const openListText = useMemo(() => openList?.domains.join("\n") ?? "", [openList]);
+  const enabledDomainCount = (proxyList.enabled ? proxyList.domains.length : 0) + (directList.enabled ? directList.domains.length : 0);
+
   return (
     <section className="screen">
+      <section className="panel routing-panel">
+        <div className="section-title">
+          <h2>Domain lists</h2>
+          <span>{enabledDomainCount > 0 ? `${enabledDomainCount} active` : "Disabled"}</span>
+        </div>
+        <div className="routing-list-grid">
+          <article className="routing-list-card">
+            <div className="routing-list-main">
+              <button
+                type="button"
+                className="routing-list-title"
+                onClick={() => setOpenList({ title: "Russia inside-raw.lst", domains: proxyList.domains })}
+              >
+                <ShieldCheck size={16} /> Russia inside-raw.lst
+              </button>
+              <span>{proxyList.domains.length} proxy domains</span>
+            </div>
+            <label className="switch-row inline-switch compact-switch">
+              <input
+                type="checkbox"
+                checked={proxyList.enabled}
+                onChange={(event) => onProxyListEnabledChange(event.target.checked)}
+              />
+              <span>Use</span>
+            </label>
+            <button type="button" className="ghost-button" onClick={onRefreshProxyList}><RefreshCw size={16} /> Refresh</button>
+          </article>
+
+          <article className="routing-list-card">
+            <div className="routing-list-main">
+              <button
+                type="button"
+                className="routing-list-title"
+                onClick={() => setOpenList({ title: "Russia outside-raw.lst", domains: directList.domains })}
+              >
+                <Route size={16} /> Russia outside-raw.lst
+              </button>
+              <span>{directList.domains.length} direct domains</span>
+            </div>
+            <label className="switch-row inline-switch compact-switch">
+              <input
+                type="checkbox"
+                checked={directList.enabled}
+                onChange={(event) => onDirectListEnabledChange(event.target.checked)}
+              />
+              <span>Use</span>
+            </label>
+            <button type="button" className="ghost-button" onClick={onRefreshDirectList}><RefreshCw size={16} /> Refresh</button>
+          </article>
+        </div>
+        <dl className="facts log-facts">
+          <div><dt>Proxy domains</dt><dd>{proxyList.enabled ? proxyList.domains.length : "Off"}</dd></div>
+          <div><dt>Direct domains</dt><dd>{directList.enabled ? directList.domains.length : "Off"}</dd></div>
+          <div className="wide-fact"><dt>Source</dt><dd>itdoginfo/allow-domains Russia</dd></div>
+        </dl>
+      </section>
+
+      <Modal open={Boolean(openList)} title={openList?.title ?? "Routing list"} onClose={() => setOpenList(undefined)}>
+        <div className="routing-list-viewer">
+          <div className="routing-list-viewer-meta">
+            <FileText size={16} />
+            <span>{openList?.domains.length ?? 0} domains</span>
+          </div>
+          <textarea
+            className="routing-list-textarea"
+            readOnly
+            value={openListText || "List is empty. Refresh it before viewing domains."}
+          />
+        </div>
+      </Modal>
+
       <section className="panel routing-panel">
         <div className="section-title">
           <h2>Routing rules</h2>

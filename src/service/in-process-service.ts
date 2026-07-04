@@ -38,7 +38,7 @@ export class InProcessServiceBridge implements ServiceBridge {
 
   async updateRouting(request: RoutingUpdateRequest): Promise<void> {
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
-    this.appendDiagnostic("info", `Service routing updated: mode=${request.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`);
+    this.appendDiagnostic("info", `Service routing updated: mode=${request.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, proxyListDomains=${request.routingProxyDomains.length}, directListDomains=${request.routingDirectDomains.length}.`);
   }
 
   async connect(request: ConnectRequest): Promise<void> {
@@ -56,7 +56,7 @@ export class InProcessServiceBridge implements ServiceBridge {
       { cookie: Buffer.alloc(16), ...DEFAULT_KEX_INIT }
     );
     const keyLengths = transportKeyLengthsFor(algorithms.encryptionClientToServer, algorithms.macClientToServer);
-    this.appendDiagnostic("info", `Connect requested for ${request.config.name} (${request.config.host}:${request.config.port}), auth=${request.config.authType}, routing=${request.routingMode}, enabledRules=${routing.enabledRules}.`);
+    this.appendDiagnostic("info", `Connect requested for ${request.config.name} (${request.config.host}:${request.config.port}), auth=${request.config.authType}, routing=${request.routingMode}, enabledRules=${routing.enabledRules}, proxyListDomains=${request.routingProxyDomains.length}, directListDomains=${request.routingDirectDomains.length}.`);
     this.appendDiagnostic("info", `Routing core prepared: domains=${routing.domainRules}, ips=${routing.ipRules}, processes=${routing.processRules}, invalid=${routing.invalidRules}.`);
     this.appendDiagnostic("info", `SSH core prepared: kex=${algorithms.kexAlgorithm}, hostKey=${algorithms.serverHostKeyAlgorithm}, cipher=${algorithms.encryptionClientToServer}, mac=${algorithms.macClientToServer}, keyBytes=${keyLengths.cipherKeyLength}.`);
     this.appendDiagnostic("info", `Service-side secrets resolved: password=${Boolean(request.secrets?.password)}, privateKey=${Boolean(request.secrets?.privateKey)}, passphrase=${Boolean(request.secrets?.privateKeyPassphrase)}.`);

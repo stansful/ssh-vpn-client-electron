@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { parseProxyShareLink, parseProxyShareLinks } from "../../core/proxy/share-link-parser.js";
 import { assertSshPrivateKeyText, normalizeSshPrivateKeyText } from "../../core/ssh/private-key.js";
-import { createDefaultStore, STORE_SCHEMA_VERSION } from "../../shared/defaults.js";
+import { createDefaultStore, RUSSIA_INSIDE_PROXY_LIST_URL, RUSSIA_OUTSIDE_DIRECT_LIST_URL, STORE_SCHEMA_VERSION } from "../../shared/defaults.js";
 import type {
   ImportProxyProfilesInput,
   ImportProxyProfilesResult,
@@ -13,7 +13,9 @@ import type {
   AppStore,
   ProxyProfile,
   ProxyServiceSecrets,
+  RoutingDirectList,
   RoutingMode,
+  RoutingProxyList,
   RoutingRule,
   SshServiceSecrets,
   SshConfig,
@@ -212,6 +214,28 @@ export class AppStorage {
 
   async updateRoutingRules(rules: RoutingRule[]): Promise<AppStore> {
     this.store.routingRules = rules;
+    await this.persistStore();
+    return this.getStore();
+  }
+
+  async updateRoutingProxyList(list: RoutingProxyList): Promise<AppStore> {
+    this.store.routingProxyList = {
+      enabled: list.enabled,
+      sourceUrl: list.sourceUrl.trim() || RUSSIA_INSIDE_PROXY_LIST_URL,
+      domains: normalizeDomainList(list.domains),
+      updatedAt: list.updatedAt
+    };
+    await this.persistStore();
+    return this.getStore();
+  }
+
+  async updateRoutingDirectList(list: RoutingDirectList): Promise<AppStore> {
+    this.store.routingDirectList = {
+      enabled: list.enabled,
+      sourceUrl: list.sourceUrl.trim() || RUSSIA_OUTSIDE_DIRECT_LIST_URL,
+      domains: normalizeDomainList(list.domains),
+      updatedAt: list.updatedAt
+    };
     await this.persistStore();
     return this.getStore();
   }
@@ -520,8 +544,44 @@ function normalizeStore(input: AppStore): AppStore {
     sshKeys: Array.isArray(input.sshKeys) ? input.sshKeys : [],
     proxyProfiles: Array.isArray(input.proxyProfiles) ? input.proxyProfiles : [],
     selectedProxyProfileId: input.selectedProxyProfileId,
-    routingRules: Array.isArray(input.routingRules) ? input.routingRules : []
+    routingRules: Array.isArray(input.routingRules) ? input.routingRules : [],
+    routingProxyList: normalizeRoutingProxyList(input.routingProxyList ?? (input as AppStore & { routingBypassList?: unknown }).routingBypassList, defaults.routingProxyList),
+    routingDirectList: normalizeRoutingDirectList(input.routingDirectList, defaults.routingDirectList)
   };
+}
+
+function normalizeRoutingProxyList(input: unknown, defaults: RoutingProxyList): RoutingProxyList {
+  const candidate = input as Partial<RoutingProxyList> | undefined;
+  return {
+    enabled: Boolean(candidate?.enabled),
+    sourceUrl: typeof candidate?.sourceUrl === "string" && candidate.sourceUrl.trim() ? candidate.sourceUrl.trim() : defaults.sourceUrl,
+    domains: normalizeDomainList(candidate?.domains),
+    updatedAt: typeof candidate?.updatedAt === "string" ? candidate.updatedAt : undefined
+  };
+}
+
+function normalizeRoutingDirectList(input: unknown, defaults: RoutingDirectList): RoutingDirectList {
+  const candidate = input as Partial<RoutingDirectList> | undefined;
+  return {
+    enabled: Boolean(candidate?.enabled),
+    sourceUrl: typeof candidate?.sourceUrl === "string" && candidate.sourceUrl.trim() ? candidate.sourceUrl.trim() : defaults.sourceUrl,
+    domains: normalizeDomainList(candidate?.domains),
+    updatedAt: typeof candidate?.updatedAt === "string" ? candidate.updatedAt : undefined
+  };
+}
+
+function normalizeDomainList(input: unknown): string[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      input
+        .filter((domain): domain is string => typeof domain === "string")
+        .map((domain) => domain.trim().toLowerCase())
+        .filter(Boolean)
+    )
+  ).sort((left, right) => left.localeCompare(right));
 }
 
 function encryptSecret(value: string, dataDir: string): Pick<SecretRecord, "backend" | "ciphertext"> {

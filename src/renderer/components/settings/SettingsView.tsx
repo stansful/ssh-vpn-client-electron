@@ -26,6 +26,7 @@ export function SettingsView({
   platform: DesktopPlatform | undefined;
 }): JSX.Element {
   const enabledRules = store.routingRules.filter((rule) => rule.enabled).length;
+  const enabledProxyListDomains = store.routingProxyList.enabled ? store.routingProxyList.domains.length : 0;
   const windowsStartupAvailable = platform === "windows";
 
   return (
@@ -113,7 +114,7 @@ export function SettingsView({
       <section className="panel">
         <div className="section-title">
           <h2>Routing</h2>
-          <span>{store.routingMode === "proxy-all" ? "Proxy all" : `${enabledRules} rules`}</span>
+          <span>{store.routingMode === "proxy-all" ? "Proxy all" : `${enabledRules + enabledProxyListDomains} targets`}</span>
         </div>
         <Segmented<RoutingMode>
           value={store.routingMode}
@@ -123,9 +124,9 @@ export function SettingsView({
           ]}
           onChange={onRoutingModeChange}
         />
-        {store.routingMode === "selected-rules" && enabledRules === 0 && (
+        {store.routingMode === "selected-rules" && enabledRules === 0 && enabledProxyListDomains === 0 && (
           <div className="warning-row spaced">
-            Selected rules mode requires at least one enabled rule before Connect.
+            Selected rules mode requires at least one enabled rule or proxy-list domain before Connect.
           </div>
         )}
       </section>

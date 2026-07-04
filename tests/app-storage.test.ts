@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDefaultStore } from "../src/shared/defaults.js";
+import { createDefaultStore, RUSSIA_INSIDE_PROXY_LIST_URL, RUSSIA_OUTSIDE_DIRECT_LIST_URL } from "../src/shared/defaults.js";
 
 vi.mock("electron", () => ({
   app: {
@@ -30,6 +30,47 @@ describe("AppStorage persistence", () => {
 
     expect(defaults.autoConnectOnStartup).toBe(true);
     expect(defaults.lastConnectedTransport).toBe("ssh");
+  });
+
+  it("defaults the Russia inside proxy list to disabled", () => {
+    const proxyList = createDefaultStore().routingProxyList;
+
+    expect(proxyList.enabled).toBe(false);
+    expect(proxyList.sourceUrl).toBe(RUSSIA_INSIDE_PROXY_LIST_URL);
+    expect(proxyList.domains).toEqual([]);
+  });
+
+  it("defaults the Russia outside direct list to disabled", () => {
+    const directList = createDefaultStore().routingDirectList;
+
+    expect(directList.enabled).toBe(false);
+    expect(directList.sourceUrl).toBe(RUSSIA_OUTSIDE_DIRECT_LIST_URL);
+    expect(directList.domains).toEqual([]);
+  });
+
+  it("migrates the temporary routingBypassList field into the proxy list", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const legacyStore = {
+      ...createDefaultStore(),
+      routingProxyList: undefined,
+      routingBypassList: {
+        enabled: true,
+        sourceUrl: RUSSIA_INSIDE_PROXY_LIST_URL,
+        domains: ["gosuslugi.ru", ".ru"],
+        updatedAt: "2026-07-04T00:00:00.000Z"
+      }
+    };
+    await writeFile(path.join(dir, "app-store.v1.json"), `${JSON.stringify(legacyStore, null, 2)}\n`, "utf8");
+
+    const storage = new AppStorage(dir);
+    await storage.init();
+
+    expect(storage.getStore().routingProxyList).toEqual({
+      enabled: true,
+      sourceUrl: RUSSIA_INSIDE_PROXY_LIST_URL,
+      domains: [".ru", "gosuslugi.ru"],
+      updatedAt: "2026-07-04T00:00:00.000Z"
+    });
   });
 
   it("uses independent temp files for concurrent atomic writes", async () => {

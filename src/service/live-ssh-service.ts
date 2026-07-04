@@ -91,6 +91,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
         ...this.lastRequest,
         routingMode: update.routingMode,
         routingRules: update.routingRules,
+        routingProxyDomains: update.routingProxyDomains,
+        routingDirectDomains: update.routingDirectDomains,
         checkEndpoint: update.checkEndpoint
       };
     }
@@ -400,6 +402,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
     const result = await this.systemProxy.apply({
       mode: request.routingMode,
       rules: effectiveRules,
+      proxyDomains: request.routingProxyDomains,
+      directDomains: request.routingDirectDomains,
       socksHost: socksEndpoint.host,
       socksPort: socksEndpoint.port
     });
@@ -448,6 +452,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
     const result = await this.systemProxy.apply({
       mode: request.routingMode,
       rules: effectiveRules,
+      proxyDomains: request.routingProxyDomains,
+      directDomains: request.routingDirectDomains,
       socksHost: socksEndpoint.host,
       socksPort: socksEndpoint.port
     });

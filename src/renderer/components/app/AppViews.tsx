@@ -166,6 +166,8 @@ export function AppViews({
         routingSaveState={routing.routingSaveState}
         filteredRules={routing.filteredRules}
         filteredProcesses={routing.filteredProcesses}
+        proxyList={store.routingProxyList}
+        directList={store.routingDirectList}
         processSearch={routing.processSearch}
         enabledCount={routing.routingDraft.filter((rule) => rule.enabled).length}
         onRuleTabChange={routing.setRuleTab}
@@ -176,6 +178,10 @@ export function AppViews({
         onImportRules={routing.importRules}
         onProcessSearchChange={routing.setProcessSearch}
         onLoadProcesses={routing.loadProcesses}
+        onProxyListEnabledChange={routing.updateProxyListEnabled}
+        onRefreshProxyList={routing.refreshProxyList}
+        onDirectListEnabledChange={routing.updateDirectListEnabled}
+        onRefreshDirectList={routing.refreshDirectList}
         onUpdateRules={routing.updateRoutingDraft}
       />
     );

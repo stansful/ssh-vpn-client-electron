@@ -1,6 +1,102 @@
 # Worklog
 
+## 2026-07-04
+
+### Start: Russia direct list and list viewer UI
+
+- User requested adding `outside-raw.lst` as a DIRECT list analogous to the existing proxy list.
+- User requested clicking `Russia inside-raw.lst` / `Russia outside-raw.lst` to open a text view of domains, with the checkbox as a separate control.
+- User requested removing the `Updated` UI element because refresh notices already show update state.
+- Current focus: add persisted direct-list model, PAC DIRECT handling before proxy rules, list viewer modal, and routing UI cleanup.
+
+### End: Russia direct list and list viewer UI
+
+- Added persisted `routingDirectList` backed by `outside-raw.lst`, disabled by default.
+- Added IPC/preload/renderer controls for enabling and refreshing the direct list.
+- Updated SSH/Xray routing updates so both lists are passed to the Windows PAC layer:
+  - `inside-raw.lst` stays a proxy-list and routes matching domains through the tunnel;
+  - `outside-raw.lst` is a direct-list and returns `DIRECT` before proxy rules;
+  - `proxy-all` now switches to PAC when direct-list domains are enabled, so direct exceptions can work.
+- Updated Routing UI:
+  - `Domain lists` now shows separate proxy/direct cards;
+  - list names open a read-only text viewer with loaded domains;
+  - checkboxes are separate `Use` controls;
+  - removed the `Updated` facts row.
+- Added storage and PAC tests for the direct list and direct-before-proxy ordering.
+- Verification passed: `npm run typecheck`, targeted `npm test -- tests/network-proxy.test.ts tests/app-storage.test.ts tests/service-routing.test.ts`, `npm run lint`, full `npm test` (17 files, 102 tests), `npm run build`, and `git diff --check`.
+- Process check note: no dev server was started; `pgrep`/`ps` process inspection is blocked in this sandbox (`sysmond service not found` / operation not permitted).
+
+### Start: Russia inside proxy routing list correction
+
+- User clarified that `inside-raw.lst` must be a proxy list, not a bypass/DIRECT list.
+- Current focus: invert the previous list semantics, rename persisted/API/UI concepts from bypass to proxy list, and make selected-rules treat enabled list domains as proxy targets.
+
+### End: Russia inside proxy routing list correction
+
+- Corrected `inside-raw.lst` semantics from DIRECT bypass to proxy routing.
+- Renamed app concepts from bypass to proxy list:
+  - persisted store field is now `routingProxyList`;
+  - IPC/API methods are now `updateRoutingProxyListEnabled` and `refreshRoutingProxyList`;
+  - Routing UI now shows `Proxy list` and `proxied` domain counts.
+- Added migration from the temporary erroneous `routingBypassList` field into `routingProxyList`.
+- Updated Windows PAC generation so proxy-list domains join proxy conditions in selected-rules mode instead of returning `DIRECT`.
+- `Selected rules` connect/blocking logic now allows an enabled proxy-list with domains even when there are no manual rules.
+- Verification passed: `npm run typecheck`, `npm test -- tests/network-proxy.test.ts`, `npm test -- tests/app-storage.test.ts`, `npm test -- tests/service-routing.test.ts`, `npm run lint`, `npm test` (17 files, 99 tests), and `npm run build`.
+
 ## 2026-07-03
+
+### Start: WSS over SSH disconnect fix
+
+- User provided Firefox/WebSocket King screenshot showing WSS over SSH receives HTTP proxy `200 Connection Established`, sometimes reaches WebSocket `101`, then disconnects.
+- Current focus: inspect SSH `direct-tcpip` channel lifecycle and local proxy byte pump for premature close/EOF handling on long-lived bidirectional WebSocket streams.
+
+### End: WSS over SSH disconnect fix
+
+- Hardened SSH `direct-tcpip` EOF handling for long-lived bidirectional streams:
+  - SSH channel EOF is now treated as half-close (`end`) rather than immediate full close for direct TCP channels;
+  - full channel cleanup remains tied to SSH channel close/open-failure;
+  - local HTTP/SOCKS proxy now listens to channel `onEnd` separately from `onClose`.
+- Updated channel lifecycle rules so local writes remain allowed after remote EOF until the local side sends EOF/CLOSE.
+- Added regression coverage for directional EOF channel behavior.
+- Verification passed: `npm run typecheck`, `npm test -- tests/ssh-transport-security.test.ts`, `npm test -- tests/network-proxy.test.ts`, `npm test -- tests/ssh-session-state.test.ts`, `npm run lint`, `npm test` (17 files, 98 tests), and `npm run build`.
+
+### Start: SSH WebSocket proxy fix
+
+- User reported that WebSocket traffic does not work at all when connected through SSH.
+- Current focus: inspect the SSH local HTTP/SOCKS proxy path, especially HTTP Upgrade and CONNECT handling, then add regression coverage.
+
+### End: SSH WebSocket proxy fix
+
+- Fixed SSH local HTTP/SOCKS proxy parsing for absolute-form `ws://...` HTTP proxy requests.
+- WebSocket HTTP Upgrade requests now preserve the original path/query when rewritten from proxy absolute-form to origin-form.
+- Existing Upgrade-related headers remain intact; only `Proxy-Connection` is stripped as before.
+- Added a regression test covering `GET ws://host/path?query HTTP/1.1` with `Upgrade: websocket`.
+- Verification passed: `npm test -- tests/network-proxy.test.ts`, `npm run typecheck`, `npm run lint`, `npm test` (17 files, 94 tests), and `npm run build`.
+
+### Start: Russia inside bypass routing list
+
+- User requested adding support in Routing for the `itdoginfo/allow-domains` Russia `inside-raw.lst` list.
+- Current focus: add an optional DIRECT bypass list sourced from the raw GitHub list, persist it locally, and apply it to SSH/Xray Windows PAC routing without changing normal routing defaults.
+
+### End: Russia inside bypass routing list
+
+- Added persisted `routingBypassList` with the Russia `inside-raw.lst` raw URL, disabled by default.
+- Added Routing UI controls:
+  - enable/disable `Russia inside-raw.lst`;
+  - refresh the list from GitHub;
+  - show domain count, last update time, and source.
+- Added main-process refresh/parsing:
+  - downloads the raw list with timeout/size limits;
+  - parses whitespace-separated domains;
+  - supports suffix entries like `.ua` and wildcard entries like `*.example.com`;
+  - stores the normalized unique domain list locally.
+- Added active routing re-apply after bypass toggle/refresh for both SSH and Xray.
+- Extended Windows PAC generation:
+  - bypass domains return `DIRECT` first;
+  - `proxy-all` with bypass uses PAC so the bypass can work;
+  - selected-rules still applies user proxy rules after bypass checks.
+- Added parser, PAC, and storage default tests.
+- Verification passed: `npm run typecheck`, `npm test -- tests/network-proxy.test.ts`, `npm test -- tests/app-storage.test.ts`, `npm run lint`, `npm test` (17 files, 97 tests), and `npm run build`.
 
 ### Start: startup auto-connect setting
 

@@ -3,6 +3,7 @@ import type { Socket } from "node:net";
 import { describe, expect, it } from "vitest";
 import { readProxyConnectRequest, readSocksConnectRequest } from "../src/core/network/socks5-proxy.js";
 import { buildProxyPac } from "../src/core/network/windows-system-proxy.js";
+import { parseDomainProxyList } from "../src/core/routing/domain-proxy-list.js";
 
 describe("SOCKS5 proxy", () => {
   it("parses no-auth CONNECT requests for direct-tcpip channel opening", async () => {
@@ -124,6 +125,49 @@ describe("SOCKS5 proxy", () => {
     });
   });
 
+  it("preserves WebSocket absolute-form target path and upgrade headers", async () => {
+    const socket = new FakeSocket() as unknown as Socket;
+    const request = readProxyConnectRequest(socket);
+    const fake = socket as unknown as FakeSocket;
+
+    fake.pushInput(Buffer.from("G", "utf8"));
+    await Promise.resolve();
+    fake.pushInput(
+      Buffer.from(
+        [
+          "ET ws://socket.example.com/realtime/events?room=1 HTTP/1.1",
+          "Host: socket.example.com",
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          "Sec-WebSocket-Key: test-key",
+          "Sec-WebSocket-Version: 13",
+          "Proxy-Connection: keep-alive",
+          "",
+          ""
+        ].join("\r\n"),
+        "utf8"
+      )
+    );
+
+    await expect(request).resolves.toEqual({
+      protocol: "http-forward",
+      target: { host: "socket.example.com", port: 80 },
+      initialData: Buffer.from(
+        [
+          "GET /realtime/events?room=1 HTTP/1.1",
+          "Host: socket.example.com",
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          "Sec-WebSocket-Key: test-key",
+          "Sec-WebSocket-Version: 13",
+          "",
+          ""
+        ].join("\r\n"),
+        "latin1"
+      )
+    });
+  });
+
 });
 
 describe("Windows PAC generation", () => {
@@ -139,7 +183,7 @@ describe("Windows PAC generation", () => {
       1080
     );
 
-    expect(pac).toContain("Shadow SSH selected-rules PAC");
+    expect(pac).toContain("Shadow SSH routing PAC");
     expect(pac).toContain("PROXY 127.0.0.1:1080");
     expect(pac).toContain("SOCKS5 127.0.0.1:1080");
     expect(pac).toContain('dnsDomainIs(hostNoBrackets, ".example.com")');
@@ -160,6 +204,50 @@ describe("Windows PAC generation", () => {
 
     expect(pac).toContain("PROXY 127.0.0.1:19080");
     expect(pac).not.toContain("SOCKS5 127.0.0.1:19080");
+  });
+
+  it("adds proxy-list checks to selected-rules routing", () => {
+    const pac = buildProxyPac([], "127.0.0.1", 1080, "mixed", {
+      mode: "selected-rules",
+      proxyDomains: [".ru", "gosuslugi.ru"]
+    });
+
+    expect(pac).toContain('if (hostNoBrackets == "ru" || dnsDomainIs(hostNoBrackets, ".ru")');
+    expect(pac).toContain('hostNoBrackets == "gosuslugi.ru"');
+    expect(pac).toContain('return "PROXY 127.0.0.1:1080; SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080";');
+  });
+
+  it("checks direct-list domains before proxy-list domains", () => {
+    const pac = buildProxyPac([], "127.0.0.1", 1080, "mixed", {
+      mode: "selected-rules",
+      proxyDomains: ["example.com"],
+      directDomains: ["direct.example.com"]
+    });
+
+    expect(pac.indexOf('hostNoBrackets == "direct.example.com"')).toBeLessThan(pac.indexOf('hostNoBrackets == "example.com"'));
+    expect(pac).toContain('return "DIRECT";');
+    expect(pac).toContain('return "PROXY 127.0.0.1:1080; SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080";');
+  });
+
+  it("uses PAC for proxy-all when a direct list is present", () => {
+    const pac = buildProxyPac([], "127.0.0.1", 1080, "mixed", {
+      mode: "proxy-all",
+      directDomains: [".ru"]
+    });
+
+    expect(pac.indexOf('dnsDomainIs(hostNoBrackets, ".ru")')).toBeLessThan(pac.indexOf('return "PROXY 127.0.0.1:1080'));
+    expect(pac).toContain('return "DIRECT";');
+    expect(pac).toContain('return "PROXY 127.0.0.1:1080; SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080";');
+  });
+});
+
+describe("domain proxy list parser", () => {
+  it("parses whitespace-separated inside-raw domains", () => {
+    expect(parseDomainProxyList(".ua  gosuslugi.ru\n*.example.com https://ignored.test/path #comment")).toEqual([
+      ".example.com",
+      ".ua",
+      "gosuslugi.ru"
+    ]);
   });
 });
 

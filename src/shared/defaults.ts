@@ -1,6 +1,8 @@
 import type { AppSettings, AppStore, CustomTheme, PlatformTarget, RuntimeStatus } from "./types.js";
 
 export const STORE_SCHEMA_VERSION = 1;
+export const RUSSIA_INSIDE_PROXY_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst";
+export const RUSSIA_OUTSIDE_DIRECT_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst";
 
 export const DEFAULT_CUSTOM_THEME: CustomTheme = {
   accent: { r: 246, g: 139, b: 0 },
@@ -41,7 +43,17 @@ export function createDefaultStore(): AppStore {
     proxyProfiles: [],
     settings: DEFAULT_SETTINGS,
     routingMode: "proxy-all",
-    routingRules: []
+    routingRules: [],
+    routingProxyList: {
+      enabled: false,
+      sourceUrl: RUSSIA_INSIDE_PROXY_LIST_URL,
+      domains: []
+    },
+    routingDirectList: {
+      enabled: false,
+      sourceUrl: RUSSIA_OUTSIDE_DIRECT_LIST_URL,
+      domains: []
+    }
   };
 }
 

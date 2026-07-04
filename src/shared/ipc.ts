@@ -33,6 +33,10 @@ export const IPC_CHANNELS = {
   updateSettings: "shadow-ssh:update-settings",
   updateRoutingMode: "shadow-ssh:update-routing-mode",
   updateRoutingRules: "shadow-ssh:update-routing-rules",
+  updateRoutingProxyListEnabled: "shadow-ssh:update-routing-proxy-list-enabled",
+  refreshRoutingProxyList: "shadow-ssh:refresh-routing-proxy-list",
+  updateRoutingDirectListEnabled: "shadow-ssh:update-routing-direct-list-enabled",
+  refreshRoutingDirectList: "shadow-ssh:refresh-routing-direct-list",
   clearDiagnostics: "shadow-ssh:clear-diagnostics",
   readLogFile: "shadow-ssh:read-log-file",
   clearLogFile: "shadow-ssh:clear-log-file",
@@ -77,6 +81,10 @@ export interface ShadowSshApi {
   updateSettings(settings: AppSettings): Promise<AppSnapshot>;
   updateRoutingMode(mode: RoutingMode): Promise<AppSnapshot>;
   updateRoutingRules(rules: RoutingRule[]): Promise<AppSnapshot>;
+  updateRoutingProxyListEnabled(enabled: boolean): Promise<AppSnapshot>;
+  refreshRoutingProxyList(): Promise<AppSnapshot>;
+  updateRoutingDirectListEnabled(enabled: boolean): Promise<AppSnapshot>;
+  refreshRoutingDirectList(): Promise<AppSnapshot>;
   clearDiagnostics(): Promise<AppSnapshot>;
   readLogFile(): Promise<string>;
   clearLogFile(): Promise<string>;

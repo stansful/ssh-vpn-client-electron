@@ -227,6 +227,38 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       store = { ...store, routingRules: rules };
       return snapshot();
     },
+    async updateRoutingProxyListEnabled(enabled: boolean) {
+      store = { ...store, routingProxyList: { ...store.routingProxyList, enabled } };
+      return snapshot();
+    },
+    async refreshRoutingProxyList() {
+      store = {
+        ...store,
+        routingProxyList: {
+          ...store.routingProxyList,
+          enabled: true,
+          domains: ["gosuslugi.ru", "mail.ru", ".ru"],
+          updatedAt: new Date().toISOString()
+        }
+      };
+      return snapshot();
+    },
+    async updateRoutingDirectListEnabled(enabled: boolean) {
+      store = { ...store, routingDirectList: { ...store.routingDirectList, enabled } };
+      return snapshot();
+    },
+    async refreshRoutingDirectList() {
+      store = {
+        ...store,
+        routingDirectList: {
+          ...store.routingDirectList,
+          enabled: true,
+          domains: ["example.ru", "bank.ru", ".ru"],
+          updatedAt: new Date().toISOString()
+        }
+      };
+      return snapshot();
+    },
     async clearDiagnostics() {
       diagnostics = [];
       return snapshot();

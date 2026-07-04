@@ -59,6 +59,8 @@ function requestWithRules(routingRules: RoutingRule[]): ConnectRequest {
     config: config(),
     routingMode: "selected-rules",
     routingRules,
+    routingProxyDomains: [],
+    routingDirectDomains: [],
     checkEndpoint: "example.com:443",
     secrets: { password: "secret" }
   };
