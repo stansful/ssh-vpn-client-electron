@@ -764,6 +764,45 @@ textarea {
   color: var(--accent);
 }
 
+.routing-source-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-alt), transparent 18%);
+}
+
+.routing-source-link {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-weight: 800;
+  text-align: left;
+  cursor: pointer;
+}
+
+.routing-source-link strong {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routing-source-link:hover,
+.routing-source-link:hover strong {
+  color: var(--accent);
+}
+
 .compact-switch {
   min-height: 40px;
   padding-inline: 10px;
@@ -861,6 +900,8 @@ textarea {
 }
 
 .modal-card {
+  position: relative;
+  z-index: 21;
   width: min(760px, calc(100vw - 48px));
   max-height: calc(100vh - 48px);
   overflow: auto;
@@ -1463,5 +1504,13 @@ details[open] summary {
   .routing-list-card .compact-switch {
     width: 100%;
     justify-content: center;
+  }
+
+  .routing-source-row {
+    grid-template-columns: 1fr;
+  }
+
+  .routing-source-row .icon-button {
+    width: 100%;
   }
 }

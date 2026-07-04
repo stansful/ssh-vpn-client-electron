@@ -20,7 +20,7 @@ import { PortableUpdateController } from "./app/portable-update-controller.js";
 import { refreshPublicProxyProfiles } from "./app/public-proxy-refresh.js";
 import { formatError, formatRuntimePath as formatRuntimePathValue } from "./app/runtime-format.js";
 import { TrayController, resolveTrayIconPaths } from "./app/tray.js";
-import { GITHUB_REPOSITORY_URL } from "../shared/links.js";
+import { GITHUB_REPOSITORY_URL, ROUTING_DOMAIN_LIST_SOURCE_URL } from "../shared/links.js";
 import type {
   AppSettings,
   AppSnapshot,
@@ -934,10 +934,14 @@ function uniqueLogPaths(): string[] {
 
 function assertAllowedExternalUrl(value: string): string {
   const url = new URL(value);
-  const repositoryUrl = new URL(GITHUB_REPOSITORY_URL);
-  const repositoryPath = repositoryUrl.pathname.replace(/\/$/u, "");
+  const allowedUrls = [GITHUB_REPOSITORY_URL, ROUTING_DOMAIN_LIST_SOURCE_URL].map((allowed) => new URL(allowed));
   const requestedPath = url.pathname.replace(/\/$/u, "");
-  if (url.protocol !== "https:" || url.hostname !== repositoryUrl.hostname || requestedPath !== repositoryPath) {
+  const allowed = allowedUrls.some((candidate) =>
+    url.protocol === "https:" &&
+    url.hostname === candidate.hostname &&
+    requestedPath === candidate.pathname.replace(/\/$/u, "")
+  );
+  if (!allowed) {
     throw new Error("External URL is not allowed.");
   }
   return url.toString();

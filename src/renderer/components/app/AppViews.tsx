@@ -182,6 +182,8 @@ export function AppViews({
         onRefreshProxyList={routing.refreshProxyList}
         onDirectListEnabledChange={routing.updateDirectListEnabled}
         onRefreshDirectList={routing.refreshDirectList}
+        onOpenSource={routing.openDomainListSource}
+        onCopySource={routing.copyDomainListSource}
         onUpdateRules={routing.updateRoutingDraft}
       />
     );

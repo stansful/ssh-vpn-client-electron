@@ -1,4 +1,5 @@
 import { X } from "lucide-react";
+import { createPortal } from "react-dom";
 
 export function Modal({
   open,
@@ -15,7 +16,7 @@ export function Modal({
     return null;
   }
 
-  return (
+  return createPortal(
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal-card" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
         <header className="modal-header">
@@ -26,6 +27,7 @@ export function Modal({
         </header>
         {children}
       </section>
-    </div>
+    </div>,
+    document.body
   );
 }

@@ -2,6 +2,45 @@
 
 ## 2026-07-04
 
+### Start: Routing source link action
+
+- User requested making the Routing source open `https://github.com/itdoginfo/allow-domains/tree/main/Russia`.
+- User requested adding a copy button to the right, matching the existing GitHub link/copy pattern.
+- Current focus: add the source row to Routing, wire open/copy actions, and allow the exact external source URL in main-process validation.
+
+### End: Routing source link action
+
+- Added a compact Source row to the Routing domain-list panel.
+- Clicking Source opens `https://github.com/itdoginfo/allow-domains/tree/main/Russia`.
+- Added a right-side copy button that copies the same source URL and shows a notice.
+- Extended main-process external URL validation to allow only the exact routing source URL in addition to the app repository URL.
+- Verification passed: `npm run typecheck`, `npm run build`, and `git diff --check`.
+- No dev server or long-running app process was started for this UI change.
+
+### Start: Routing domain list duplicate cards cleanup
+
+- User pointed out that the `Proxy domains` / `Direct domains` cards duplicate information already shown in the domain-list rows.
+- Current focus: remove the redundant facts cards from the Routing domain-list panel.
+
+### End: Routing domain list duplicate cards cleanup
+
+- Removed the duplicate `Proxy domains` / `Direct domains` facts cards from the Routing domain-list panel.
+- Kept per-list counts in the `Russia inside-raw.lst` and `Russia outside-raw.lst` rows.
+- Verification passed: `npm run typecheck`, `npm run build`, and `git diff --check`.
+- No dev server or long-running app process was started for this cleanup.
+
+### Start: Routing list modal visibility fix
+
+- User reported that clicking `Russia inside-raw.lst` / `Russia outside-raw.lst` only blurs the app background and does not show the domain text viewer.
+- Current focus: fix modal layering/render target so the list viewer card appears above the blur overlay.
+
+### End: Routing list modal visibility fix
+
+- Updated shared `Modal` to render through a React portal into `document.body`, avoiding nested stacking-context issues from the page content.
+- Added an explicit modal card z-index so the dialog appears above the blur backdrop.
+- Verification passed: `npm run typecheck`, `npm run build`, and `git diff --check`.
+- No dev server or long-running app process was started for this fix.
+
 ### Start: Russia direct list and list viewer UI
 
 - User requested adding `outside-raw.lst` as a DIRECT list analogous to the existing proxy list.

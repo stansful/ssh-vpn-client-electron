@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent, type Dispatch, 
 import { api } from "../api.js";
 import { toErrorMessage } from "../lib/labels.js";
 import type { RoutingSaveState } from "../types.js";
+import { ROUTING_DOMAIN_LIST_SOURCE_URL } from "../../shared/links.js";
 import { normalizeRuleValue, validateRoutingRuleValue } from "../../shared/validation.js";
 import type { AppSnapshot, RoutingRule, RoutingRuleType } from "../../shared/types.js";
 
@@ -182,6 +183,22 @@ export function useRoutingController({
     });
   }
 
+  function openDomainListSource(): void {
+    void run(async () => {
+      await api.openExternal(ROUTING_DOMAIN_LIST_SOURCE_URL);
+    });
+  }
+
+  function copyDomainListSource(): void {
+    void run(async () => {
+      const copied = await api.copyText(ROUTING_DOMAIN_LIST_SOURCE_URL);
+      if (!copied) {
+        throw new Error("Unable to copy source link.");
+      }
+      setNotice("Routing source link copied.");
+    });
+  }
+
   return {
     ruleTab,
     setRuleTab,
@@ -204,6 +221,8 @@ export function useRoutingController({
     updateProxyListEnabled,
     refreshProxyList,
     updateDirectListEnabled,
-    refreshDirectList
+    refreshDirectList,
+    openDomainListSource,
+    copyDomainListSource
   };
 }

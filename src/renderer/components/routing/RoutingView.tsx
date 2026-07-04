@@ -1,4 +1,4 @@
-import { Download, FileText, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
+import { Copy, Download, ExternalLink, FileText, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
 import { useMemo, useState, type ChangeEvent, type Dispatch, type SetStateAction } from "react";
 import { placeholderForRule, routingSaveLabel } from "../../lib/labels.js";
 import type { RoutingSaveState } from "../../types.js";
@@ -29,6 +29,8 @@ export function RoutingView({
   onRefreshProxyList,
   onDirectListEnabledChange,
   onRefreshDirectList,
+  onOpenSource,
+  onCopySource,
   onUpdateRules
 }: {
   ruleTab: RoutingRuleType;
@@ -54,6 +56,8 @@ export function RoutingView({
   onRefreshProxyList: () => void;
   onDirectListEnabledChange: (enabled: boolean) => void;
   onRefreshDirectList: () => void;
+  onOpenSource: () => void;
+  onCopySource: () => void;
   onUpdateRules: (mutator: (rules: RoutingRule[]) => RoutingRule[]) => void;
 }): JSX.Element {
   const [openList, setOpenList] = useState<{ title: string; domains: string[] } | undefined>();
@@ -112,11 +116,16 @@ export function RoutingView({
             <button type="button" className="ghost-button" onClick={onRefreshDirectList}><RefreshCw size={16} /> Refresh</button>
           </article>
         </div>
-        <dl className="facts log-facts">
-          <div><dt>Proxy domains</dt><dd>{proxyList.enabled ? proxyList.domains.length : "Off"}</dd></div>
-          <div><dt>Direct domains</dt><dd>{directList.enabled ? directList.domains.length : "Off"}</dd></div>
-          <div className="wide-fact"><dt>Source</dt><dd>itdoginfo/allow-domains Russia</dd></div>
-        </dl>
+        <div className="routing-source-row">
+          <button type="button" className="routing-source-link" onClick={onOpenSource} aria-label="Open routing source">
+            <ExternalLink size={16} />
+            <span>Source</span>
+            <strong>itdoginfo/allow-domains Russia</strong>
+          </button>
+          <button type="button" className="icon-button" onClick={onCopySource} aria-label="Copy routing source link" title="Copy source link">
+            <Copy size={16} />
+          </button>
+        </div>
       </section>
 
       <Modal open={Boolean(openList)} title={openList?.title ?? "Routing list"} onClose={() => setOpenList(undefined)}>
