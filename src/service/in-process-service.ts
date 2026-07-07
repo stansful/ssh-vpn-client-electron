@@ -59,7 +59,7 @@ export class InProcessServiceBridge implements ServiceBridge {
     this.appendDiagnostic("info", `Connect requested for ${request.config.name} (${request.config.host}:${request.config.port}), auth=${request.config.authType}, routing=${request.routingMode}, enabledRules=${routing.enabledRules}, proxyListDomains=${request.routingProxyDomains.length}, directListDomains=${request.routingDirectDomains.length}.`);
     this.appendDiagnostic("info", `Routing core prepared: domains=${routing.domainRules}, ips=${routing.ipRules}, processes=${routing.processRules}, invalid=${routing.invalidRules}.`);
     this.appendDiagnostic("info", `SSH core prepared: kex=${algorithms.kexAlgorithm}, hostKey=${algorithms.serverHostKeyAlgorithm}, cipher=${algorithms.encryptionClientToServer}, mac=${algorithms.macClientToServer}, keyBytes=${keyLengths.cipherKeyLength}.`);
-    this.appendDiagnostic("info", `Service-side secrets resolved: password=${Boolean(request.secrets?.password)}, privateKey=${Boolean(request.secrets?.privateKey)}, passphrase=${Boolean(request.secrets?.privateKeyPassphrase)}.`);
+    this.appendDiagnostic("info", `Service-side secrets resolved: password=${Boolean(request.secrets?.password)}, privateKey=${Boolean(request.secrets?.privateKey)}, passphraseProvided=${Boolean(request.secrets?.privateKeyPassphrase)}.`);
 
     await delay(600);
     if (this.disconnectRequested) {

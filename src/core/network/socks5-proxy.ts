@@ -93,6 +93,7 @@ export class Socks5Proxy {
   private async handleSocket(socket: net.Socket): Promise<void> {
     this.sockets.add(socket);
     configureLowLatencySocket(socket);
+    let request: ProxyConnectRequest | undefined;
     const handshakeTimeoutMs = this.options.handshakeTimeoutMs ?? 30_000;
     socket.setTimeout(handshakeTimeoutMs, () => {
       socket.destroy(new ProxyHandshakeError("SOCKS/HTTP proxy handshake timed out.", "unknown"));
@@ -103,7 +104,7 @@ export class Socks5Proxy {
     socket.on("error", onHandshakeSocketError);
 
     try {
-      const request = await readProxyConnectRequest(socket);
+      request = await readProxyConnectRequest(socket);
       socket.setTimeout(0);
       const originator = {
         address: socket.remoteAddress ?? "127.0.0.1",
@@ -170,7 +171,7 @@ export class Socks5Proxy {
         endSocketAfterQueuedWrites();
       });
       const offError = channel.onError((error) => {
-        this.events.emit("event", { type: "error", message: error.message } satisfies Socks5ProxyEvent);
+        this.events.emit("event", { type: "error", message: formatProxyTunnelError(request, error.message) } satisfies Socks5ProxyEvent);
         socket.destroy();
       });
 
@@ -210,7 +211,7 @@ export class Socks5Proxy {
         this.events.emit("event", { type: "connection-closed", message: "SOCKS5 connection closed." } satisfies Socks5ProxyEvent);
       });
       socket.on("error", (error) => {
-        this.events.emit("event", { type: "error", message: error.message } satisfies Socks5ProxyEvent);
+        this.events.emit("event", { type: "error", message: formatProxyTunnelError(request, error.message) } satisfies Socks5ProxyEvent);
       });
 
       if (request.initialData && request.initialData.length > 0) {
@@ -224,7 +225,7 @@ export class Socks5Proxy {
       socket.destroy();
       this.events.emit("event", {
         type: "error",
-        message: error instanceof Error ? error.message : String(error)
+        message: formatProxyTunnelError(request, error instanceof Error ? error.message : String(error))
       } satisfies Socks5ProxyEvent);
     }
   }
@@ -445,6 +446,13 @@ function formatProtocol(protocol: ProxyProtocol): string {
     return "HTTP CONNECT";
   }
   return "HTTP proxy";
+}
+
+export function formatProxyTunnelError(request: ProxyConnectRequest | undefined, message: string): string {
+  if (!request) {
+    return message;
+  }
+  return `${formatProtocol(request.protocol)} tunnel failed for ${request.target.host}:${request.target.port}: ${message}`;
 }
 
 function isHttpMethodStart(byte: number): boolean {

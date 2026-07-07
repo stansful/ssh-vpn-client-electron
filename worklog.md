@@ -1,5 +1,23 @@
 # Worklog
 
+## 2026-07-07
+
+### Start: Proxy tunnel error diagnostics
+
+- User provided logs where SSH eventually connects, Windows PAC routing applies, then diagnostics show bare `Connection refused` warnings without the refused target.
+- Current focus: add target/protocol context to local HTTP/SOCKS proxy tunnel failures and clean misleading SSH connect diagnostics for password auth.
+
+### End: Proxy tunnel error diagnostics
+
+- Added target/protocol context to local HTTP/SOCKS proxy tunnel failures.
+  - Example after fix: `HTTP CONNECT tunnel failed for refused.example:443: Connection refused`.
+- Kept handshake errors unchanged when no target has been parsed yet.
+- Changed live SSH connect diagnostics from `passphrase=...` to `passphraseProvided=...`, so boolean diagnostics are not redacted as secrets.
+- Changed SSH TCP connect timeout text to include `host:port`.
+- Added regression coverage for proxy tunnel error formatting.
+- Verification passed: `npm run typecheck`, `npm test -- tests/network-proxy.test.ts`, `npm run lint`, full `npm test` (17 files, 103 tests), `npm run build`, and `git diff --check`.
+- No dev server or long-running app process was started for this fix.
+
 ## 2026-07-04
 
 ### Start: Routing source link action

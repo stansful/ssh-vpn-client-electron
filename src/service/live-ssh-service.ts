@@ -150,7 +150,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     });
     this.appendDiagnostic(
       "info",
-      `Connect requested for ${request.config.username}@${request.config.host}:${request.config.port}, auth=${request.config.authType}, routing=${request.routingMode}, privateKey=${Boolean(request.secrets?.privateKey)}, passphrase=${Boolean(request.secrets?.privateKeyPassphrase)}.`
+      `Connect requested for ${request.config.username}@${request.config.host}:${request.config.port}, auth=${request.config.authType}, routing=${request.routingMode}, privateKey=${Boolean(request.secrets?.privateKey)}, passphraseProvided=${Boolean(request.secrets?.privateKeyPassphrase)}.`
     );
 
     const unsupportedRouting = describeUnsupportedSelectedRouting(request);

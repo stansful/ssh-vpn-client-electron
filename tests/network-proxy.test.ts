@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { Socket } from "node:net";
 import { describe, expect, it } from "vitest";
-import { readProxyConnectRequest, readSocksConnectRequest } from "../src/core/network/socks5-proxy.js";
+import { formatProxyTunnelError, readProxyConnectRequest, readSocksConnectRequest } from "../src/core/network/socks5-proxy.js";
 import { buildProxyPac } from "../src/core/network/windows-system-proxy.js";
 import { parseDomainProxyList } from "../src/core/routing/domain-proxy-list.js";
 
@@ -166,6 +166,18 @@ describe("SOCKS5 proxy", () => {
         "latin1"
       )
     });
+  });
+
+  it("includes the proxy target when tunnel opening fails", async () => {
+    expect(
+      formatProxyTunnelError(
+        {
+          protocol: "http-connect",
+          target: { host: "refused.example", port: 443 }
+        },
+        "Connection refused"
+      )
+    ).toBe("HTTP CONNECT tunnel failed for refused.example:443: Connection refused");
   });
 
 });

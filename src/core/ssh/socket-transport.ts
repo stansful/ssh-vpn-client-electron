@@ -44,7 +44,7 @@ export class SshSocketTransport {
     configureLowLatencySocket(socket);
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        socket.destroy(new Error("SSH TCP connect timeout."));
+        socket.destroy(new Error(`SSH TCP connect timeout for ${options.host}:${options.port}.`));
       }, options.timeoutMs ?? 10000);
       socket.once("connect", () => {
         clearTimeout(timeout);
