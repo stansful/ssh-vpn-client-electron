@@ -3,6 +3,7 @@ import net from "node:net";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const MAX_WINDOWS_PROCESS_CONNECTION_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 export interface WindowsProcessConnection {
   processName: string;
@@ -23,50 +24,53 @@ export async function listWindowsProcessConnections(processNames?: Iterable<stri
     return [];
   }
 
-  const targets = processNames === undefined
-    ? undefined
-    : [...new Set([...processNames].map((name) => name.trim().toLowerCase()).filter(Boolean))];
-  if (targets?.length === 0) {
+  const script = buildWindowsProcessConnectionsPowerShell(processNames);
+  if (!script) {
     return [];
   }
-  const encodedTargets = targets === undefined
-    ? ""
-    : Buffer.from(JSON.stringify(targets), "utf8").toString("base64");
 
-  const script = [
+  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    timeout: 7000,
+    maxBuffer: MAX_WINDOWS_PROCESS_CONNECTION_OUTPUT_BYTES,
+    windowsHide: true
+  });
+  return parsePowerShellConnections(stdout);
+}
+
+export function buildWindowsProcessConnectionsPowerShell(processNames?: Iterable<string>): string | undefined {
+  const targets = processNames === undefined
+    ? undefined
+    : [...new Set([...processNames].map(normalizeWindowsProcessName).filter(Boolean))];
+  if (targets?.length === 0) {
+    return undefined;
+  }
+
+  // Keep the pre-optimization Windows snapshot path for compatibility. Some
+  // PowerShell 5.1/CIM combinations returned an empty result when the owning
+  // PID list was pre-filtered. Filtering the completed snapshot in Node is a
+  // little more work, but it is the behavior known to work across Windows 10
+  // and 11 builds.
+  return [
     "$ErrorActionPreference = 'SilentlyContinue'",
-    encodedTargets
-      ? `$targetJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedTargets}'))`
-      : "$targetJson = '[]'",
-    "$targets = @{}",
-    "@($targetJson | ConvertFrom-Json) | ForEach-Object { $targets[[string]$_.ToLowerInvariant()] = $true }",
-    "$connections = @(Get-NetTCPConnection -State Established,SynSent)",
     "$p = @{}",
-    "$ids = @($connections | Select-Object -ExpandProperty OwningProcess -Unique)",
-    "if ($ids.Count -gt 0) {",
-    "  Get-Process -Id $ids | ForEach-Object {",
-    "    $name = ($_.ProcessName + '.exe')",
-    "    if ($targets.Count -eq 0 -or $targets.ContainsKey($name.ToLowerInvariant())) { $p[[int]$_.Id] = $name }",
-    "  }",
-    "}",
-    "$connections | ForEach-Object {",
-    "  $name = $p[[int]$_.OwningProcess]",
-    "  if ($name) {",
+    "Get-Process | ForEach-Object { $p[[int]$_.Id] = ($_.ProcessName + '.exe') }",
+    "Get-NetTCPConnection -State Established,SynSent | ForEach-Object {",
     "  [PSCustomObject]@{",
-    "    processName = $name",
+    "    processName = $p[[int]$_.OwningProcess]",
     "    remoteAddress = [string]$_.RemoteAddress",
     "    remotePort = [int]$_.RemotePort",
     "    state = [string]$_.State",
     "  }",
-    "  }",
     "} | ConvertTo-Json -Compress"
   ].join("\n");
+}
 
-  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    timeout: 7000,
-    windowsHide: true
-  });
-  return parsePowerShellConnections(stdout);
+export function normalizeWindowsProcessName(name: string): string {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized || normalized.endsWith(".exe")) {
+    return normalized;
+  }
+  return `${normalized}.exe`;
 }
 
 export function parsePowerShellConnections(stdout: string): WindowsProcessConnection[] {

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isRoutableRemoteAddress, parsePowerShellConnections } from "../src/core/network/windows-process-connections.js";
+import {
+  buildWindowsProcessConnectionsPowerShell,
+  isRoutableRemoteAddress,
+  normalizeWindowsProcessName,
+  parsePowerShellConnections
+} from "../src/core/network/windows-process-connections.js";
 
 describe("Windows process connection parsing", () => {
   it("normalizes PowerShell TCP connection rows", () => {
@@ -37,5 +42,21 @@ describe("Windows process connection parsing", () => {
     expect(isRoutableRemoteAddress("::1")).toBe(false);
     expect(isRoutableRemoteAddress("169.254.10.20")).toBe(false);
     expect(isRoutableRemoteAddress("fe80::1")).toBe(false);
+  });
+
+  it("normalizes manually entered Windows process names to executable names", () => {
+    expect(normalizeWindowsProcessName(" Chrome ")).toBe("chrome.exe");
+    expect(normalizeWindowsProcessName("TELEGRAM.EXE")).toBe("telegram.exe");
+  });
+
+  it("uses the Windows 10/11 compatible unfiltered PowerShell snapshot", () => {
+    const script = buildWindowsProcessConnectionsPowerShell(["Chrome", "TELEGRAM.EXE", "chrome.exe"]);
+    expect(script).toBeDefined();
+    expect(script).toContain("$ErrorActionPreference = 'SilentlyContinue'");
+    expect(script).toContain("Get-Process | ForEach-Object");
+    expect(script).toContain("Get-NetTCPConnection -State Established,SynSent | ForEach-Object");
+    expect(script).not.toContain("FromBase64String");
+    expect(script).not.toContain("Select-Object -First");
+    expect(buildWindowsProcessConnectionsPowerShell([])).toBeUndefined();
   });
 });

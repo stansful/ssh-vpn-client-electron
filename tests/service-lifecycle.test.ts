@@ -169,13 +169,203 @@ describe("live SSH service lifecycle", () => {
     const internals = service as unknown as {
       currentProcessRoutingRefreshIntervalMs(): number;
       currentProcessRoutingTtlMs(): number;
+      nextProcessRoutingRefreshIntervalMs(): number;
     };
 
     expect(internals.currentProcessRoutingRefreshIntervalMs()).toBe(60_000);
     expect(internals.currentProcessRoutingTtlMs()).toBe(5 * 60_000);
+    expect([
+      internals.nextProcessRoutingRefreshIntervalMs(),
+      internals.nextProcessRoutingRefreshIntervalMs(),
+      internals.nextProcessRoutingRefreshIntervalMs(),
+      internals.nextProcessRoutingRefreshIntervalMs(),
+      internals.nextProcessRoutingRefreshIntervalMs()
+    ]).toEqual([1_000, 2_000, 4_000, 8_000, 60_000]);
     refreshIntervalMs = 120_000;
     expect(internals.currentProcessRoutingRefreshIntervalMs()).toBe(120_000);
     expect(internals.currentProcessRoutingTtlMs()).toBe(360_000);
+  });
+
+  it("learns a late process connection during the discovery burst and reapplies routing", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    vi.useFakeTimers();
+    const client = new FakeSshClient();
+    vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+    vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31086 });
+    vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+    const systemProxy = {
+      apply: vi.fn()
+        .mockResolvedValue({ applied: true, message: "applied" })
+        .mockResolvedValueOnce({ applied: true, message: "initial" })
+        .mockRejectedValueOnce(new Error("temporary PAC publish failure")),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValue([{
+        processName: "Telegram.exe",
+        remoteAddress: "149.154.167.41",
+        remotePort: 443,
+        state: "Established"
+      }])
+      .mockResolvedValueOnce([]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processRoutingRefreshIntervalMs: () => 30_000
+    });
+    const request: ConnectRequest = {
+      ...connectRequest("process-routing"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "telegram",
+        type: "process.name",
+        value: "telegram",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+
+    try {
+      await service.connect(request);
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+      expect([...processConnectionsProvider.mock.calls[0][0]]).toEqual(["telegram.exe"]);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(3);
+      expect(vi.mocked(systemProxy.apply).mock.calls[2][0]).toMatchObject({
+        mode: "selected-rules",
+        socksHost: "127.0.0.1",
+        socksPort: 31086,
+        forcePacEndpointRotation: true,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ type: "process.name", value: "telegram", enabled: true }),
+          expect.objectContaining({ type: "ip", value: "149.154.167.41", enabled: true })
+        ])
+      });
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(systemProxy.apply).toHaveBeenCalledTimes(3);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        vi.useRealTimers();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("drops learned IPs immediately when the selected process target changes", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const processConnectionsProvider = vi.fn(async (names: Iterable<string>) => {
+      const processName = [...names][0];
+      return processName === "telegram.exe"
+        ? [{ processName, remoteAddress: "149.154.167.41", remotePort: 443, state: "Established" }]
+        : [{ processName: "chrome.exe", remoteAddress: "142.250.74.110", remotePort: 443, state: "Established" }];
+    });
+    const service = new LiveSshServiceBridge(initialStatus(), { systemProxy, processConnectionsProvider });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+    };
+    const processRequest = (value: string): ConnectRequest => ({
+      ...connectRequest(value),
+      routingMode: "selected-rules",
+      routingRules: [{ id: value, type: "process.name", value, enabled: true, createdAt: "", updatedAt: "" }]
+    });
+
+    try {
+      await internals.learnProcessRoutingIps(processRequest("telegram"));
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["149.154.167.41"]));
+
+      await internals.learnProcessRoutingIps(processRequest("chrome"));
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["142.250.74.110"]));
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("retries a failed connected target change without restoring the removed process IP", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    vi.useFakeTimers();
+    const client = new FakeSshClient();
+    vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+    vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31087 });
+    vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+    const systemProxy = {
+      apply: vi.fn()
+        .mockResolvedValue({ applied: true, message: "applied" })
+        .mockResolvedValueOnce({ applied: true, message: "initial" })
+        .mockRejectedValueOnce(new Error("temporary target PAC failure")),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const processConnectionsProvider = vi.fn(async (names: Iterable<string>) => {
+      const target = [...names][0];
+      return target === "telegram.exe"
+        ? [{ processName: target, remoteAddress: "149.154.167.41", remotePort: 443, state: "Established" }]
+        : [{ processName: "chrome.exe", remoteAddress: "142.250.74.110", remotePort: 443, state: "Established" }];
+    });
+    const service = new LiveSshServiceBridge(initialStatus(), { systemProxy, processConnectionsProvider });
+    const processRule = (value: string) => ({
+      id: value,
+      type: "process.name" as const,
+      value,
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    });
+    const initialRequest: ConnectRequest = {
+      ...connectRequest("target-change"),
+      routingMode: "selected-rules",
+      routingRules: [processRule("telegram")]
+    };
+
+    try {
+      await service.connect(initialRequest);
+      await expect(service.updateRoutingRules([processRule("chrome")])).rejects.toThrow("temporary target PAC failure");
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(3);
+      const retriedRules = vi.mocked(systemProxy.apply).mock.calls[2][0].rules;
+      expect(vi.mocked(systemProxy.apply).mock.calls[2][0].forcePacEndpointRotation).toBe(true);
+      expect(retriedRules).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "process.name", value: "chrome" }),
+        expect.objectContaining({ type: "ip", value: "142.250.74.110" })
+      ]));
+      expect(retriedRules).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "ip", value: "149.154.167.41" })
+      ]));
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        vi.useRealTimers();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
   });
 });
 

@@ -149,6 +149,70 @@ describe("Xray service lifecycle", () => {
     await service.dispose();
   });
 
+  it("learns a late process connection during the discovery burst and reapplies PAC routing", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    vi.useFakeTimers();
+    const processHandle = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(processHandle);
+    const systemProxy = fakeSystemProxy();
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{
+        processName: "Telegram.exe",
+        remoteAddress: "149.154.167.41",
+        remotePort: 443,
+        state: "Established"
+      }]);
+    const runtimeDirectory = path.join(os.tmpdir(), `shadow-ssh-xray-lifecycle-${process.pid}-process-routing`);
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy,
+      processConnectionsProvider,
+      processRoutingRefreshIntervalMs: () => 30_000
+    });
+    const request: ProxyConnectRequest = {
+      ...proxyRequest("process-routing"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "telegram",
+        type: "process.name",
+        value: "telegram",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+
+    try {
+      await service.connect(request);
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+      expect([...processConnectionsProvider.mock.calls[0][0]]).toEqual(["telegram.exe"]);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(systemProxy.apply).mock.calls[1][0]).toMatchObject({
+        proxyProtocol: "http",
+        forcePacEndpointRotation: true,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ type: "ip", value: "149.154.167.41", enabled: true })
+        ])
+      });
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        vi.useRealTimers();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
   it("bounds runtime log work and keeps suppressed child pipes draining", async () => {
     const processHandle = new FakeXrayProcess();
     childProcess.spawn.mockReturnValueOnce(processHandle);

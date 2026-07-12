@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer, type RequestListener, type Server } from "node:http";
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
@@ -17,6 +18,7 @@ export interface SystemProxyApplyRequest {
   socksHost: string;
   socksPort: number;
   proxyProtocol?: "mixed" | "http" | "socks";
+  forcePacEndpointRotation?: boolean;
 }
 
 export interface SystemProxyApplyResult {
@@ -75,6 +77,7 @@ interface ProxySnapshot {
 const PROXY_SNAPSHOT_VERSION = 1;
 const MAX_PROXY_SNAPSHOT_BYTES = 256 * 1024;
 const MAX_PROXY_REGISTRY_STRING_LENGTH = 64 * 1024;
+const MAX_SERVED_PAC_VERSIONS = 8;
 
 export class WindowsSystemProxyManager {
   private snapshot: ProxySnapshot | undefined;
@@ -82,9 +85,14 @@ export class WindowsSystemProxyManager {
   private readonly pacPath: string;
   private readonly pacServerFactory: (requestListener: RequestListener) => Server;
   private pacServer: Server | undefined;
+  private readonly retainedPacServers = new Set<Server>();
   private pacContent = "";
+  private readonly pacVersions = new Map<string, string>();
   private registeredPacUrl: string | undefined;
+  private registryPacUrl: string | undefined;
+  private pendingPacNotificationUrl: string | undefined;
   private registeredStaticProxy: string | undefined;
+  private proxyStateDirty = false;
   private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(options: WindowsSystemProxyOptions = {}) {
@@ -94,7 +102,16 @@ export class WindowsSystemProxyManager {
   }
 
   apply(request: SystemProxyApplyRequest): Promise<SystemProxyApplyResult> {
-    return this.enqueueOperation(() => this.applyInternal(request));
+    return this.enqueueOperation(async () => {
+      try {
+        const result = await this.applyInternal(request);
+        this.proxyStateDirty = false;
+        return result;
+      } catch (error) {
+        this.proxyStateDirty = true;
+        throw error;
+      }
+    });
   }
 
   private async applyInternal(request: SystemProxyApplyRequest): Promise<SystemProxyApplyResult> {
@@ -105,19 +122,22 @@ export class WindowsSystemProxyManager {
 
     await this.restorePersistedSnapshot();
     if (!this.snapshot) {
-      this.snapshot = await readProxySnapshot();
-      await persistProxySnapshot(this.pacDirectory, this.snapshot);
+      const snapshot = await readProxySnapshot();
+      await persistProxySnapshot(this.pacDirectory, snapshot);
+      this.snapshot = snapshot;
     }
 
     const proxyDomains = normalizeProxyDomains(request.proxyDomains);
     const directDomains = normalizeProxyDomains(request.directDomains);
     if (request.mode === "proxy-all" && directDomains.length === 0) {
       const staticProxy = buildWindowsProxyServer(request.socksHost, request.socksPort, request.proxyProtocol ?? "mixed");
-      if (this.registeredStaticProxy !== staticProxy || Boolean(this.pacServer)) {
+      if (this.proxyStateDirty || this.registeredStaticProxy !== staticProxy || Boolean(this.pacServer)) {
         this.registeredStaticProxy = undefined;
         await regAddDword("ProxyEnable", "1");
         await regAddString("ProxyServer", staticProxy);
         await regDeleteValue("AutoConfigURL");
+        this.registryPacUrl = undefined;
+        this.pendingPacNotificationUrl = undefined;
         await regAddDword("AutoDetect", "0");
         await refreshWindowsProxy();
         this.registeredStaticProxy = staticProxy;
@@ -140,39 +160,77 @@ export class WindowsSystemProxyManager {
       await mkdir(this.pacDirectory, { recursive: true, mode: 0o700 });
       await writeFile(this.pacPath, pac, { encoding: "utf8", mode: 0o600 });
     }
-    const pacUrl = await this.startPacServer(pac);
-    if (this.registeredPacUrl !== pacUrl) {
-      this.registeredStaticProxy = undefined;
-      await regAddDword("ProxyEnable", "0");
-      await regDeleteValue("ProxyServer");
-      await regAddDword("AutoDetect", "0");
-      await regAddString("AutoConfigURL", pacUrl);
-      await refreshWindowsProxy();
-      this.registeredPacUrl = pacUrl;
-    } else if (pacChanged) {
-      // The PAC server and URL remain stable. Only invalidate WinINet's PAC
-      // cache; restarting the listener and importing registry state through
-      // netsh every 30 seconds caused avoidable connection/setup latency.
-      await notifyWindowsProxyChanged();
+    const forcePacEndpointRotation = request.forcePacEndpointRotation === true;
+    const retriedPublishedEndpoint = forcePacEndpointRotation
+      ? await this.retryPendingPacNotification()
+      : false;
+    const reusingRetriedEndpoint = retriedPublishedEndpoint && !pacChanged;
+    const pacEndpoint = await this.startPacServer(pac, forcePacEndpointRotation && !reusingRetriedEndpoint);
+    // Process routing intentionally uses the same plain path as the original
+    // compatibility implementation. The newly allocated port makes the URL
+    // unique and avoids PAC caches that ignore query parameters. Stable
+    // domain/IP routing keeps immutable content hashes on one listener.
+    const pacUrl = forcePacEndpointRotation ? pacEndpoint.baseUrl : versionPacUrl(pacEndpoint.baseUrl, pacEndpoint.version);
+    try {
+      if (this.proxyStateDirty || this.registeredPacUrl !== pacUrl) {
+        const revisingActivePac =
+          !forcePacEndpointRotation &&
+          !this.proxyStateDirty &&
+          this.registeredPacUrl !== undefined &&
+          this.registeredStaticProxy === undefined;
+        if (!revisingActivePac) {
+          await regAddDword("ProxyEnable", "0");
+          await regDeleteValue("ProxyServer");
+          await regAddDword("AutoDetect", "0");
+        }
+        await regAddString("AutoConfigURL", pacUrl);
+        this.registryPacUrl = pacUrl;
+        await refreshWindowsProxy();
+        this.registeredStaticProxy = undefined;
+        this.registeredPacUrl = pacUrl;
+      } else if (pacChanged) {
+        // A SHA-256 URL version normally changes together with the PAC content.
+        // Keep this notification as a collision-safe fallback without restarting
+        // the listener that is already serving the current in-memory PAC.
+        await notifyWindowsProxyChanged();
+      }
+    } catch (error) {
+      if (forcePacEndpointRotation && this.registryPacUrl === pacUrl) {
+        this.pendingPacNotificationUrl = pacUrl;
+      }
+      await this.finishPacEndpointRotation(pacEndpoint, pacUrl, false);
+      throw error;
     }
+    this.pendingPacNotificationUrl = undefined;
+    await this.finishPacEndpointRotation(pacEndpoint, pacUrl, true);
     const proxyListMessage = proxyDomains.length > 0 ? ` with ${proxyDomains.length} proxy-list domains` : "";
     const directListMessage = directDomains.length > 0 ? ` and ${directDomains.length} direct-list domains` : "";
     return { applied: true, message: `Windows PAC routing enabled for ${request.mode}${proxyListMessage}${directListMessage} through ${request.socksHost}:${request.socksPort} at ${pacUrl}.` };
   }
 
   restore(): Promise<void> {
-    return this.enqueueOperation(() => this.restoreInternal());
+    return this.enqueueOperation(async () => {
+      try {
+        await this.restoreInternal();
+        this.proxyStateDirty = false;
+      } catch (error) {
+        this.proxyStateDirty = true;
+        throw error;
+      }
+    });
   }
 
   private async restoreInternal(): Promise<void> {
     if (process.platform !== "win32") {
       await this.stopPacServer();
+      this.proxyStateDirty = false;
       return;
     }
 
     const snapshot = this.snapshot ?? (await readPersistedProxySnapshot(this.pacDirectory));
     if (!snapshot) {
       await this.stopPacServer();
+      this.proxyStateDirty = false;
       return;
     }
 
@@ -183,12 +241,17 @@ export class WindowsSystemProxyManager {
     await restoreValue("ProxyServer", snapshot.proxyServer, "REG_SZ");
     await restoreValue("ProxyOverride", snapshot.proxyOverride, "REG_SZ");
     await restoreValue("AutoConfigURL", snapshot.autoConfigUrl, "REG_SZ");
+    this.registryPacUrl = undefined;
+    this.pendingPacNotificationUrl = undefined;
     await restoreValue("AutoDetect", snapshot.autoDetect, "REG_DWORD");
     await refreshWindowsProxy();
     await this.stopPacServer();
     this.snapshot = undefined;
     this.registeredPacUrl = undefined;
+    this.registryPacUrl = undefined;
+    this.pendingPacNotificationUrl = undefined;
     this.registeredStaticProxy = undefined;
+    this.proxyStateDirty = false;
     await rm(this.pacPath, { force: true });
     await rm(snapshotPath(this.pacDirectory), { force: true });
   }
@@ -215,29 +278,63 @@ export class WindowsSystemProxyManager {
     return result;
   }
 
-  private async startPacServer(pac: string): Promise<string> {
+  private async startPacServer(
+    pac: string,
+    forceNewEndpoint = false
+  ): Promise<{
+    baseUrl: string;
+    version: string;
+    server: Server;
+    previousServer?: Server;
+    previousPacContent?: string;
+  }> {
+    const previousPacContent = this.pacContent;
     this.pacContent = pac;
-    if (this.pacServer) {
+    const version = pacVersion(pac);
+    this.rememberPacVersion(version, pac);
+    if (this.pacServer && !forceNewEndpoint) {
       const currentAddress = this.pacServer.address();
       if (isAddressInfo(currentAddress)) {
-        return `http://127.0.0.1:${currentAddress.port}/shadow-ssh-routing.pac`;
+        return {
+          baseUrl: `http://127.0.0.1:${currentAddress.port}/shadow-ssh-routing.pac`,
+          version,
+          server: this.pacServer
+        };
       }
       await this.stopPacServer();
       this.pacContent = pac;
+      this.rememberPacVersion(version, pac);
     }
+    const previousServer = forceNewEndpoint ? this.pacServer : undefined;
+    const endpointPacContent = forceNewEndpoint ? pac : undefined;
     const server = this.pacServerFactory((request, response) => {
-      const requestPath = (request.url ?? "").split("?")[0];
-      if (requestPath !== "/shadow-ssh-routing.pac") {
+      let requestUrl: URL;
+      try {
+        requestUrl = new URL(request.url ?? "", "http://127.0.0.1");
+      } catch {
+        response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        response.end("Bad request");
+        return;
+      }
+      if (requestUrl.pathname !== "/shadow-ssh-routing.pac") {
         response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
         response.end("Not found");
         return;
       }
+      const requestedVersion = requestUrl.searchParams.get("v");
+      // The actively registered version is always retained. An unusually
+      // stale WinINet client may request an older successfully published URL
+      // after the bounded history was evicted; serving the current PAC is
+      // safer than letting that client fall back to DIRECT on a 404.
+      const requestedPac = requestedVersion
+        ? this.pacVersions.get(requestedVersion) ?? this.pacContent
+        : endpointPacContent ?? this.pacContent;
       response.writeHead(200, {
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "Content-Type": "application/x-ns-proxy-autoconfig; charset=utf-8",
         Pragma: "no-cache"
       });
-      response.end(this.pacContent);
+      response.end(requestedPac);
     });
     server.on("clientError", (_error, socket) => {
       socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
@@ -252,7 +349,13 @@ export class WindowsSystemProxyManager {
         if (this.pacServer !== server) {
           return;
         }
-        await this.restoreInternal();
+        try {
+          await this.restoreInternal();
+          this.proxyStateDirty = false;
+        } catch (error) {
+          this.proxyStateDirty = true;
+          throw error;
+        }
       }).catch(() => undefined);
     });
 
@@ -266,27 +369,127 @@ export class WindowsSystemProxyManager {
       });
     } catch (error) {
       await closeServer(server);
+      this.pacContent = previousPacContent;
       throw error;
     }
 
     const address = server.address();
     if (!isAddressInfo(address)) {
       await closeServer(server);
+      this.pacContent = previousPacContent;
       throw new Error("PAC server did not bind a TCP address.");
     }
     this.pacServer = server;
-    return `http://127.0.0.1:${address.port}/shadow-ssh-routing.pac`;
+    return {
+      baseUrl: `http://127.0.0.1:${address.port}/shadow-ssh-routing.pac`,
+      version,
+      server,
+      previousServer,
+      previousPacContent: previousServer ? previousPacContent : undefined
+    };
+  }
+
+  private async finishPacEndpointRotation(
+    endpoint: { server: Server; previousServer?: Server; previousPacContent?: string },
+    pacUrl: string,
+    succeeded: boolean
+  ): Promise<void> {
+    const previousServer = endpoint.previousServer;
+    if (succeeded) {
+      if (previousServer && previousServer !== endpoint.server) {
+        this.retainedPacServers.delete(previousServer);
+        await closeServer(previousServer);
+      }
+      await this.closeRetainedPacServers(endpoint.server);
+      return;
+    }
+
+    if (!previousServer || previousServer === endpoint.server) {
+      return;
+    }
+
+    if (this.registryPacUrl === pacUrl) {
+      // AutoConfigURL was published, but the WinINet broadcast failed. Some
+      // processes can still hold the previous PAC URL in memory, while newly
+      // created sessions can already read the new URL from the registry. Keep
+      // both endpoints reachable until a later apply succeeds or restore()
+      // retires all app-owned listeners.
+      this.retainedPacServers.add(previousServer);
+      return;
+    }
+
+    if (this.pacServer === endpoint.server) {
+      this.pacServer = previousServer;
+    }
+    await closeServer(endpoint.server);
+    const registryVersion = pacVersionFromUrl(this.registryPacUrl);
+    this.pacContent = endpoint.previousPacContent ??
+      (registryVersion ? this.pacVersions.get(registryVersion) : undefined) ??
+      this.pacContent;
+  }
+
+  private async retryPendingPacNotification(): Promise<boolean> {
+    const pendingUrl = this.pendingPacNotificationUrl;
+    const server = this.pacServer;
+    if (!pendingUrl || pendingUrl !== this.registryPacUrl || !server || !isAddressInfo(server.address())) {
+      return false;
+    }
+
+    // Do not allocate another listener while publication of the current one is
+    // unresolved. Reassert the complete per-user proxy state and retry the
+    // broadcast first; only a successful retry may retire the endpoint still
+    // cached by older WinINet sessions or proceed to publish newer PAC content.
+    await regAddDword("ProxyEnable", "0");
+    await regDeleteValue("ProxyServer");
+    await regAddDword("AutoDetect", "0");
+    await regAddString("AutoConfigURL", pendingUrl);
+    this.registryPacUrl = pendingUrl;
+    await refreshWindowsProxy();
+    this.registeredStaticProxy = undefined;
+    this.registeredPacUrl = pendingUrl;
+    this.pendingPacNotificationUrl = undefined;
+    this.proxyStateDirty = false;
+    await this.closeRetainedPacServers(server);
+    return true;
+  }
+
+  private rememberPacVersion(version: string, pac: string): void {
+    this.pacVersions.delete(version);
+    this.pacVersions.set(version, pac);
+    const registeredVersion = pacVersionFromUrl(this.registeredPacUrl);
+    const registryVersion = pacVersionFromUrl(this.registryPacUrl);
+    while (this.pacVersions.size > MAX_SERVED_PAC_VERSIONS) {
+      const removable = [...this.pacVersions.keys()].find(
+        (candidate) => candidate !== version && candidate !== registeredVersion && candidate !== registryVersion
+      );
+      if (!removable) {
+        break;
+      }
+      this.pacVersions.delete(removable);
+    }
   }
 
   private async stopPacServer(): Promise<void> {
     const server = this.pacServer;
-    if (!server) {
-      return;
-    }
     this.pacServer = undefined;
-    await closeServer(server);
+    const servers = new Set(this.retainedPacServers);
+    this.retainedPacServers.clear();
+    if (server) {
+      servers.add(server);
+    }
+    await Promise.all([...servers].map(closeServer));
     this.pacContent = "";
+    this.pacVersions.clear();
     this.registeredPacUrl = undefined;
+    this.pendingPacNotificationUrl = undefined;
+  }
+
+  private async closeRetainedPacServers(activeServer: Server): Promise<void> {
+    const servers = [...this.retainedPacServers].filter((server) => server !== activeServer);
+    for (const server of servers) {
+      this.retainedPacServers.delete(server);
+    }
+    await Promise.all(servers.map(closeServer));
   }
 }
 
@@ -305,16 +508,25 @@ export function buildProxyPac(
   const proxyListDomains = normalizeProxyDomains(options.proxyDomains).map(normalizeSuffixDomain);
   const exactDomainRules = domainRules.filter((rule) => !rule.startsWith("*.")).map((rule) => rule);
   const wildcardDomainRules = domainRules.filter((rule) => rule.startsWith("*.")).map((rule) => rule.slice(2));
-  const ipChecks = ipRules.flatMap((rule) => buildIpChecks(rule));
-  const parsedIpRules = ipRules.map(parseCidrRange).filter((range): range is NonNullable<ReturnType<typeof parseCidrRange>> => Boolean(range));
-  const needsIpv4Dns = parsedIpRules.some((range) => range.version === 4);
-  const needsIpv6Dns = parsedIpRules.some((range) => range.version === 6);
+  const parsedIpRules = ipRules.flatMap((rule) => {
+    const range = parseCidrRange(rule);
+    return range ? [{ range, rule }] : [];
+  });
+  const exactIpRules = parsedIpRules
+    .filter(({ range }) => range.prefixLength === (range.version === 4 ? 32 : 128))
+    .map(({ range }) => range.version === 4 ? ipv4BigIntToDotted(range.network) : ipv6BigIntToString(range.network));
+  const ipChecks = parsedIpRules.flatMap(({ rule }) => buildIpChecks(rule));
+  const needsIpv4Dns = parsedIpRules.some(({ range }) => range.version === 4);
+  const needsExtendedDns = parsedIpRules.length > 0;
   const domainCheck = [
     "hasOwn(proxyExactDomains, hostNoBrackets)",
     "matchesSubdomain(hostNoBrackets, proxyWildcardDomains)",
     "matchesDomainOrParent(hostNoBrackets, proxyListDomains)"
   ].join(" || ");
-  const checks = [domainCheck, ...ipChecks].filter(Boolean);
+  const exactIpCheck = exactIpRules.length > 0
+    ? "hasOwn(proxyExactIps, hostNoBrackets) || hasOwn(proxyExactIps, resolvedHost) || resolvedHasOwn(resolvedHosts, proxyExactIps)"
+    : "";
+  const checks = [domainCheck, exactIpCheck, ...ipChecks].filter(Boolean);
 
   const mode = options.mode ?? "selected-rules";
   const proxyRule = mode === "proxy-all"
@@ -329,12 +541,14 @@ export function buildProxyPac(
     `var proxyListDomains = ${domainLookupLiteral(proxyListDomains)};`,
     `var proxyExactDomains = ${domainLookupLiteral(exactDomainRules)};`,
     `var proxyWildcardDomains = ${domainLookupLiteral(wildcardDomainRules)};`,
+    `var proxyExactIps = ${domainLookupLiteral(exactIpRules)};`,
     "function FindProxyForURL(url, host) {",
     "  host = String(host || \"\").toLowerCase();",
     "  var hostNoBrackets = host.replace(/^\\[/, \"\").replace(/\\]$/, \"\");",
     "  if (matchesDomainOrParent(hostNoBrackets, directDomains)) { return \"DIRECT\"; }",
     needsIpv4Dns ? "  var resolvedHost = resolveIpv4(hostNoBrackets);" : "  var resolvedHost = hostNoBrackets;",
-    needsIpv6Dns ? "  var resolvedHostEx = resolveAll(hostNoBrackets);" : "  var resolvedHostEx = \"\";",
+    needsExtendedDns ? "  var resolvedHostEx = resolveAll(hostNoBrackets);" : "  var resolvedHostEx = \"\";",
+    needsExtendedDns ? "  var resolvedHosts = splitResolvedHosts(resolvedHostEx);" : "  var resolvedHosts = [];",
     proxyRule,
     "  return \"DIRECT\";",
     "}",
@@ -370,7 +584,7 @@ export function buildProxyPac(
           "}"
         ]
       : []),
-    ...(needsIpv6Dns
+    ...(needsExtendedDns
       ? [
           "function resolveAll(host) {",
           "  try {",
@@ -378,18 +592,24 @@ export function buildProxyPac(
           "    return value || host;",
           "  } catch (e) { return host; }",
           "}",
-          "function resolvedContains(values, expected) {",
-          "  var entries = String(values || \"\").split(/[;,\\s]+/);",
+          "function splitResolvedHosts(values) {",
+          "  var rawEntries = String(values || \"\").split(/[;,\\s]+/);",
+          "  var entries = [];",
+          "  for (var index = 0; index < rawEntries.length; index += 1) {",
+          "    if (rawEntries[index]) { entries.push(rawEntries[index]); }",
+          "  }",
+          "  return entries;",
+          "}",
+          "function resolvedHasOwn(entries, map) {",
           "  for (var index = 0; index < entries.length; index += 1) {",
-          "    if (entries[index] == expected) { return true; }",
+          "    if (hasOwn(map, entries[index])) { return true; }",
           "  }",
           "  return false;",
           "}",
-          "function resolvedIsInNetEx(values, range) {",
+          "function resolvedIsInNetEx(entries, range) {",
           "  if (typeof isInNetEx !== \"function\") { return false; }",
-          "  var entries = String(values || \"\").split(/[;,\\s]+/);",
           "  for (var index = 0; index < entries.length; index += 1) {",
-          "    if (entries[index] && isInNetEx(entries[index], range)) { return true; }",
+          "    if (isInNetEx(entries[index], range)) { return true; }",
           "  }",
           "  return false;",
           "}"
@@ -476,7 +696,8 @@ async function notifyWindowsProxyChanged(): Promise<void> {
       "Add-Type -Namespace ShadowSsh -Name WinInet -MemberDefinition '[System.Runtime.InteropServices.DllImport(\"wininet.dll\", SetLastError=true)] public static extern bool InternetSetOption(System.IntPtr hInternet, int dwOption, System.IntPtr lpBuffer, int dwBufferLength);'",
       "$settingsChanged=[ShadowSsh.WinInet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)",
       "$settingsRefreshed=[ShadowSsh.WinInet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)",
-      "if (-not ($settingsChanged -and $settingsRefreshed)) { throw 'WinINet proxy refresh failed.' }"
+      "$instancesNotified=[ShadowSsh.WinInet]::InternetSetOption([IntPtr]::Zero, 95, [IntPtr]::Zero, 0)",
+      "if (-not ($settingsChanged -and $settingsRefreshed -and $instancesNotified)) { throw 'WinINet proxy refresh failed.' }"
     ].join("; ")
   ]);
 }
@@ -611,43 +832,51 @@ function domainLookupLiteral(domains: string[]): string {
   return JSON.stringify(Object.fromEntries([...new Set(domains.filter(Boolean))].map((domain) => [domain, 1])));
 }
 
+function pacVersion(pac: string): string {
+  return createHash("sha256").update(pac, "utf8").digest("hex");
+}
+
+function versionPacUrl(baseUrl: string, version: string): string {
+  const url = new URL(baseUrl);
+  url.searchParams.set("v", version);
+  return url.toString();
+}
+
+function pacVersionFromUrl(url: string | undefined): string | undefined {
+  if (!url) {
+    return undefined;
+  }
+  try {
+    return new URL(url).searchParams.get("v") ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function buildIpChecks(rule: string): string[] {
   const range = parseCidrRange(rule);
   if (!range) {
     return [];
   }
 
-  const [ip] = rule.split("/");
-  const normalizedIp = (ip ?? "").trim().toLowerCase();
   if (range.version === 4) {
     const networkIp = ipv4BigIntToDotted(range.network);
-    const directChecks = [
-      `hostNoBrackets == ${JSON.stringify(normalizedIp)}`,
-      `resolvedHost == ${JSON.stringify(normalizedIp)}`
-    ];
     if (range.prefixLength === 32) {
-      return [`(${directChecks.join(" || ")})`];
+      return [];
     }
     return [
-      `isInNet(resolvedHost, ${JSON.stringify(networkIp)}, ${JSON.stringify(prefixToMask(range.prefixLength))})`
+      `(isInNet(resolvedHost, ${JSON.stringify(networkIp)}, ${JSON.stringify(prefixToMask(range.prefixLength))}) || resolvedIsInNetEx(resolvedHosts, ${JSON.stringify(`${networkIp}/${range.prefixLength}`)}))`
     ];
   }
 
-  const ipv6Checks = [
-    `hostNoBrackets == ${JSON.stringify(normalizedIp)}`,
-    `resolvedContains(resolvedHostEx, ${JSON.stringify(normalizedIp)})`
-  ];
   const canonicalRange = `${ipv6BigIntToString(range.network)}/${range.prefixLength}`;
   if (range.prefixLength === 128) {
-    // Text equality is only a fast path: equivalent IPv6 spellings can differ
-    // through zero compression or leading zeroes. isInNetEx performs the
-    // address-aware /128 comparison for both literal and resolved hosts.
-    return [
-      `(${ipv6Checks.join(" || ")} || resolvedIsInNetEx(resolvedHostEx, ${JSON.stringify(canonicalRange)}))`
-    ];
+    // The exact-IP map is the fast path. isInNetEx retains an address-aware
+    // fallback for PAC engines that return an equivalent IPv6 spelling.
+    return [`resolvedIsInNetEx(resolvedHosts, ${JSON.stringify(canonicalRange)})`];
   }
   return [
-    `resolvedIsInNetEx(resolvedHostEx, ${JSON.stringify(canonicalRange)})`
+    `resolvedIsInNetEx(resolvedHosts, ${JSON.stringify(canonicalRange)})`
   ];
 }
 

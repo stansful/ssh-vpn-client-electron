@@ -527,10 +527,56 @@ describe("Windows PAC generation", () => {
     expect(pac).toContain('var proxyWildcardDomains = {"example.com":1};');
     expect(pac).toContain("dnsResolve(host)");
     expect(pac).toContain('isInNet(resolvedHost, "10.10.0.0", "255.255.0.0")');
-    expect(pac).toContain('hostNoBrackets == "192.0.2.10"');
-    expect(pac).toContain('resolvedHost == "192.0.2.10"');
+    expect(pac).toContain('var proxyExactIps = {"192.0.2.10":1};');
+    expect(pac).toContain("resolvedHasOwn(resolvedHosts, proxyExactIps)");
     expect(pac).not.toContain("resolvedHostEx.indexOf");
     expect(pac).not.toContain("disabled.test");
+  });
+
+  it("matches an exact learned IPv4 address across every DNS result", () => {
+    const pac = buildProxyPac(
+      [{ id: "process-ip", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080
+    );
+    const context: {
+      result?: string;
+      dnsResolve: () => string;
+      dnsResolveEx: () => string;
+    } = {
+      dnsResolve: () => "203.0.113.1",
+      dnsResolveEx: () => "203.0.113.1;203.0.113.2"
+    };
+
+    runInNewContext(`${pac}\nresult = FindProxyForURL("https://cdn.example/", "cdn.example");`, context);
+
+    expect(pac).toContain("dnsResolveEx(host)");
+    expect(context.result).toContain("PROXY 127.0.0.1:1080");
+  });
+
+  it("matches an IPv4 CIDR across every extended DNS result", () => {
+    const pac = buildProxyPac(
+      [{ id: "process-cidr", type: "ip", value: "203.0.113.0/24", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080
+    );
+    const context: {
+      result?: string;
+      dnsResolve: () => string;
+      dnsResolveEx: () => string;
+      isInNet: () => boolean;
+      isInNetEx: (address: string, range: string) => boolean;
+    } = {
+      dnsResolve: () => "198.51.100.10",
+      dnsResolveEx: () => "198.51.100.10;203.0.113.77",
+      isInNet: () => false,
+      isInNetEx: (address, range) => address === "203.0.113.77" && range === "203.0.113.0/24"
+    };
+
+    runInNewContext(`${pac}\nresult = FindProxyForURL("https://cdn.example/", "cdn.example");`, context);
+
+    expect(pac).toContain('resolvedIsInNetEx(resolvedHosts, "203.0.113.0/24")');
+    expect(context.result).toContain("PROXY 127.0.0.1:1080");
   });
 
   it("omits invalid enabled routing rules from generated PAC content", () => {
@@ -646,7 +692,7 @@ describe("Windows PAC generation", () => {
 
     runInNewContext(`${pac}\nresult = FindProxyForURL("https://ipv6.example/", "ipv6.example");`, context);
 
-    expect(pac).toContain("resolvedIsInNetEx(resolvedHostEx");
+    expect(pac).toContain("resolvedIsInNetEx(resolvedHosts");
     expect(pac).toContain('"2001:db8::1/128"');
     expect(context.result).toContain("PROXY 127.0.0.1:1080");
   });

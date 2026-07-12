@@ -23,28 +23,28 @@ describe("main-process energy policy", () => {
     expect(visible.paintWhenInitiallyHidden).toBe(true);
   });
 
-  it("slows only low-priority process discovery on battery and thermal pressure", () => {
+  it("keeps the proven process-routing cadence across power states", () => {
     const policy = new SystemEnergyPolicy({ onBatteryPower: false });
-    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(30_000);
-    expect(policy.processRoutingRefreshIntervalMs(false)).toBe(60_000);
+    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(10_000);
+    expect(policy.processRoutingRefreshIntervalMs(false)).toBe(10_000);
 
     policy.setOnBatteryPower(true);
-    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(120_000);
-    expect(policy.processRoutingRefreshIntervalMs(false)).toBe(120_000);
+    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(10_000);
+    expect(policy.processRoutingRefreshIntervalMs(false)).toBe(10_000);
 
     policy.setThermalState("serious");
-    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(120_000);
+    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(10_000);
 
     policy.setOnBatteryPower(false);
-    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(120_000);
+    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(10_000);
 
     policy.setThermalState("nominal");
-    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(30_000);
+    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(10_000);
 
     policy.setCpuSpeedLimitPercent(80);
-    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(120_000);
+    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(10_000);
     policy.setCpuSpeedLimitPercent(100);
-    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(30_000);
+    expect(policy.processRoutingRefreshIntervalMs(true)).toBe(10_000);
   });
 
   it("suppresses production console noise while preserving warnings and development logs", () => {

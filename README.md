@@ -268,8 +268,10 @@ throttle tunnel throughput. Only low-priority UI and process-routing discovery w
   discarded; the behavior can be disabled in Settings);
 - hidden/minimized renderers receive no streaming terminal or diagnostic IPC and resynchronize from a bounded snapshot
   when shown again;
-- process-name routing refreshes every 30 seconds with a foreground window on AC power, every 60 seconds in the
-  background, and every 120 seconds on battery or when the OS reports thermal/CPU pressure;
+- when no matching process connection is visible yet, process-name routing performs a short 1/2/4/8-second discovery
+  burst after connect or rule changes; an already discovered process skips that extra work. While process rules are
+  enabled, the compatibility snapshot then refreshes every 10 seconds on AC or battery, matching the pre-optimization
+  behavior required by Windows process routing;
 - SSH keepalive and time-based rekey share one deadline timer, while byte-based rekey is checked on active traffic and
   causes no idle polling;
 - accepted SSH upload frames are pipelined through a bounded 4 MiB socket buffer instead of waiting for one

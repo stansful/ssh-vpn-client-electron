@@ -2,13 +2,14 @@ import type { BrowserWindowConstructorOptions } from "electron";
 
 export type ThermalState = "unknown" | "nominal" | "fair" | "serious" | "critical";
 
-const AC_PROCESS_ROUTING_REFRESH_MS = 30_000;
-const BACKGROUND_PROCESS_ROUTING_REFRESH_MS = 60_000;
-const POWER_CONSTRAINED_PROCESS_ROUTING_REFRESH_MS = 120_000;
+const AC_PROCESS_ROUTING_REFRESH_MS = 10_000;
+const BACKGROUND_PROCESS_ROUTING_REFRESH_MS = 10_000;
+const POWER_CONSTRAINED_PROCESS_ROUTING_REFRESH_MS = 10_000;
 
 /**
- * Mutable, event-driven power state shared with low-priority background work.
- * Active tunnel I/O never consults this policy, so throughput is unaffected.
+ * Mutable, event-driven power state shared with background work. Process-name
+ * routing intentionally keeps its proven 10-second Windows compatibility
+ * cadence; active tunnel I/O never consults this policy.
  */
 export class SystemEnergyPolicy {
   private batteryPower: boolean;

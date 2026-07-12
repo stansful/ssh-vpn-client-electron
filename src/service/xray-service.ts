@@ -5,12 +5,16 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { checkSocks5Connect, parseEndpoint } from "../core/network/socks5-check.js";
 import { RoutingMatcher } from "../core/routing/routing-matcher.js";
-import { listWindowsProcessConnections } from "../core/network/windows-process-connections.js";
-import { WindowsSystemProxyManager } from "../core/network/windows-system-proxy.js";
+import {
+  listWindowsProcessConnections,
+  normalizeWindowsProcessName,
+  type WindowsProcessConnection
+} from "../core/network/windows-process-connections.js";
+import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
 import { buildXrayConfig } from "../core/proxy/xray-config.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { DiagnosticsEntry, ProxyConnectRequest, RoutingRule, RoutingUpdateRequest, RuntimeStatus, TunnelCheckResult } from "../shared/types.js";
-import { normalizeRuleValue } from "../shared/validation.js";
+import { normalizeRuleValue, validateRoutingRuleValue } from "../shared/validation.js";
 import { buildSelectedRulesWithProcessIps, recordBoundedProcessRouteIp } from "./live-ssh-service.js";
 import { reserveDistinctLocalTcpPorts, terminateProcess, waitForProcessStartup, type XrayProcess } from "./xray/process-utils.js";
 
@@ -20,10 +24,12 @@ export interface XrayServiceBridgeOptions {
   executablePath?: string;
   systemProxy?: WindowsSystemProxyManager;
   processRoutingRefreshIntervalMs?: () => number;
+  processConnectionsProvider?: (processNames: Iterable<string>) => Promise<WindowsProcessConnection[]>;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
-const PROCESS_ROUTE_REFRESH_INTERVAL_MS = 30 * 1000;
+const PROCESS_ROUTE_REFRESH_INTERVAL_MS = 10 * 1000;
+const PROCESS_ROUTE_DISCOVERY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
 const MAX_XRAY_PROCESS_LOG_LINES = 80;
 const MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS = 64 * 1024;
 const MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS = 4096;
@@ -32,6 +38,7 @@ export class XrayServiceBridge {
   private readonly events = new EventEmitter();
   private readonly systemProxy: WindowsSystemProxyManager;
   private readonly processRoutingRefreshIntervalMs: () => number;
+  private readonly processConnectionsProvider: (processNames: Iterable<string>) => Promise<WindowsProcessConnection[]>;
   private readonly runtimeDirectory: string;
   private readonly configPath: string;
   private readonly startupConfigCleanup: Promise<void>;
@@ -46,11 +53,15 @@ export class XrayServiceBridge {
   private startupAbortController: AbortController | undefined;
   private routingRules: RoutingRule[] = [];
   private processRoutingMonitor: NodeJS.Timeout | undefined;
-  private processRoutingRefreshInFlight = false;
   private processRoutingGeneration = 0;
   private processRoutingIps = new Map<string, number>();
   private processRoutingLastSignature = "";
+  private processRoutingAppliedSignature = "";
+  private processRoutingTargetSignature = "";
+  private processRoutingApplyPending = false;
+  private processRoutingLastMatchedConnections = 0;
   private processRoutingWarningEmitted = false;
+  private processRoutingDiscoveryStep = 0;
   private processLogLines = 0;
   private readonly processLogDrainers = new WeakMap<XrayProcess, () => void>();
   private mutationTail: Promise<void> = Promise.resolve();
@@ -61,6 +72,7 @@ export class XrayServiceBridge {
   constructor(initialStatus: RuntimeStatus, options: XrayServiceBridgeOptions) {
     this.systemProxy = options.systemProxy ?? new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
     this.processRoutingRefreshIntervalMs = options.processRoutingRefreshIntervalMs ?? (() => PROCESS_ROUTE_REFRESH_INTERVAL_MS);
+    this.processConnectionsProvider = options.processConnectionsProvider ?? listWindowsProcessConnections;
     this.runtimeDirectory = options.runtimeDirectory;
     this.configPath = path.join(this.runtimeDirectory, "xray-config.json");
     this.startupConfigCleanup = rm(this.configPath, { force: true }).catch(() => undefined);
@@ -182,6 +194,10 @@ export class XrayServiceBridge {
     this.processLogLines = 0;
     this.processRoutingIps.clear();
     this.processRoutingLastSignature = "";
+    this.processRoutingAppliedSignature = "";
+    this.processRoutingTargetSignature = "";
+    this.processRoutingApplyPending = false;
+    this.processRoutingLastMatchedConnections = 0;
     this.processRoutingWarningEmitted = false;
     await this.stopRouting();
     if (!this.isCurrentLifecycle(generation)) {
@@ -472,6 +488,10 @@ export class XrayServiceBridge {
     this.stopProcessRoutingMonitor();
     this.processRoutingIps.clear();
     this.processRoutingLastSignature = "";
+    this.processRoutingAppliedSignature = "";
+    this.processRoutingTargetSignature = "";
+    this.processRoutingApplyPending = false;
+    this.processRoutingLastMatchedConnections = 0;
     try {
       await this.systemProxy.restore();
     } catch (error) {
@@ -606,19 +626,37 @@ export class XrayServiceBridge {
     } else {
       this.processRoutingIps.clear();
       this.processRoutingLastSignature = "";
+      this.processRoutingAppliedSignature = "";
+      this.processRoutingTargetSignature = "";
+      this.processRoutingApplyPending = false;
+      this.processRoutingLastMatchedConnections = 0;
     }
     const effectiveRules = buildSelectedRulesWithProcessIps(request.routingRules, this.currentProcessRoutingIps());
-    const result = await this.systemProxy.apply({
-      mode: request.routingMode,
-      rules: effectiveRules,
-      proxyDomains: request.routingProxyDomains,
-      directDomains: request.routingDirectDomains,
-      socksHost: httpEndpoint.host,
-      socksPort: httpEndpoint.port,
-      proxyProtocol: "http"
-    });
+    this.processRoutingApplyPending = hasProcessRouting;
+    let result: SystemProxyApplyResult;
+    try {
+      result = await this.systemProxy.apply({
+        mode: request.routingMode,
+        rules: effectiveRules,
+        proxyDomains: request.routingProxyDomains,
+        directDomains: request.routingDirectDomains,
+        socksHost: httpEndpoint.host,
+        socksPort: httpEndpoint.port,
+        proxyProtocol: "http",
+        forcePacEndpointRotation: hasProcessRouting
+      });
+    } catch (error) {
+      if (hasProcessRouting && generation === this.processRoutingGeneration && this.status.state === "Connected") {
+        this.startProcessRoutingMonitor(request, socksEndpoint);
+      }
+      throw error;
+    }
     if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
       return;
+    }
+    if (hasProcessRouting && result.applied) {
+      this.processRoutingAppliedSignature = this.processRoutingLastSignature;
+      this.processRoutingApplyPending = false;
     }
     this.appendDiagnostic(result.applied ? "info" : "warning", result.message);
     if (hasProcessRouting) {
@@ -631,7 +669,7 @@ export class XrayServiceBridge {
     }
     this.appendDiagnostic(
       summary.enabledRules > 0 ? "info" : "warning",
-      `Selected routing prepared for Xray transport: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, learnedProcessIps=${this.processRoutingIps.size}.`
+      `Selected routing prepared for Xray transport: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}.`
     );
   }
 
@@ -642,6 +680,9 @@ export class XrayServiceBridge {
     }
 
     const generation = this.processRoutingGeneration;
+    this.processRoutingDiscoveryStep = this.processRoutingIps.size > 0 && !this.processRoutingApplyPending
+      ? PROCESS_ROUTE_DISCOVERY_DELAYS_MS.length
+      : 0;
     this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
   }
 
@@ -658,11 +699,6 @@ export class XrayServiceBridge {
       if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
         return;
       }
-      if (this.processRoutingRefreshInFlight) {
-        this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
-        return;
-      }
-      this.processRoutingRefreshInFlight = true;
       void this.enqueueMutation(() => this.refreshProcessRouting(request, socksEndpoint, generation))
         .catch((error: unknown) => {
           if (!this.processRoutingWarningEmitted) {
@@ -674,10 +710,9 @@ export class XrayServiceBridge {
           }
         })
         .finally(() => {
-          this.processRoutingRefreshInFlight = false;
           this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
         });
-    }, this.currentProcessRoutingRefreshIntervalMs());
+    }, this.nextProcessRoutingRefreshIntervalMs());
     this.processRoutingMonitor.unref();
   }
 
@@ -695,12 +730,21 @@ export class XrayServiceBridge {
     socksEndpoint: { host: string; port: number },
     generation: number
   ): Promise<void> {
-    const changed = await this.learnProcessRoutingIps(request.routingRules, generation);
-    if (!changed || generation !== this.processRoutingGeneration || this.status.state !== "Connected") {
+    if (generation !== this.processRoutingGeneration || this.status.state !== "Connected") {
+      return;
+    }
+    await this.learnProcessRoutingIps(request.routingRules, generation);
+    if (
+      generation !== this.processRoutingGeneration ||
+      this.status.state !== "Connected" ||
+      (!this.processRoutingApplyPending && this.processRoutingLastSignature === this.processRoutingAppliedSignature)
+    ) {
       return;
     }
 
+    const observedSignature = this.processRoutingLastSignature;
     const effectiveRules = buildSelectedRulesWithProcessIps(request.routingRules, this.currentProcessRoutingIps());
+    this.processRoutingApplyPending = true;
     const result = await this.systemProxy.apply({
       mode: request.routingMode,
       rules: effectiveRules,
@@ -708,11 +752,24 @@ export class XrayServiceBridge {
       directDomains: request.routingDirectDomains,
       socksHost: (this.httpEndpoint ?? socksEndpoint).host,
       socksPort: (this.httpEndpoint ?? socksEndpoint).port,
-      proxyProtocol: "http"
+      proxyProtocol: "http",
+      forcePacEndpointRotation: true
     });
+    if (
+      result.applied &&
+      generation === this.processRoutingGeneration &&
+      this.status.state === "Connected" &&
+      this.processRoutingLastSignature === observedSignature
+    ) {
+      this.processRoutingAppliedSignature = observedSignature;
+      this.processRoutingApplyPending = false;
+      if (this.processRoutingIps.size > 0) {
+        this.processRoutingDiscoveryStep = PROCESS_ROUTE_DISCOVERY_DELAYS_MS.length;
+      }
+    }
     this.appendDiagnostic(
       result.applied ? "info" : "warning",
-      `Process-name routing updated for Xray transport: learnedProcessIps=${this.processRoutingIps.size}. ${result.message}`
+      `Process-name routing updated for Xray transport: matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}. ${result.message}`
     );
   }
 
@@ -720,22 +777,29 @@ export class XrayServiceBridge {
     if (!supportsDynamicProcessRouting("selected-rules", rules)) {
       return false;
     }
+    if (generation !== undefined && generation !== this.processRoutingGeneration) {
+      return false;
+    }
 
     try {
       const processNames = enabledProcessRuleNames(rules);
-      const connections = await listWindowsProcessConnections(processNames);
+      this.resetProcessRoutingIpsForTargets(processNames);
+      const connections = await this.processConnectionsProvider(processNames);
       if (generation !== undefined && generation !== this.processRoutingGeneration) {
         return false;
       }
       const now = Date.now();
       const expiresBefore = now - this.currentProcessRoutingTtlMs();
       const nextIps = new Map([...this.processRoutingIps].filter((entry) => entry[1] >= expiresBefore));
+      let matchedConnections = 0;
       for (const connection of connections) {
-        const processName = normalizeRuleValue("process.name", connection.processName);
+        const processName = normalizeWindowsProcessName(connection.processName);
         if (processNames.has(processName)) {
+          matchedConnections += 1;
           recordBoundedProcessRouteIp(nextIps, connection.remoteAddress, now);
         }
       }
+      this.processRoutingLastMatchedConnections = matchedConnections;
 
       const nextSignature = [...nextIps.keys()].sort().join(",");
       const changed = nextSignature !== this.processRoutingLastSignature;
@@ -773,6 +837,15 @@ export class XrayServiceBridge {
     } catch {
       return PROCESS_ROUTE_REFRESH_INTERVAL_MS;
     }
+  }
+
+  private nextProcessRoutingRefreshIntervalMs(): number {
+    const discoveryDelay = PROCESS_ROUTE_DISCOVERY_DELAYS_MS[this.processRoutingDiscoveryStep];
+    if (discoveryDelay !== undefined) {
+      this.processRoutingDiscoveryStep += 1;
+      return discoveryDelay;
+    }
+    return this.currentProcessRoutingRefreshIntervalMs();
   }
 
   private currentProcessRoutingTtlMs(): number {
@@ -828,6 +901,20 @@ export class XrayServiceBridge {
     return new Set(this.processRoutingIps.keys());
   }
 
+  private resetProcessRoutingIpsForTargets(processNames: Set<string>): void {
+    const targetSignature = [...processNames].sort().join(",");
+    if (targetSignature === this.processRoutingTargetSignature) {
+      return;
+    }
+    this.processRoutingTargetSignature = targetSignature;
+    this.processRoutingIps.clear();
+    this.processRoutingLastSignature = "";
+    this.processRoutingAppliedSignature = "";
+    this.processRoutingApplyPending = false;
+    this.processRoutingLastMatchedConnections = 0;
+    this.processRoutingWarningEmitted = false;
+  }
+
   private isRoutingApplicable(): boolean {
     return this.status.state === "Connecting" || this.status.state === "Connected";
   }
@@ -841,7 +928,8 @@ function enabledProcessRuleNames(rules: RoutingRule[]): Set<string> {
   return new Set(
     rules
       .filter((rule) => rule.enabled && rule.type === "process.name")
-      .map((rule) => normalizeRuleValue("process.name", rule.value))
+      .filter((rule) => validateRoutingRuleValue(rule.type, rule.value).ok)
+      .map((rule) => normalizeWindowsProcessName(normalizeRuleValue("process.name", rule.value)))
       .filter(Boolean)
   );
 }
