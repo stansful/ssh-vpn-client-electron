@@ -916,6 +916,7 @@ textarea {
   place-items: center;
   padding: 24px;
   background: rgb(12 14 18 / 48%);
+  backdrop-filter: blur(8px);
   animation: fade-in 140ms ease both;
 }
 

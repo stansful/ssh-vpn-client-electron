@@ -16,6 +16,8 @@ export function Modal({
     return null;
   }
 
+  const portalRoot = document.querySelector<HTMLElement>(".app-shell") ?? document.body;
+
   return createPortal(
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal-card" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
@@ -28,6 +30,6 @@ export function Modal({
         {children}
       </section>
     </div>,
-    document.body
+    portalRoot
   );
 }
