@@ -7,6 +7,23 @@ export interface ValidationResult {
 
 const DOMAIN_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 const HEX_GROUP = /^[0-9a-f]{1,4}$/i;
+const SSH_SHA256_FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/u;
+
+export function validateSshServerFingerprint(value: string, allowDiscovery = true): ValidationResult {
+  const fingerprint = value.trim();
+  if (!fingerprint) {
+    return allowDiscovery
+      ? { ok: true }
+      : { ok: false, message: "A verified SSH server SHA256 fingerprint is required." };
+  }
+  if (!SSH_SHA256_FINGERPRINT.test(fingerprint)) {
+    return {
+      ok: false,
+      message: "SSH server fingerprint must use the OpenSSH SHA256:base64 format (43 characters after SHA256:)."
+    };
+  }
+  return { ok: true };
+}
 
 export function validateDomainPattern(value: string): ValidationResult {
   const pattern = value.trim().toLowerCase();
@@ -88,7 +105,10 @@ export function validateRoutingRuleValue(type: RoutingRuleType, value: string): 
   if (type === "ip") {
     return validateIpOrCidr(value);
   }
-  return validateProcessName(value);
+  if (type === "process.name") {
+    return validateProcessName(value);
+  }
+  return { ok: false, message: "Unsupported routing rule type." };
 }
 
 export function isValidIpv4(value: string): boolean {

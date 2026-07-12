@@ -1,5 +1,5 @@
 import type { RoutingMode, RoutingRule } from "../../shared/types.js";
-import { normalizeRuleValue } from "../../shared/validation.js";
+import { normalizeRuleValue, validateRoutingRuleValue } from "../../shared/validation.js";
 import { ipMatchesCidr, parseCidrRange, parseIpAddress, type ParsedCidrRange } from "./ip-address.js";
 
 export interface TrafficDescriptor {
@@ -25,8 +25,7 @@ export interface RoutingMatcherSummary {
 
 interface CompiledDomainRule {
   id: string;
-  pattern: string;
-  wildcard: boolean;
+  order: number;
 }
 
 interface CompiledIpRule {
@@ -36,30 +35,43 @@ interface CompiledIpRule {
 
 interface CompiledProcessRule {
   id: string;
-  name: string;
 }
 
 export class RoutingMatcher {
-  private readonly domains: CompiledDomainRule[] = [];
+  private readonly exactDomains = new Map<string, CompiledDomainRule>();
+  private readonly wildcardDomains = new Map<string, CompiledDomainRule>();
   private readonly ips: CompiledIpRule[] = [];
-  private readonly processes: CompiledProcessRule[] = [];
+  private readonly processes = new Map<string, CompiledProcessRule>();
+  private domainRules = 0;
+  private processRules = 0;
   private invalidRules = 0;
 
   constructor(
     private readonly mode: RoutingMode,
     rules: RoutingRule[]
   ) {
-    for (const rule of rules) {
+    for (const [order, rule] of rules.entries()) {
       if (!rule.enabled) {
+        continue;
+      }
+      if (!validateRoutingRuleValue(rule.type, rule.value).ok) {
+        this.invalidRules += 1;
         continue;
       }
       const normalized = normalizeRuleValue(rule.type, rule.value);
       if (rule.type === "domain") {
-        this.domains.push({
-          id: rule.id,
-          pattern: normalized.startsWith("*.") ? normalized.slice(2) : normalized,
-          wildcard: normalized.startsWith("*.")
-        });
+        const wildcard = normalized.startsWith("*.");
+        const pattern = wildcard ? normalized.slice(2) : normalized;
+        const index = wildcard ? this.wildcardDomains : this.exactDomains;
+        // Map insertion is intentionally first-wins: duplicate rule IDs/values
+        // historically matched the earliest enabled rule in the source array.
+        if (!index.has(pattern)) {
+          index.set(pattern, {
+            id: rule.id,
+            order
+          });
+        }
+        this.domainRules += 1;
         continue;
       }
       if (rule.type === "ip") {
@@ -71,7 +83,10 @@ export class RoutingMatcher {
         }
         continue;
       }
-      this.processes.push({ id: rule.id, name: normalized });
+      if (!this.processes.has(normalized)) {
+        this.processes.set(normalized, { id: rule.id });
+      }
+      this.processRules += 1;
     }
   }
 
@@ -86,7 +101,7 @@ export class RoutingMatcher {
 
     const domain = descriptor.destinationDomain?.trim().toLowerCase();
     if (domain) {
-      const matched = this.domains.find((rule) => domainMatches(rule, domain));
+      const matched = this.matchDomain(domain);
       if (matched) {
         return { shouldProxy: true, reason: "domain", ruleId: matched.id };
       }
@@ -102,7 +117,7 @@ export class RoutingMatcher {
 
     const processName = descriptor.processName?.trim().toLowerCase();
     if (processName) {
-      const matched = this.processes.find((rule) => rule.name === processName);
+      const matched = this.processes.get(processName);
       if (matched) {
         return { shouldProxy: true, reason: "process.name", ruleId: matched.id };
       }
@@ -115,21 +130,29 @@ export class RoutingMatcher {
     return {
       mode: this.mode,
       enabledRules: this.enabledRulesCount(),
-      domainRules: this.domains.length,
+      domainRules: this.domainRules,
       ipRules: this.ips.length,
-      processRules: this.processes.length,
+      processRules: this.processRules,
       invalidRules: this.invalidRules
     };
   }
 
   private enabledRulesCount(): number {
-    return this.domains.length + this.ips.length + this.processes.length;
+    return this.domainRules + this.ips.length + this.processRules;
   }
-}
 
-function domainMatches(rule: CompiledDomainRule, domain: string): boolean {
-  if (rule.wildcard) {
-    return domain.endsWith(`.${rule.pattern}`) && domain.length > rule.pattern.length + 1;
+  private matchDomain(domain: string): CompiledDomainRule | undefined {
+    let matched = this.exactDomains.get(domain);
+    // A wildcard only matches a strict subdomain. Walking label boundaries
+    // makes lookup proportional to domain depth rather than total rule count.
+    let separator = domain.indexOf(".");
+    while (separator >= 0 && separator + 1 < domain.length) {
+      const wildcard = this.wildcardDomains.get(domain.slice(separator + 1));
+      if (wildcard && (!matched || wildcard.order < matched.order)) {
+        matched = wildcard;
+      }
+      separator = domain.indexOf(".", separator + 1);
+    }
+    return matched;
   }
-  return domain === rule.pattern;
 }

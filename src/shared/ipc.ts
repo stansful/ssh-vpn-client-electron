@@ -1,6 +1,7 @@
 import type {
   AppSettings,
   AppSnapshot,
+  AppUpdateDownload,
   AppUpdateInfo,
   ImportProxyProfilesInput,
   ImportProxyProfilesResult,
@@ -63,6 +64,8 @@ export type ServiceEvent =
   | { type: "terminal-output"; line: TerminalLine }
   | { type: "error"; message: string };
 
+export type RendererEvent = ServiceEvent | { type: "update-download-changed"; download: AppUpdateDownload };
+
 export interface ShadowSshApi {
   loadSnapshot(): Promise<AppSnapshot>;
   upsertConfig(input: UpsertSshConfigInput): Promise<AppSnapshot>;
@@ -78,7 +81,7 @@ export interface ShadowSshApi {
   toggleProxyProfilePin(id: string): Promise<AppSnapshot>;
   deleteProxyProfile(id: string): Promise<AppSnapshot>;
   deleteUnpinnedProxyProfiles(): Promise<AppSnapshot>;
-  updateSettings(settings: AppSettings): Promise<AppSnapshot>;
+  updateSettings(patch: Partial<AppSettings>): Promise<AppSnapshot>;
   updateRoutingMode(mode: RoutingMode): Promise<AppSnapshot>;
   updateRoutingRules(rules: RoutingRule[]): Promise<AppSnapshot>;
   updateRoutingProxyListEnabled(enabled: boolean): Promise<AppSnapshot>;
@@ -101,5 +104,5 @@ export interface ShadowSshApi {
   revealDownloadedUpdate(): Promise<boolean>;
   copyText(text: string): Promise<boolean>;
   openExternal(url: string): Promise<boolean>;
-  onServiceEvent(callback: (event: ServiceEvent) => void): () => void;
+  onServiceEvent(callback: (event: RendererEvent) => void): () => void;
 }

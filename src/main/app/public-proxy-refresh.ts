@@ -1,36 +1,38 @@
 import type { AppStorage } from "../storage/app-storage.js";
+import { fetchTextWithLimit, type FetchImplementation } from "../../shared/http-fetch.js";
 import type { ImportProxyProfilesResult } from "../../shared/types.js";
 
 const PUBLIC_PROXY_SOURCE_URL = "https://hub.mos.ru/zieng2/wl/raw/main/list_universal.txt";
 const MAX_PUBLIC_PROXY_SOURCE_BYTES = 2 * 1024 * 1024;
+const PUBLIC_PROXY_REFRESH_TIMEOUT_MS = 30_000;
 
-export async function refreshPublicProxyProfiles(storage: AppStorage): Promise<ImportProxyProfilesResult> {
-  const response = await fetch(PUBLIC_PROXY_SOURCE_URL, {
+export interface RefreshPublicProxyProfilesOptions {
+  fetchImpl?: FetchImplementation;
+  maxBytes?: number;
+  timeoutMs?: number;
+}
+
+export async function refreshPublicProxyProfiles(
+  storage: AppStorage,
+  options: RefreshPublicProxyProfilesOptions = {}
+): Promise<ImportProxyProfilesResult> {
+  const text = await fetchTextWithLimit({
+    fetchImpl: options.fetchImpl,
+    url: PUBLIC_PROXY_SOURCE_URL,
     headers: {
       Accept: "text/plain, */*",
       "User-Agent": "shadow-ssh-desktop-proxy-refresh"
-    }
+    },
+    maxBytes: options.maxBytes ?? MAX_PUBLIC_PROXY_SOURCE_BYTES,
+    timeoutMs: options.timeoutMs ?? PUBLIC_PROXY_REFRESH_TIMEOUT_MS,
+    failureMessagePrefix: "Public proxy refresh failed",
+    limitMessage: "Remote proxy source is larger than the allowed limit.",
+    timeoutMessage: "Public proxy refresh timed out."
   });
-  if (!response.ok) {
-    throw new Error(`Public proxy refresh failed: ${response.status} ${response.statusText}`);
-  }
-  const text = await readLimitedResponseText(response, MAX_PUBLIC_PROXY_SOURCE_BYTES);
   const { result } = await storage.importProxyProfiles({
     text,
     source: "remote",
     sourceUrl: PUBLIC_PROXY_SOURCE_URL
   });
   return result;
-}
-
-async function readLimitedResponseText(response: Response, limit: number): Promise<string> {
-  const contentLength = Number(response.headers.get("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > limit) {
-    throw new Error("Remote proxy source is larger than the allowed limit.");
-  }
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > limit) {
-    throw new Error("Remote proxy source is larger than the allowed limit.");
-  }
-  return text;
 }

@@ -12,7 +12,6 @@ export interface KeyDraft extends UpsertSshKeyInput {
 }
 
 export const MAX_RENDERER_DIAGNOSTICS = 500;
-export const MAX_RENDERER_TERMINAL_LINES = 2000;
 
 export const emptyConfigDraft = (): ConfigDraft => ({
   mode: "create",

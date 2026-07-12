@@ -1,8 +1,11 @@
 import { Check, Download, Pin, PinOff, Plus, RefreshCw, RotateCw, ShieldAlert, SlidersHorizontal, Trash2, X } from "lucide-react";
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type { AppSnapshot, ImportProxyProfilesInput, ProxyProfile, UpsertProxyProfileInput } from "../../../shared/types.js";
 import { checkButtonClass } from "../../lib/labels.js";
+import { nextRenderPageCount, sliceRenderPage } from "../../lib/render-page.js";
 import { Modal } from "../ui/index.js";
+
+const PROFILE_RENDER_PAGE_SIZE = 100;
 
 export function XrayView({
   snapshot,
@@ -47,6 +50,8 @@ export function XrayView({
   const [importText, setImportText] = useState("");
   const [localError, setLocalError] = useState("");
   const [search, setSearch] = useState("");
+  const profilePageKey = JSON.stringify([search, store.proxyProfiles.length]);
+  const [profilePage, setProfilePage] = useState(() => ({ key: profilePageKey, count: PROFILE_RENDER_PAGE_SIZE }));
 
   const selectedProfile = store.proxyProfiles.find((profile) => profile.id === store.selectedProxyProfileId);
   const connected = runtime.transport === "xray" && (runtime.state === "Connected" || runtime.state === "Connecting" || runtime.state === "Reconnecting");
@@ -59,6 +64,14 @@ export function XrayView({
         : true
     );
   }, [search, store.proxyProfiles]);
+  const visibleProfileCount = profilePage.key === profilePageKey ? profilePage.count : PROFILE_RENDER_PAGE_SIZE;
+  const visibleProfiles = sliceRenderPage(filteredProfiles, visibleProfileCount);
+
+  useEffect(() => {
+    setProfilePage((current) => current.key === profilePageKey
+      ? current
+      : { key: profilePageKey, count: PROFILE_RENDER_PAGE_SIZE });
+  }, [profilePageKey]);
 
   async function submitManual(event: FormEvent): Promise<void> {
     event.preventDefault();
@@ -169,7 +182,7 @@ export function XrayView({
           <button type="button" className="ghost-button" disabled={busy} onClick={() => setImportOpen(true)}>
             <Download size={18} /> Import links
           </button>
-          <button type="button" className="ghost-button" disabled={busy} onClick={() => void onRefresh()}>
+          <button type="button" className="ghost-button" disabled={busy} onClick={() => void onRefresh().catch(() => undefined)}>
             <RotateCw size={18} /> Refresh public configs
           </button>
           <button
@@ -178,7 +191,7 @@ export function XrayView({
             disabled={busy || store.proxyProfiles.every((profile) => profile.isPinned)}
             onClick={() => {
               if (window.confirm("Delete all unpinned Xray profiles?")) {
-                void onDeleteUnpinned();
+                void onDeleteUnpinned().catch(() => undefined);
               }
             }}
           >
@@ -193,9 +206,10 @@ export function XrayView({
         {filteredProfiles.length === 0 ? (
           <div className="empty-state">No Xray profiles found.</div>
         ) : (
-          <div className="profile-grid">
-            {filteredProfiles.map((profile) => (
-              <article key={profile.id} className={`profile-card${profile.id === store.selectedProxyProfileId ? " selected" : ""}`}>
+          <>
+            <div className="profile-grid">
+              {visibleProfiles.map((profile) => (
+                <article key={profile.id} className={`profile-card${profile.id === store.selectedProxyProfileId ? " selected" : ""}`}>
                 <button type="button" className="profile-select" onClick={() => void onSelect(profile.id)}>
                   <strong>{profile.name}</strong>
                   <span>{profile.protocol.toUpperCase()} · {profile.host}:{profile.port}</span>
@@ -211,7 +225,7 @@ export function XrayView({
                     disabled={connected && runtime.activeConfigId === profile.id}
                     onClick={() => {
                       if (window.confirm(`Delete profile "${profile.name}"?`)) {
-                        void onDelete(profile.id);
+                        void onDelete(profile.id).catch(() => undefined);
                       }
                     }}
                     aria-label="Delete profile"
@@ -219,9 +233,24 @@ export function XrayView({
                     <Trash2 size={16} />
                   </button>
                 </div>
-              </article>
-            ))}
-          </div>
+                </article>
+              ))}
+            </div>
+            {visibleProfiles.length < filteredProfiles.length && (
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => setProfilePage({
+                    key: profilePageKey,
+                    count: nextRenderPageCount(visibleProfileCount, filteredProfiles.length, PROFILE_RENDER_PAGE_SIZE)
+                  })}
+                >
+                  Show more ({filteredProfiles.length - visibleProfiles.length} remaining)
+                </button>
+              </div>
+            )}
+          </>
         )}
       </section>
 

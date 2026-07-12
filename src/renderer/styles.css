@@ -126,7 +126,6 @@ button {
   overflow: hidden;
   border-right: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface), var(--bg) 16%);
-  backdrop-filter: blur(14px);
   transition:
     gap 180ms ease,
     padding 180ms ease,
@@ -574,6 +573,13 @@ h2 {
   font-weight: 700;
 }
 
+.field .field-hint {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
 .field.wide {
   grid-column: 1 / -1;
 }
@@ -663,6 +669,21 @@ textarea {
     background-color 150ms ease,
     transform 150ms ease,
     box-shadow 150ms ease;
+}
+
+.item,
+.rule-row,
+.profile-card {
+  content-visibility: auto;
+}
+
+.item,
+.rule-row {
+  contain-intrinsic-size: auto 60px;
+}
+
+.profile-card {
+  contain-intrinsic-size: auto 104px;
 }
 
 .item:hover,
@@ -895,7 +916,6 @@ textarea {
   place-items: center;
   padding: 24px;
   background: rgb(12 14 18 / 48%);
-  backdrop-filter: blur(8px);
   animation: fade-in 140ms ease both;
 }
 
@@ -926,8 +946,7 @@ textarea {
   top: 0;
   z-index: 1;
   border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--surface), transparent 4%);
-  backdrop-filter: blur(12px);
+  background: var(--surface);
 }
 
 .modal-actions {
@@ -1317,6 +1336,26 @@ details[open] summary {
   font-size: 13px;
 }
 
+.startup-screen {
+  grid-column: 1 / -1;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  padding: 24px;
+  place-items: center;
+  background: var(--bg);
+}
+
+.startup-screen .loading {
+  width: min(680px, 100%);
+}
+
+.startup-error {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--danger);
+}
+
 .empty-state,
 .loading {
   display: grid;
@@ -1332,6 +1371,10 @@ details[open] summary {
 
 .spin {
   animation: spin 0.9s linear infinite;
+}
+
+html[data-document-hidden] .spin {
+  animation-play-state: paused;
 }
 
 @keyframes spin {
@@ -1377,6 +1420,16 @@ details[open] summary {
   }
   to {
     opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition: none !important;
+    animation: none !important;
   }
 }
 

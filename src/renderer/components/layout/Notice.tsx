@@ -1,6 +1,7 @@
 import { X } from "lucide-react";
+import { memo } from "react";
 
-export function Notice({ message, onDismiss }: { message: string; onDismiss: () => void }): JSX.Element | null {
+export const Notice = memo(function Notice({ message, onDismiss }: { message: string; onDismiss: () => void }): JSX.Element | null {
   if (!message) {
     return null;
   }
@@ -13,4 +14,4 @@ export function Notice({ message, onDismiss }: { message: string; onDismiss: () 
       </button>
     </div>
   );
-}
+});

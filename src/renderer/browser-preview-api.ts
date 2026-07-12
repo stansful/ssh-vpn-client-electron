@@ -1,7 +1,11 @@
 import { createDefaultRuntimeStatus, createDefaultStore } from "../shared/defaults.js";
-import type { ServiceEvent, ShadowSshApi } from "../shared/ipc.js";
+import { normalizeProxyDomain } from "../core/routing/domain-proxy-list.js";
+import type { RendererEvent, ServiceEvent, ShadowSshApi } from "../shared/ipc.js";
+import { appendBoundedDiagnosticEntries } from "../shared/diagnostics-history.js";
+import { appendBoundedTerminalLine } from "../shared/terminal-history.js";
 import type {
   AppSettings,
+  AppStore,
   AppUpdateDownload,
   AppUpdateInfo,
   AppSnapshot,
@@ -18,12 +22,10 @@ import type {
   UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "../shared/types.js";
-
-const MAX_PREVIEW_DIAGNOSTICS = 500;
-const MAX_PREVIEW_TERMINAL_LINES = 2000;
+import { validateRoutingRuleValue } from "../shared/validation.js";
 
 export function createBrowserPreviewApi(): ShadowSshApi {
-  const listeners = new Set<(event: ServiceEvent) => void>();
+  const listeners = new Set<(event: RendererEvent) => void>();
   let store = createDefaultStore();
   let runtime = createDefaultRuntimeStatus({
     platform: "unknown",
@@ -58,8 +60,11 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       return;
     }
     const entry: DiagnosticsEntry = { id: crypto.randomUUID(), at: new Date().toISOString(), level, message };
-    diagnostics = [...diagnostics, entry].slice(-MAX_PREVIEW_DIAGNOSTICS);
-    emit({ type: "diagnostics-appended", entry });
+    diagnostics = appendBoundedDiagnosticEntries(diagnostics, [entry]);
+    const appended = diagnostics.at(-1);
+    if (appended) {
+      emit({ type: "diagnostics-appended", entry: appended });
+    }
   };
   const setRuntime = (patch: Partial<typeof runtime>): void => {
     runtime = { ...runtime, ...patch };
@@ -67,7 +72,7 @@ export function createBrowserPreviewApi(): ShadowSshApi {
   };
   const appendTerminal = (text: string): void => {
     const line: TerminalLine = { id: crypto.randomUUID(), at: new Date().toISOString(), stream: "system", text };
-    terminal = [...terminal, line].slice(-MAX_PREVIEW_TERMINAL_LINES);
+    terminal = appendBoundedTerminalLine(terminal, line);
     emit({ type: "terminal-output", line });
   };
 
@@ -215,8 +220,17 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       store = { ...store, proxyProfiles: store.proxyProfiles.filter((profile) => profile.isPinned) };
       return snapshot();
     },
-    async updateSettings(settings: AppSettings) {
-      store = { ...store, settings };
+    async updateSettings(patch: Partial<AppSettings>) {
+      store = {
+        ...store,
+        settings: {
+          ...store.settings,
+          ...patch,
+          customTheme: patch.customTheme
+            ? { ...store.settings.customTheme, ...patch.customTheme }
+            : store.settings.customTheme
+        }
+      };
       return snapshot();
     },
     async updateRoutingMode(mode: RoutingMode) {
@@ -279,8 +293,8 @@ export function createBrowserPreviewApi(): ShadowSshApi {
         appendDiagnostic("error", "Select or create an SSH configuration before connecting.");
         return snapshot();
       }
-      if (store.routingMode === "selected-rules" && !store.routingRules.some((rule) => rule.enabled)) {
-        appendDiagnostic("error", "Selected rules mode requires at least one enabled routing rule.");
+      if (store.routingMode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
+        appendDiagnostic("error", "Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain.");
         return snapshot();
       }
       diagnostics = [];
@@ -294,6 +308,10 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       const selectedProfile = store.proxyProfiles.find((profile) => profile.id === store.selectedProxyProfileId);
       if (!selectedProfile) {
         appendDiagnostic("error", "Select or import a proxy profile before connecting.");
+        return snapshot();
+      }
+      if (store.routingMode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
+        appendDiagnostic("error", "Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain.");
         return snapshot();
       }
       setRuntime({
@@ -361,11 +379,18 @@ export function createBrowserPreviewApi(): ShadowSshApi {
       window.open(url, "_blank", "noopener,noreferrer");
       return true;
     },
-    onServiceEvent(callback: (event: ServiceEvent) => void) {
+    onServiceEvent(callback: (event: RendererEvent) => void) {
       listeners.add(callback);
       return () => listeners.delete(callback);
     }
   };
+}
+
+function hasSelectedRoutingTargets(store: AppStore): boolean {
+  return (
+    store.routingRules.some((rule) => rule.enabled && validateRoutingRuleValue(rule.type, rule.value).ok) ||
+    (store.routingProxyList.enabled && store.routingProxyList.domains.some((domain) => normalizeProxyDomain(domain) !== undefined))
+  );
 }
 
 function makePreviewProxyProfile(rawUri: string, name: string, existing: ProxyProfile | undefined, source: ProxyProfile["source"]): ProxyProfile {

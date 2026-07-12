@@ -1,5 +1,6 @@
 import { Clipboard, Eye, EyeOff } from "lucide-react";
 import { useState } from "react";
+import { api } from "../../api.js";
 
 export function SecretField({
   label,
@@ -17,7 +18,7 @@ export function SecretField({
   const [visible, setVisible] = useState(false);
   const copyValue = (): void => {
     if (value) {
-      void navigator.clipboard.writeText(value);
+      void api.copyText(value).catch(() => undefined);
     }
   };
   const control = multiline ? (

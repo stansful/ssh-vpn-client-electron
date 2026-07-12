@@ -6,6 +6,9 @@ import { ROUTING_DOMAIN_LIST_SOURCE_URL } from "../../shared/links.js";
 import { normalizeRuleValue, validateRoutingRuleValue } from "../../shared/validation.js";
 import type { AppSnapshot, RoutingRule, RoutingRuleType } from "../../shared/types.js";
 
+const MAX_ROUTING_IMPORT_BYTES = 2 * 1024 * 1024;
+const MAX_ROUTING_RULES = 10_000;
+
 export function useRoutingController({
   snapshot,
   setSnapshot,
@@ -34,21 +37,28 @@ export function useRoutingController({
   }, [snapshot?.store.routingRules]);
 
   const filteredRules = useMemo(
-    () =>
-      routingDraft.filter(
+    () => {
+      const query = ruleSearch.trim().toLowerCase();
+      return routingDraft.filter(
         (rule) =>
           rule.type === ruleTab &&
-          (!ruleSearch.trim() || rule.value.toLowerCase().includes(ruleSearch.trim().toLowerCase()))
-      ),
+          (!query || rule.value.toLowerCase().includes(query))
+      );
+    },
     [routingDraft, ruleSearch, ruleTab]
   );
 
   const filteredProcesses = useMemo(
-    () =>
-      processes.filter((name) =>
-        processSearch.trim() ? name.toLowerCase().includes(processSearch.trim().toLowerCase()) : true
-      ),
+    () => {
+      const query = processSearch.trim().toLowerCase();
+      return processes.filter((name) => !query || name.toLowerCase().includes(query));
+    },
     [processSearch, processes]
+  );
+
+  const enabledCount = useMemo(
+    () => routingDraft.reduce((count, rule) => count + (rule.enabled ? 1 : 0), 0),
+    [routingDraft]
   );
 
   function persistRoutingRules(nextRules: RoutingRule[], successMessage?: string): void {
@@ -116,6 +126,11 @@ export function useRoutingController({
     if (!file) {
       return;
     }
+    if (file.size > MAX_ROUTING_IMPORT_BYTES) {
+      setNotice(`Routing import is larger than ${MAX_ROUTING_IMPORT_BYTES} bytes.`);
+      event.target.value = "";
+      return;
+    }
 
     const reader = new FileReader();
     reader.onload = () => {
@@ -123,6 +138,9 @@ export function useRoutingController({
         const parsed = JSON.parse(String(reader.result)) as RoutingRule[];
         if (!Array.isArray(parsed)) {
           throw new Error("Import file must contain a rules array.");
+        }
+        if (parsed.length > MAX_ROUTING_RULES) {
+          throw new Error(`Routing import contains more than ${MAX_ROUTING_RULES} rules.`);
         }
         const validRules = parsed.filter((rule) => validateRoutingRuleValue(rule.type, rule.value).ok);
         setRoutingDraft(validRules);
@@ -213,6 +231,7 @@ export function useRoutingController({
     setProcessSearch,
     filteredRules,
     filteredProcesses,
+    enabledCount,
     updateRoutingDraft,
     addRule,
     importRules,

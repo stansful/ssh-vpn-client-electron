@@ -16,6 +16,13 @@ func DefaultEndpoint() string {
 	return filepath.Join(defaultRuntimeDirectory(), "shadow-ssh-"+strconv.Itoa(os.Getuid())+".sock")
 }
 
+func SetAllowedClientSID(value string) error {
+	if value == "" {
+		return nil
+	}
+	return ValidateWindowsSID(value)
+}
+
 func ServeEndpoint(ctx context.Context, endpoint string, handler Handler) error {
 	if err := os.MkdirAll(filepath.Dir(endpoint), 0o700); err != nil {
 		return err
@@ -32,16 +39,45 @@ func ServeEndpoint(ctx context.Context, endpoint string, handler Handler) error 
 		_ = listener.Close()
 		_ = os.Remove(endpoint)
 	}()
-	_ = os.Chmod(endpoint, 0o600)
+	if err := os.Chmod(endpoint, 0o600); err != nil {
+		return err
+	}
 
 	shutdown := make(chan struct{})
 	var closeOnce sync.Once
+	var connectionsMu sync.Mutex
+	connections := make(map[net.Conn]struct{})
+	connectionLimiter := newEndpointConnectionLimiter()
+	var connectionWG sync.WaitGroup
+	closeConnections := func() {
+		connectionsMu.Lock()
+		defer connectionsMu.Unlock()
+		for conn := range connections {
+			_ = conn.Close()
+		}
+	}
 	closeForShutdown := func() {
 		closeOnce.Do(func() {
 			close(shutdown)
 			_ = listener.Close()
+			closeConnections()
 		})
 	}
+	cancelWatcherDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+			closeConnections()
+		case <-cancelWatcherDone:
+		}
+	}()
+	defer func() {
+		close(cancelWatcherDone)
+		_ = listener.Close()
+		closeConnections()
+		connectionWG.Wait()
+	}()
 
 	for {
 		conn, err := listener.Accept()
@@ -55,10 +91,25 @@ func ServeEndpoint(ctx context.Context, endpoint string, handler Handler) error 
 				return err
 			}
 		}
+		if !connectionLimiter.tryAcquire() {
+			_ = conn.Close()
+			continue
+		}
 
+		connectionsMu.Lock()
+		connections[conn] = struct{}{}
+		connectionsMu.Unlock()
+		connectionWG.Add(1)
 		go func() {
+			defer connectionWG.Done()
+			defer connectionLimiter.release()
 			defer conn.Close()
-			if err := ServeLines(ctx, conn, conn, handler); errors.Is(err, ErrShutdown) {
+			defer func() {
+				connectionsMu.Lock()
+				delete(connections, conn)
+				connectionsMu.Unlock()
+			}()
+			if err := ServeEndpointConnection(ctx, conn, handler); errors.Is(err, ErrShutdown) {
 				closeForShutdown()
 			}
 		}()

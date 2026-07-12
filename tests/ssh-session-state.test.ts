@@ -1,9 +1,11 @@
+import { diffieHellman, generateKeyPairSync, sign as nodeSign, type KeyObject } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { SshBinaryReader, SshBinaryWriter } from "../src/core/ssh/binary.js";
 import {
   SSH_MSG_CHANNEL_CLOSE,
   SSH_MSG_CHANNEL_DATA,
   SSH_MSG_CHANNEL_EOF,
+  SSH_MSG_CHANNEL_EXTENDED_DATA,
   SSH_MSG_CHANNEL_FAILURE,
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
   SSH_MSG_CHANNEL_SUCCESS,
@@ -13,10 +15,23 @@ import {
   SSH_MSG_USERAUTH_FAILURE,
   SSH_MSG_USERAUTH_SUCCESS
 } from "../src/core/ssh/connection-messages.js";
+import {
+  SSH_MSG_CHANNEL_OPEN,
+  SSH_MSG_CHANNEL_OPEN_FAILURE,
+  SSH_MSG_CHANNEL_REQUEST
+} from "../src/core/ssh/channel-messages.js";
 import { deriveTransportKeys, transportKeyLengthsFor } from "../src/core/ssh/key-derivation.js";
 import { SshPacketProtector } from "../src/core/ssh/packet-codec.js";
 import { SshSessionStateMachine } from "../src/core/ssh/session-state.js";
 import { createDefaultKexInit, encodeKexInit } from "../src/core/ssh/messages.js";
+import {
+  computeCurve25519Sha256ExchangeHash,
+  exportRawX25519PublicKey,
+  importRawX25519PublicKey
+} from "../src/core/ssh/kex-curve25519.js";
+import { bufferToBigInt } from "../src/core/ssh/kex-group14.js";
+import { encodeEd25519PublicKeyBlob, encodeSshSignatureBlob } from "../src/core/ssh/host-key.js";
+import { sha256Fingerprint } from "../src/core/ssh/fingerprint.js";
 
 describe("SSH packet codec stream state", () => {
   it("round-trips multiple packets without resetting CTR IV", () => {
@@ -56,6 +71,26 @@ describe("SSH session state machine", () => {
 
     expect(result.negotiated.kexAlgorithm).toBe("curve25519-sha256");
     expect(new SshBinaryReader(result.kexDhInitPayload).byte()).toBe(30);
+    expect(result.ignoreNextServerKexPacket).toBe(false);
+  });
+
+  it("marks a speculative server KEX packet for discard when the server guessed the wrong algorithm", () => {
+    const session = new SshSessionStateMachine({
+      clientVersion: "SSH-2.0-client",
+      serverVersion: "SSH-2.0-server"
+    });
+    session.startKex();
+
+    const result = session.receiveServerKexInit(
+      encodeKexInit({
+        ...createDefaultKexInit(),
+        kexAlgorithms: ["diffie-hellman-group14-sha256", "curve25519-sha256"],
+        firstKexPacketFollows: true
+      })
+    );
+
+    expect(result.negotiated.kexAlgorithm).toBe("curve25519-sha256");
+    expect(result.ignoreNextServerKexPacket).toBe(true);
   });
 
   it("falls back to group14 when curve25519 is unavailable", () => {
@@ -72,6 +107,69 @@ describe("SSH session state machine", () => {
     );
 
     expect(result.negotiated.kexAlgorithm).toBe("diffie-hellman-group14-sha256");
+  });
+
+  it("accepts a signed server host key without requiring a pinned fingerprint", () => {
+    const hostIdentity = createEd25519HostIdentity();
+    const session = new SshSessionStateMachine({
+      clientVersion: "SSH-2.0-client",
+      serverVersion: "SSH-2.0-server"
+    });
+    const exchange = prepareCurveExchange(session, hostIdentity);
+
+    const result = session.completeKex(exchange.replyPayload);
+
+    expect(result.serverHostKeyFingerprint).toBe(hostIdentity.fingerprint);
+    expect(session.getPhase()).toBe("newkeys-sent");
+  });
+
+  it("still enforces an explicitly configured fingerprint pin", () => {
+    const hostIdentity = createEd25519HostIdentity();
+    const session = new SshSessionStateMachine({
+      clientVersion: "SSH-2.0-client",
+      serverVersion: "SSH-2.0-server",
+      expectedServerFingerprint: `SHA256:${"A".repeat(43)}`
+    });
+    const exchange = prepareCurveExchange(session, hostIdentity);
+
+    expect(() => session.completeKex(exchange.replyPayload)).toThrow("SSH server fingerprint mismatch");
+    expect(session.getPhase()).toBe("kexdh-sent");
+  });
+
+  it("preserves the first session id and authenticated phase across runtime rekey", () => {
+    const hostIdentity = createEd25519HostIdentity();
+    const session = new SshSessionStateMachine({
+      clientVersion: "SSH-2.0-client",
+      serverVersion: "SSH-2.0-server"
+    });
+    const firstExchange = prepareCurveExchange(session, hostIdentity);
+    const first = session.completeKex(firstExchange.replyPayload);
+    session.receiveNewKeys(Buffer.from([SSH_MSG_NEWKEYS]));
+    expect(session.getPhase()).toBe("encrypted");
+
+    forcePhase(session, "authenticated");
+    const secondExchange = prepareCurveExchange(session, hostIdentity);
+    const second = session.completeKex(secondExchange.replyPayload);
+    expect(second.exchangeHash).not.toEqual(first.exchangeHash);
+    expect(second.sessionId).toEqual(first.sessionId);
+    session.receiveNewKeys(Buffer.from([SSH_MSG_NEWKEYS]));
+    expect(session.getPhase()).toBe("authenticated");
+  });
+
+  it("rejects a host-key change during rekey even without a configured pin", () => {
+    const firstHost = createEd25519HostIdentity();
+    const replacementHost = createEd25519HostIdentity();
+    const session = new SshSessionStateMachine({
+      clientVersion: "SSH-2.0-client",
+      serverVersion: "SSH-2.0-server"
+    });
+    const firstExchange = prepareCurveExchange(session, firstHost);
+    session.completeKex(firstExchange.replyPayload);
+    session.receiveNewKeys(Buffer.from([SSH_MSG_NEWKEYS]));
+    forcePhase(session, "authenticated");
+
+    const replacementExchange = prepareCurveExchange(session, replacementHost);
+    expect(() => session.completeKex(replacementExchange.replyPayload)).toThrow("SSH server host key changed during rekey");
   });
 
   it("moves through NEWKEYS, service accept, and password auth success", () => {
@@ -142,11 +240,16 @@ describe("SSH session state machine", () => {
     session.receiveChannelMessage(new SshBinaryWriter().byte(SSH_MSG_CHANNEL_WINDOW_ADJUST).uint32(0).uint32(10).toBuffer());
     expect(session.getChannel(0)?.remoteWindow).toBe(13);
 
-    expect(session.receiveChannelMessage(new SshBinaryWriter().byte(SSH_MSG_CHANNEL_CLOSE).uint32(0).toBuffer())).toEqual({
-      type: "close",
+    const close = session.receiveChannelMessage(new SshBinaryWriter().byte(SSH_MSG_CHANNEL_CLOSE).uint32(0).toBuffer());
+    expect(close).toMatchObject({ type: "close", localChannel: 0 });
+    const reciprocalClose = new SshBinaryReader(close.responsePayload!);
+    expect(reciprocalClose.byte()).toBe(SSH_MSG_CHANNEL_CLOSE);
+    expect(reciprocalClose.uint32()).toBe(44);
+    expect(session.getChannel(0)).toBeUndefined();
+    expect(session.receiveChannelMessage(new SshBinaryWriter().byte(SSH_MSG_CHANNEL_CLOSE).uint32(0).toBuffer())).toMatchObject({
+      type: "ignored",
       localChannel: 0
     });
-    expect(session.getChannel(0)).toBeUndefined();
   });
 
   it("chunks outbound channel data by remote packet size and remote window", () => {
@@ -225,7 +328,7 @@ describe("SSH session state machine", () => {
     expect(reader.uint32()).toBe(0);
   });
 
-  it("sends window adjust when inbound streaming data drains the local window", () => {
+  it("sends window adjust only after inbound data is acknowledged by the downstream sink", () => {
     const session = authenticatedReadySession("authenticated");
     const opened = session.openDirectTcpIpChannel({
       hostToConnect: "video-edge.example.com",
@@ -243,18 +346,50 @@ describe("SSH session state machine", () => {
         .toBuffer()
     );
 
-    const chunk = Buffer.alloc(9 * 1024 * 1024);
-    const event = session.receiveChannelMessage(
-      new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(opened.channel.localId).string(chunk).toBuffer()
-    );
+    const chunk = Buffer.alloc(64 * 1024);
+    let adjustPayload: Buffer | undefined;
+    for (let index = 0; index < 128; index += 1) {
+      const event = session.receiveChannelMessage(
+        new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(opened.channel.localId).string(chunk).toBuffer()
+      );
+      expect(event.type).toBe("data");
+      expect(event.windowAdjustPayload).toBeUndefined();
+      adjustPayload = session.acknowledgeChannelData(opened.channel.localId, chunk.length) ?? adjustPayload;
+    }
 
-    expect(event.type).toBe("data");
-    expect(event.windowAdjustPayload).toBeDefined();
-    const adjust = new SshBinaryReader(event.windowAdjustPayload!);
+    expect(adjustPayload).toBeDefined();
+    const adjust = new SshBinaryReader(adjustPayload!);
     expect(adjust.byte()).toBe(SSH_MSG_CHANNEL_WINDOW_ADJUST);
     expect(adjust.uint32()).toBe(7);
-    expect(adjust.uint32()).toBe(9 * 1024 * 1024);
+    expect(adjust.uint32()).toBe(8 * 1024 * 1024);
     expect(session.getChannel(opened.channel.localId)?.localWindow).toBe(16 * 1024 * 1024);
+  });
+
+  it("rejects inbound channel data frames above the advertised local maximum", () => {
+    const session = authenticatedReadySession("authenticated");
+    const opened = session.openDirectTcpIpChannel({
+      hostToConnect: "video-edge.example.com",
+      portToConnect: 443,
+      originatorIpAddress: "127.0.0.1",
+      originatorPort: 50000
+    });
+    session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(opened.channel.localId)
+        .uint32(7)
+        .uint32(1024 * 1024)
+        .uint32(65536)
+        .toBuffer()
+    );
+
+    expect(() => session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_DATA)
+        .uint32(opened.channel.localId)
+        .string(Buffer.alloc(65537))
+        .toBuffer()
+    )).toThrow("inbound maximum packet size exceeded");
   });
 
   it("ignores late channel messages for locally closed direct-tcpip checks", () => {
@@ -294,6 +429,105 @@ describe("SSH session state machine", () => {
       });
     }
   });
+
+  it("closes a late channel confirmation after a timed-out local open was abandoned", () => {
+    const session = authenticatedReadySession("authenticated");
+    const opened = session.openDirectTcpIpChannel({
+      hostToConnect: "slow.example.com",
+      portToConnect: 443,
+      originatorIpAddress: "127.0.0.1",
+      originatorPort: 50000
+    });
+    expect(session.abortChannel(opened.channel.localId)).toBeUndefined();
+
+    const late = session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(opened.channel.localId)
+        .uint32(77)
+        .uint32(1024)
+        .uint32(32768)
+        .toBuffer()
+    );
+
+    expect(late).toMatchObject({ type: "ignored", localChannel: opened.channel.localId });
+    const close = new SshBinaryReader(late.responsePayload!);
+    expect(close.byte()).toBe(SSH_MSG_CHANNEL_CLOSE);
+    expect(close.uint32()).toBe(77);
+  });
+
+  it("accounts for extended channel data and rejects unsupported inbound requests with replies", () => {
+    const session = authenticatedReadySession("authenticated");
+    const opened = session.openSessionChannel();
+    session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(opened.channel.localId)
+        .uint32(44)
+        .uint32(1024)
+        .uint32(65536)
+        .toBuffer()
+    );
+
+    const extended = session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_EXTENDED_DATA)
+        .uint32(opened.channel.localId)
+        .uint32(1)
+        .string(Buffer.from("stderr"))
+        .toBuffer()
+    );
+    expect(extended).toMatchObject({
+      type: "extended-data",
+      localChannel: opened.channel.localId,
+      dataTypeCode: 1,
+      data: Buffer.from("stderr")
+    });
+    expect(session.getChannel(opened.channel.localId)?.localWindow).toBe(16 * 1024 * 1024 - 6);
+
+    const request = session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_REQUEST)
+        .uint32(opened.channel.localId)
+        .string("custom@example.com")
+        .boolean(true)
+        .string("payload")
+        .toBuffer()
+    );
+    const failure = new SshBinaryReader(request.responsePayload!);
+    expect(failure.byte()).toBe(SSH_MSG_CHANNEL_FAILURE);
+    expect(failure.uint32()).toBe(44);
+
+    const noReply = session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_REQUEST)
+        .uint32(opened.channel.localId)
+        .string("exit-status")
+        .boolean(false)
+        .uint32(0)
+        .toBuffer()
+    );
+    expect(noReply.responsePayload).toBeUndefined();
+  });
+
+  it("rejects unsupported server-initiated channels instead of leaving them unanswered", () => {
+    const session = authenticatedReadySession("authenticated");
+    const event = session.receiveChannelMessage(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN)
+        .string("forwarded-tcpip")
+        .uint32(91)
+        .uint32(1024)
+        .uint32(32768)
+        .string("example.com")
+        .toBuffer()
+    );
+
+    const failure = new SshBinaryReader(event.responsePayload!);
+    expect(failure.byte()).toBe(SSH_MSG_CHANNEL_OPEN_FAILURE);
+    expect(failure.uint32()).toBe(91);
+    expect(failure.uint32()).toBe(1);
+  });
 });
 
 function authenticatedReadySession(phase: "authenticating" | "authenticated"): SshSessionStateMachine {
@@ -307,4 +541,58 @@ function authenticatedReadySession(phase: "authenticating" | "authenticated"): S
 
 function forcePhase(session: SshSessionStateMachine, phase: string): void {
   (session as unknown as { phase: string }).phase = phase;
+}
+
+interface TestHostIdentity {
+  privateKey: KeyObject;
+  hostKeyBlob: Buffer;
+  fingerprint: string;
+}
+
+function createEd25519HostIdentity(): TestHostIdentity {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const rawPublicKey = publicKey.export({ format: "der", type: "spki" }).subarray(-32);
+  const hostKeyBlob = encodeEd25519PublicKeyBlob(rawPublicKey);
+  return { privateKey, hostKeyBlob, fingerprint: sha256Fingerprint(hostKeyBlob) };
+}
+
+function prepareCurveExchange(session: SshSessionStateMachine, hostIdentity: TestHostIdentity): { replyPayload: Buffer } {
+  const started = session.startKex();
+  const serverKexInitPayload = encodeKexInit({
+    ...createDefaultKexInit(),
+    kexAlgorithms: ["curve25519-sha256"],
+    serverHostKeyAlgorithms: ["ssh-ed25519"]
+  });
+  const kexInit = session.receiveServerKexInit(serverKexInitPayload);
+  const clientInit = new SshBinaryReader(kexInit.kexDhInitPayload);
+  expect(clientInit.byte()).toBe(30);
+  const clientPublicKey = clientInit.string();
+
+  const serverExchange = generateKeyPairSync("x25519");
+  const serverPublicKey = exportRawX25519PublicKey(serverExchange.publicKey);
+  const sharedSecret = bufferToBigInt(
+    diffieHellman({
+      privateKey: serverExchange.privateKey,
+      publicKey: importRawX25519PublicKey(clientPublicKey)
+    })
+  );
+  const exchangeHash = computeCurve25519Sha256ExchangeHash({
+    clientVersion: "SSH-2.0-client",
+    serverVersion: "SSH-2.0-server",
+    clientKexInitPayload: started.clientKexInitPayload,
+    serverKexInitPayload,
+    serverHostKey: hostIdentity.hostKeyBlob,
+    clientPublicKey,
+    serverPublicKey,
+    sharedSecret
+  });
+  const signature = encodeSshSignatureBlob("ssh-ed25519", nodeSign(null, exchangeHash, hostIdentity.privateKey));
+  return {
+    replyPayload: new SshBinaryWriter()
+      .byte(31)
+      .string(hostIdentity.hostKeyBlob)
+      .string(serverPublicKey)
+      .string(signature)
+      .toBuffer()
+  };
 }

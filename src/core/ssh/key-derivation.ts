@@ -34,6 +34,24 @@ export function deriveTransportKeys(
   };
 }
 
+export function deriveDirectionalTransportKeys(
+  sharedSecret: bigint,
+  exchangeHash: Buffer,
+  sessionId: Buffer,
+  clientToServer: TransportKeyLengths,
+  serverToClient: TransportKeyLengths
+): DerivedTransportKeys {
+  const hashAlgorithm = clientToServer.hashAlgorithm ?? serverToClient.hashAlgorithm ?? "sha256";
+  return {
+    initialIvClientToServer: deriveKey(sharedSecret, exchangeHash, sessionId, "A", clientToServer.ivLength, hashAlgorithm),
+    initialIvServerToClient: deriveKey(sharedSecret, exchangeHash, sessionId, "B", serverToClient.ivLength, hashAlgorithm),
+    encryptionKeyClientToServer: deriveKey(sharedSecret, exchangeHash, sessionId, "C", clientToServer.cipherKeyLength, hashAlgorithm),
+    encryptionKeyServerToClient: deriveKey(sharedSecret, exchangeHash, sessionId, "D", serverToClient.cipherKeyLength, hashAlgorithm),
+    integrityKeyClientToServer: deriveKey(sharedSecret, exchangeHash, sessionId, "E", clientToServer.macKeyLength, hashAlgorithm),
+    integrityKeyServerToClient: deriveKey(sharedSecret, exchangeHash, sessionId, "F", serverToClient.macKeyLength, hashAlgorithm)
+  };
+}
+
 export function deriveKey(
   sharedSecret: bigint,
   exchangeHash: Buffer,

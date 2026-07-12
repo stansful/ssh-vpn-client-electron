@@ -1,4 +1,4 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { toErrorMessage } from "../lib/labels.js";
 import type { AppSnapshot } from "../../shared/types.js";
 
@@ -10,14 +10,19 @@ export function useAsyncAction({
   setNotice: Dispatch<SetStateAction<string>>;
 }): {
   busy: boolean;
-  setBusy: Dispatch<SetStateAction<boolean>>;
+  setBusy: (value: boolean) => void;
   run: (action: () => Promise<AppSnapshot | void>) => Promise<void>;
   commitSnapshotAction: (action: () => Promise<AppSnapshot>, successMessage?: string) => Promise<void>;
 } {
   const [busy, setBusy] = useState(false);
+  const busyOperations = useRef(0);
+  const setOperationBusy = useCallback((value: boolean): void => {
+    busyOperations.current = Math.max(0, busyOperations.current + (value ? 1 : -1));
+    setBusy(busyOperations.current > 0);
+  }, []);
 
-  async function run(action: () => Promise<AppSnapshot | void>): Promise<void> {
-    setBusy(true);
+  const run = useCallback(async (action: () => Promise<AppSnapshot | void>): Promise<void> => {
+    setOperationBusy(true);
     setNotice("");
     try {
       const next = await action();
@@ -27,12 +32,15 @@ export function useAsyncAction({
     } catch (error) {
       setNotice(toErrorMessage(error));
     } finally {
-      setBusy(false);
+      setOperationBusy(false);
     }
-  }
+  }, [setNotice, setOperationBusy, setSnapshot]);
 
-  async function commitSnapshotAction(action: () => Promise<AppSnapshot>, successMessage?: string): Promise<void> {
-    setBusy(true);
+  const commitSnapshotAction = useCallback(async (
+    action: () => Promise<AppSnapshot>,
+    successMessage?: string
+  ): Promise<void> => {
+    setOperationBusy(true);
     setNotice("");
     try {
       const next = await action();
@@ -45,9 +53,9 @@ export function useAsyncAction({
       setNotice(message);
       throw new Error(message);
     } finally {
-      setBusy(false);
+      setOperationBusy(false);
     }
-  }
+  }, [setNotice, setOperationBusy, setSnapshot]);
 
-  return { busy, setBusy, run, commitSnapshotAction };
+  return { busy, setBusy: setOperationBusy, run, commitSnapshotAction };
 }

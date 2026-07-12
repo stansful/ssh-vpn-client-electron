@@ -1,8 +1,9 @@
 import { Copy, FileText, Github, KeyRound, Network, PanelLeftClose, PanelLeftOpen, Power, Server, Settings as SettingsIcon } from "lucide-react";
+import { memo } from "react";
 import type { View } from "../../types.js";
 import { NavButton } from "../ui/index.js";
 
-export function Sidebar({
+export const Sidebar = memo(function Sidebar({
   view,
   platform,
   arch,
@@ -76,4 +77,4 @@ export function Sidebar({
       </div>
     </aside>
   );
-}
+});

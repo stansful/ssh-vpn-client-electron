@@ -38,11 +38,21 @@ type SSHConfig struct {
 }
 
 type ConnectPayload struct {
-	Config        SSHConfig         `json:"config"`
-	RoutingMode   routing.Mode      `json:"routingMode"`
-	RoutingRules  []routing.Rule    `json:"routingRules"`
-	CheckEndpoint string            `json:"checkEndpoint"`
-	Secrets       map[string]string `json:"secrets,omitempty"`
+	Config               SSHConfig         `json:"config"`
+	RoutingMode          routing.Mode      `json:"routingMode"`
+	RoutingRules         []routing.Rule    `json:"routingRules"`
+	RoutingProxyDomains  []string          `json:"routingProxyDomains"`
+	RoutingDirectDomains []string          `json:"routingDirectDomains"`
+	CheckEndpoint        string            `json:"checkEndpoint"`
+	Secrets              map[string]string `json:"secrets,omitempty"`
+}
+
+type RoutingUpdatePayload struct {
+	RoutingMode          routing.Mode   `json:"routingMode"`
+	RoutingRules         []routing.Rule `json:"routingRules"`
+	RoutingProxyDomains  []string       `json:"routingProxyDomains"`
+	RoutingDirectDomains []string       `json:"routingDirectDomains"`
+	CheckEndpoint        string         `json:"checkEndpoint"`
 }
 
 type DiagnosticsEntry struct {

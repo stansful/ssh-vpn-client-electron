@@ -4,9 +4,24 @@ export interface SocketWriteOptions {
   timeoutMs?: number;
 }
 
-export function configureLowLatencySocket(socket: net.Socket): void {
+export interface SocketTuningOptions {
+  keepAlive?: boolean;
+  keepAliveInitialDelayMs?: number;
+}
+
+// One busy download can still consume the complete SSH receive window, while
+// many stalled local consumers cannot retain hundreds of MiB in aggregate.
+export const DEFAULT_PROXY_CONNECTION_QUEUE_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_PROXY_TOTAL_QUEUE_BYTES = 64 * 1024 * 1024;
+
+export function configureLowLatencySocket(socket: net.Socket, options: SocketTuningOptions = {}): void {
   socket.setNoDelay(true);
-  socket.setKeepAlive(true, 30_000);
+  // Loopback proxy sockets do not benefit from kernel keepalive probes: both
+  // endpoints live in the same OS and already have an application idle
+  // deadline. For the remote SSH socket keep probes, but start them late enough
+  // that they do not duplicate the protocol keepalive on every short idle.
+  const keepAlive = options.keepAlive ?? true;
+  socket.setKeepAlive(keepAlive, keepAlive ? options.keepAliveInitialDelayMs ?? 120_000 : 0);
 }
 
 export function isSocketWritable(socket: net.Socket): boolean {
@@ -55,11 +70,15 @@ export async function writeSocketWithBackpressure(socket: net.Socket, data: Buff
 
     socket.once("error", onError);
     socket.once("close", onClose);
-    const accepted = socket.write(data);
-    if (accepted) {
-      finish();
-    } else {
-      socket.once("drain", onDrain);
+    try {
+      const accepted = socket.write(data);
+      if (accepted) {
+        finish();
+      } else {
+        socket.once("drain", onDrain);
+      }
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
     }
   });
 }

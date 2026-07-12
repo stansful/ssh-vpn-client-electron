@@ -7,11 +7,13 @@ import { listWindowsProcessConnections } from "../core/network/windows-process-c
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
-import { normalizeRuleValue } from "../shared/validation.js";
+import { normalizeRuleValue, validateRoutingRuleValue } from "../shared/validation.js";
 import type { ServiceBridge } from "./service-bridge.js";
 
 export interface LiveSshServiceBridgeOptions {
   pacDirectory?: string;
+  systemProxy?: WindowsSystemProxyManager;
+  processRoutingRefreshIntervalMs?: () => number;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
@@ -29,16 +31,24 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private socksProxy: Socks5Proxy | undefined;
   private socksEndpoint: { host: string; port: number } | undefined;
   private readonly systemProxy: WindowsSystemProxyManager;
+  private readonly processRoutingRefreshIntervalMs: () => number;
   private proxyInfoDiagnostics = 0;
   private proxyWarningDiagnostics = 0;
   private processRoutingMonitor: NodeJS.Timeout | undefined;
+  private processRoutingRefreshInFlight = false;
+  private processRoutingGeneration = 0;
   private processRoutingIps = new Map<string, number>();
   private processRoutingLastSignature = "";
   private processRoutingWarningEmitted = false;
-  private ignoreNextClientClose = false;
+  private mutationTail: Promise<void> = Promise.resolve();
+  private terminalMutationTail: Promise<void> = Promise.resolve();
+  private lifecycleGeneration = 0;
+  private routingGeneration = 0;
+  private disposed = false;
 
   constructor(initialStatus: RuntimeStatus, options: LiveSshServiceBridgeOptions = {}) {
-    this.systemProxy = new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
+    this.systemProxy = options.systemProxy ?? new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
+    this.processRoutingRefreshIntervalMs = options.processRoutingRefreshIntervalMs ?? (() => PROCESS_ROUTE_REFRESH_INTERVAL_MS);
     this.status = {
       ...initialStatus,
       state: "Disconnected",
@@ -62,29 +72,42 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // The selected config is resolved at connect time with fresh secrets.
   }
 
-  async updateRoutingRules(rules: RoutingRule[]): Promise<void> {
+  updateRoutingRules(rules: RoutingRule[]): Promise<void> {
+    if (this.disposed) {
+      return Promise.resolve();
+    }
     this.routingRules = rules;
-    const summary = new RoutingMatcher("selected-rules", rules).summary();
     if (this.lastRequest) {
       this.lastRequest = { ...this.lastRequest, routingRules: rules };
     }
-    if (this.status.state === "Connected" && this.lastRequest && this.socksEndpoint) {
-      const request = { ...this.lastRequest, routingRules: rules };
+    const routingGeneration = ++this.routingGeneration;
+    const lifecycleGeneration = this.lifecycleGeneration;
+    return this.enqueueMutation(async () => {
+      if (!this.isCurrentMutation(lifecycleGeneration, routingGeneration)) {
+        return;
+      }
+      const summary = new RoutingMatcher("selected-rules", rules).summary();
+      const request = this.lastRequest;
+      const socksEndpoint = this.socksEndpoint;
+      if (this.status.state === "Connected" && request && socksEndpoint) {
+        this.appendDiagnostic(
+          "info",
+          `Routing rules changed while connected: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing.`
+        );
+        await this.applySystemRouting(request, socksEndpoint);
+        return;
+      }
       this.appendDiagnostic(
         "info",
-        `Routing rules changed while connected: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing.`
+        `Routing rules prepared for live SSH service: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
       );
-      await this.applySystemRouting(request, this.socksEndpoint);
-      this.lastRequest = request;
-      return;
-    }
-    this.appendDiagnostic(
-      "info",
-      `Routing rules prepared for live SSH service: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
-    );
+    });
   }
 
-  async updateRouting(update: RoutingUpdateRequest): Promise<void> {
+  updateRouting(update: RoutingUpdateRequest): Promise<void> {
+    if (this.disposed) {
+      return Promise.resolve();
+    }
     this.routingRules = update.routingRules;
     if (this.lastRequest) {
       this.lastRequest = {
@@ -96,51 +119,51 @@ export class LiveSshServiceBridge implements ServiceBridge {
         checkEndpoint: update.checkEndpoint
       };
     }
-    const summary = new RoutingMatcher(update.routingMode, update.routingRules).summary();
-    if (this.status.state === "Connected" && this.lastRequest && this.socksEndpoint) {
-      const unsupportedRouting = describeUnsupportedSelectedRouting(this.lastRequest);
-      if (unsupportedRouting) {
-        this.setStatus({
-          state: "Error",
-          activeConfigId: this.lastRequest.config.id,
-          realTunnelAvailable: false,
-          message: unsupportedRouting
-        });
-        this.appendDiagnostic("error", unsupportedRouting);
+    const routingGeneration = ++this.routingGeneration;
+    const lifecycleGeneration = this.lifecycleGeneration;
+    return this.enqueueMutation(async () => {
+      if (!this.isCurrentMutation(lifecycleGeneration, routingGeneration)) {
+        return;
+      }
+      const summary = new RoutingMatcher(update.routingMode, update.routingRules).summary();
+      const request = this.lastRequest;
+      const socksEndpoint = this.socksEndpoint;
+      if (this.status.state === "Connected" && request && socksEndpoint) {
+        const unsupportedRouting = describeUnsupportedSelectedRouting(request);
+        if (unsupportedRouting) {
+          this.setStatus({
+            state: "Error",
+            activeConfigId: request.config.id,
+            realTunnelAvailable: false,
+            message: unsupportedRouting
+          });
+          this.appendDiagnostic("error", unsupportedRouting);
+          return;
+        }
+        this.appendDiagnostic(
+          "info",
+          `Routing mode changed while connected: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing without SSH reconnect.`
+        );
+        await this.applySystemRouting(request, socksEndpoint);
         return;
       }
       this.appendDiagnostic(
         "info",
-        `Routing mode changed while connected: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing without SSH reconnect.`
+        `Routing prepared for live SSH service: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
       );
-      await this.applySystemRouting(this.lastRequest, this.socksEndpoint);
-      return;
-    }
-    this.appendDiagnostic(
-      "info",
-      `Routing prepared for live SSH service: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
-    );
+    });
   }
 
-  async connect(request: ConnectRequest): Promise<void> {
+  connect(request: ConnectRequest): Promise<void> {
+    if (this.disposed) {
+      return Promise.reject(new Error("Live SSH service has been disposed."));
+    }
     this.clearReconnectTimer();
     this.lastRequest = request;
     this.disconnectRequested = false;
     this.routingRules = request.routingRules;
-    this.proxyInfoDiagnostics = 0;
-    this.proxyWarningDiagnostics = 0;
-    this.processRoutingIps.clear();
-    this.processRoutingLastSignature = "";
-    this.processRoutingWarningEmitted = false;
-    this.shellOpen = false;
-    await this.stopRouting();
-    const existingClient = this.client;
-    this.client = undefined;
-    if (existingClient) {
-      this.ignoreNextClientClose = true;
-      await existingClient.disconnect("Replacing SSH session.");
-    }
-
+    this.routingGeneration += 1;
+    const generation = ++this.lifecycleGeneration;
     this.setStatus({
       state: "Connecting",
       activeConfigId: request.config.id,
@@ -148,6 +171,32 @@ export class LiveSshServiceBridge implements ServiceBridge {
       connectedAt: undefined,
       realTunnelAvailable: false
     });
+    return this.enqueueMutation(() => this.connectInternal(request, generation));
+  }
+
+  private async connectInternal(request: ConnectRequest, generation: number): Promise<void> {
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
+    this.proxyInfoDiagnostics = 0;
+    this.proxyWarningDiagnostics = 0;
+    this.processRoutingIps.clear();
+    this.processRoutingLastSignature = "";
+    this.processRoutingWarningEmitted = false;
+    this.shellOpen = false;
+    await this.stopRouting();
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
+    const existingClient = this.client;
+    this.client = undefined;
+    if (existingClient) {
+      await this.disconnectClient(existingClient, "Replacing SSH session.");
+      if (!this.isCurrentLifecycle(generation)) {
+        return;
+      }
+    }
+
     this.appendDiagnostic(
       "info",
       `Connect requested for ${request.config.username}@${request.config.host}:${request.config.port}, auth=${request.config.authType}, routing=${request.routingMode}, privateKey=${Boolean(request.secrets?.privateKey)}, passphraseProvided=${Boolean(request.secrets?.privateKeyPassphrase)}.`
@@ -165,6 +214,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
       return;
     }
 
+    let acquiredClient: SshLiveClient | undefined;
+    let acquiredProxy: Socks5Proxy | undefined;
     try {
       const client = await SshLiveClient.connect({
         host: request.config.host,
@@ -178,21 +229,44 @@ export class LiveSshServiceBridge implements ServiceBridge {
         connectTimeoutMs: 10000,
         operationTimeoutMs: 60000
       });
+      acquiredClient = client;
+      if (!this.isCurrentLifecycle(generation)) {
+        await this.disconnectClient(client, "SSH connection was superseded.");
+        return;
+      }
       this.client = client;
-      client.onEvent((event) => this.handleClientEvent(event));
-      const socksEndpoint = await this.startSocksProxy(client);
+      client.onEvent((event) => this.handleClientEvent(client, generation, event));
+      const { endpoint: socksEndpoint, proxy } = await this.startSocksProxy(client, generation);
+      acquiredProxy = proxy;
+      if (!this.isCurrentLifecycle(generation) || this.client !== client) {
+        await this.cleanupClientResources(client, proxy, "SSH connection was superseded.");
+        return;
+      }
+      this.socksProxy = proxy;
       this.socksEndpoint = socksEndpoint;
+      const effectiveRequest = this.lastRequest ?? request;
+      await this.applySystemRouting(effectiveRequest, socksEndpoint, true);
+      if (!this.isCurrentLifecycle(generation) || this.client !== client) {
+        await this.cleanupClientResources(client, proxy, "SSH connection was superseded.");
+        return;
+      }
       this.setStatus({
         state: "Connected",
-        activeConfigId: request.config.id,
+        activeConfigId: effectiveRequest.config.id,
         connectedAt: new Date().toISOString(),
         reconnectAttempt: 0,
         realTunnelAvailable: true,
-        message: `Connected to ${request.config.name}. HTTP/SOCKS proxy ${socksEndpoint.host}:${socksEndpoint.port}, direct-tcpip, and shell channels are live.`
+        message: `Connected to ${effectiveRequest.config.name}. HTTP/SOCKS proxy ${socksEndpoint.host}:${socksEndpoint.port}, direct-tcpip, and shell channels are live.`
       });
-      this.appendDiagnostic("info", `SSH session established for ${request.config.username}@${request.config.host}:${request.config.port}.`);
-      await this.applySystemRouting(request, socksEndpoint);
+      this.appendDiagnostic(
+        "info",
+        `SSH session established for ${effectiveRequest.config.username}@${effectiveRequest.config.host}:${effectiveRequest.config.port}.`
+      );
     } catch (error) {
+      await this.cleanupClientResources(acquiredClient, acquiredProxy, "SSH connection setup failed.");
+      if (!this.isCurrentLifecycle(generation)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.setStatus({
         state: "Error",
@@ -204,22 +278,43 @@ export class LiveSshServiceBridge implements ServiceBridge {
       if (error instanceof SshAuthenticationError && error.diagnostics.length > 0) {
         this.appendDiagnostic("info", `SSH private key parse diagnostics: ${error.diagnostics.join("; ")}`);
       }
-      if (isNonRetryableConnectError(message)) {
+      if (isNonRetryableConnectError(error)) {
         this.appendDiagnostic("warning", "Reconnect stopped. Update the SSH configuration or key, then connect again.");
         return;
       }
-      this.scheduleReconnect(message);
+      this.scheduleReconnect(message, generation);
     }
   }
 
-  async disconnect(): Promise<void> {
+  disconnect(): Promise<void> {
+    if (this.disposed) {
+      return this.mutationTail;
+    }
     this.disconnectRequested = true;
     this.clearReconnectTimer();
+    const generation = ++this.lifecycleGeneration;
+    this.setStatus({
+      state: "Disconnecting",
+      realTunnelAvailable: false,
+      message: "Disconnecting SSH session."
+    });
+    return this.enqueueMutation(() => this.disconnectInternal(generation, "User disconnected."));
+  }
+
+  private async disconnectInternal(generation: number, reason: string): Promise<void> {
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
     const client = this.client;
     this.client = undefined;
     this.shellOpen = false;
     await this.stopRouting();
-    await client?.disconnect("User disconnected.");
+    if (client) {
+      await this.disconnectClient(client, reason);
+    }
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
     this.setStatus({
       state: "Disconnected",
       activeConfigId: undefined,
@@ -233,7 +328,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
   async checkTunnel(endpoint: string): Promise<TunnelCheckResult> {
     const at = new Date().toISOString();
-    if (!this.client || this.status.state !== "Connected") {
+    const client = this.client;
+    if (!client || this.status.state !== "Connected") {
       const result = { endpoint, ok: false, at, message: "SSH session is not connected." };
       this.appendDiagnostic("warning", `Tunnel check skipped for ${endpoint}: SSH session is not connected.`);
       this.emit({ type: "tunnel-check-result", result });
@@ -242,7 +338,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
     try {
       this.appendDiagnostic("info", `Tunnel check requested for ${endpoint}.`);
-      await this.client.checkTunnel(endpoint);
+      await client.checkTunnel(endpoint);
       const result = { endpoint, ok: true, at, message: `SSH direct-tcpip check succeeded for ${endpoint}.` };
       this.appendDiagnostic("info", result.message);
       this.emit({ type: "tunnel-check-result", result });
@@ -260,64 +356,122 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
   }
 
-  async openTerminal(): Promise<void> {
-    if (!this.client || this.status.state !== "Connected") {
-      this.emitError("SSH terminal requires an active connection.");
-      return;
-    }
-    if (this.shellOpen) {
-      return;
-    }
-    await this.client.openShell();
-    this.shellOpen = true;
-    this.appendTerminal("system", "SSH shell channel opened.\n");
+  openTerminal(): Promise<void> {
+    return this.enqueueTerminalMutation(async () => {
+      const client = this.client;
+      if (!client || this.status.state !== "Connected") {
+        this.emitError("SSH terminal requires an active connection.");
+        return;
+      }
+      if (this.shellOpen) {
+        return;
+      }
+      await client.openShell();
+      if (this.client !== client || this.status.state !== "Connected") {
+        await client.closeShell().catch(() => undefined);
+        return;
+      }
+      this.shellOpen = true;
+      this.appendTerminal("system", "SSH shell channel opened.\n");
+    });
   }
 
-  async closeTerminal(): Promise<void> {
-    if (!this.client || !this.shellOpen) {
-      return;
-    }
-    await this.client.closeShell();
-    this.shellOpen = false;
-    this.appendTerminal("system", "\nSSH shell channel closed.\n");
+  closeTerminal(): Promise<void> {
+    return this.enqueueTerminalMutation(async () => {
+      const client = this.client;
+      if (!client || !this.shellOpen) {
+        return;
+      }
+      await client.closeShell();
+      if (this.client === client) {
+        this.shellOpen = false;
+        this.appendTerminal("system", "\nSSH shell channel closed.\n");
+      }
+    });
   }
 
-  async terminalInput(input: string): Promise<void> {
-    if (!this.client || !this.shellOpen) {
-      this.emitError("SSH shell channel is not open.");
-      return;
-    }
-    await this.client.writeShell(input);
+  terminalInput(input: string): Promise<void> {
+    return this.enqueueTerminalMutation(async () => {
+      const client = this.client;
+      if (!client || !this.shellOpen) {
+        this.emitError("SSH shell channel is not open.");
+        return;
+      }
+      await client.writeShell(input);
+    });
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposed) {
+      return this.mutationTail;
+    }
+    this.disposed = true;
+    this.disconnectRequested = true;
     this.clearReconnectTimer();
-    await this.stopRouting();
-    await this.client?.disconnect("Application is quitting.");
-    this.client = undefined;
+    const generation = ++this.lifecycleGeneration;
+    this.setStatus({
+      state: "Disconnecting",
+      realTunnelAvailable: false,
+      message: "Stopping SSH service."
+    });
+    return this.enqueueMutation(() => this.disconnectInternal(generation, "Application is quitting."));
   }
 
-  private handleClientEvent(event: SshLiveClientEvent): void {
+  private handleClientEvent(client: SshLiveClient, generation: number, event: SshLiveClientEvent): void {
+    if (client !== this.client || !this.isCurrentLifecycle(generation)) {
+      return;
+    }
     if (event.type === "terminal-data") {
-      this.appendTerminal("stdout", event.data.toString("utf8"));
+      if (event.data.length === 0) {
+        return;
+      }
+      this.appendTerminal(event.stream, event.data.toString("utf8"));
+      return;
+    }
+    if (event.type === "terminal-close") {
+      this.shellOpen = false;
+      this.appendTerminal("system", "\nSSH shell channel closed by the server.\n");
       return;
     }
     if (event.type === "error") {
-      this.appendDiagnostic("error", event.error.message);
-      this.scheduleReconnect(event.error.message);
-      return;
-    }
-    if (event.type === "close" && this.ignoreNextClientClose) {
-      this.ignoreNextClientClose = false;
+      this.handleClientFailure(client, generation, event.error);
       return;
     }
     if (event.type === "close" && !this.disconnectRequested) {
-      this.scheduleReconnect("SSH transport closed.");
+      this.handleClientFailure(client, generation, new Error("SSH transport closed."));
     }
   }
 
-  private scheduleReconnect(reason: string): void {
-    if (this.disconnectRequested || !this.lastRequest || this.reconnectTimer) {
+  private handleClientFailure(client: SshLiveClient, generation: number, error: Error): void {
+    if (client !== this.client || !this.isCurrentLifecycle(generation)) {
+      return;
+    }
+    const failureGeneration = ++this.lifecycleGeneration;
+    this.client = undefined;
+    this.shellOpen = false;
+    this.clearReconnectTimer();
+    this.setStatus({
+      state: "Error",
+      realTunnelAvailable: false,
+      message: error.message
+    });
+    this.appendDiagnostic("error", error.message);
+    void this.enqueueMutation(async () => {
+      await this.stopRouting();
+      await this.disconnectClient(client, "SSH transport failed.");
+      if (!this.isCurrentLifecycle(failureGeneration) || this.disconnectRequested) {
+        return;
+      }
+      if (isNonRetryableConnectError(error)) {
+        this.appendDiagnostic("warning", "Reconnect stopped because SSH host trust or credentials require user action.");
+        return;
+      }
+      this.scheduleReconnect(error.message, failureGeneration);
+    });
+  }
+
+  private scheduleReconnect(reason: string, generation: number): void {
+    if (this.disposed || !this.isCurrentLifecycle(generation) || this.disconnectRequested || !this.lastRequest || this.reconnectTimer) {
       return;
     }
     const attempt = this.status.reconnectAttempt + 1;
@@ -332,7 +486,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      if (this.lastRequest && !this.disconnectRequested) {
+      if (this.lastRequest && this.isCurrentLifecycle(generation) && !this.disconnectRequested) {
         void this.connect(this.lastRequest);
       }
     }, delayMs);
@@ -346,14 +500,19 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
   }
 
-  private async startSocksProxy(client: SshLiveClient): Promise<{ host: string; port: number }> {
-    await this.socksProxy?.stop();
+  private async startSocksProxy(
+    client: SshLiveClient,
+    generation: number
+  ): Promise<{ endpoint: { host: string; port: number }; proxy: Socks5Proxy }> {
     const proxy = new Socks5Proxy({
       listenHost: "127.0.0.1",
       idleTimeoutMs: 5 * 60 * 1000,
       connectChannel: (target, originator) => client.openDirectTcpIpChannel(target, originator)
     });
     proxy.onEvent((event) => {
+      if (!this.isCurrentLifecycle(generation) || this.client !== client) {
+        return;
+      }
       if (event.type === "error") {
         this.appendProxyDiagnostic("warning", event.message);
         return;
@@ -362,34 +521,97 @@ export class LiveSshServiceBridge implements ServiceBridge {
         this.appendProxyDiagnostic("info", event.message);
       }
     });
-    this.socksProxy = proxy;
-    const endpoint = await proxy.start();
-    this.appendDiagnostic("info", `Local HTTP/SOCKS proxy is listening on ${endpoint.host}:${endpoint.port}.`);
-    return endpoint;
+    try {
+      const endpoint = await proxy.start();
+      this.appendDiagnostic("info", `Local HTTP/SOCKS proxy is listening on ${endpoint.host}:${endpoint.port}.`);
+      return { endpoint, proxy };
+    } catch (error) {
+      await proxy.stop().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async cleanupClientResources(
+    client: SshLiveClient | undefined,
+    proxy: Socks5Proxy | undefined,
+    reason: string
+  ): Promise<void> {
+    if (this.client === client) {
+      this.client = undefined;
+    }
+    if (this.socksProxy === proxy) {
+      await this.stopRouting();
+    } else {
+      await proxy?.stop().catch(() => undefined);
+    }
+    if (client) {
+      await this.disconnectClient(client, reason);
+    }
+  }
+
+  private async disconnectClient(client: SshLiveClient, reason: string): Promise<void> {
+    try {
+      await client.disconnect(reason);
+    } catch (error) {
+      this.appendDiagnostic("warning", `SSH client cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private enqueueMutation(operation: () => Promise<void>): Promise<void> {
+    const result = this.mutationTail.then(operation, operation);
+    this.mutationTail = result.catch(() => undefined);
+    return result;
+  }
+
+  private enqueueTerminalMutation(operation: () => Promise<void>): Promise<void> {
+    const result = this.terminalMutationTail.then(operation, operation);
+    this.terminalMutationTail = result.catch(() => undefined);
+    return result;
+  }
+
+  private isCurrentLifecycle(generation: number): boolean {
+    return generation === this.lifecycleGeneration;
+  }
+
+  private isCurrentMutation(lifecycleGeneration: number, routingGeneration: number): boolean {
+    return !this.disposed && this.isCurrentLifecycle(lifecycleGeneration) && routingGeneration === this.routingGeneration;
   }
 
   private async stopRouting(): Promise<void> {
     this.stopProcessRoutingMonitor();
     this.processRoutingIps.clear();
     this.processRoutingLastSignature = "";
+    const socksProxy = this.socksProxy;
+    this.socksProxy = undefined;
+    this.socksEndpoint = undefined;
     try {
       await this.systemProxy.restore();
     } catch (error) {
       this.appendDiagnostic("warning", `Windows proxy restore failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (this.socksProxy) {
-      await this.socksProxy.stop();
-      this.socksProxy = undefined;
+    if (socksProxy) {
+      try {
+        await socksProxy.stop();
+      } catch (error) {
+        this.appendDiagnostic("warning", `Local proxy cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-    this.socksEndpoint = undefined;
   }
 
-  private async applySystemRouting(request: ConnectRequest, socksEndpoint: { host: string; port: number }): Promise<void> {
+  private async applySystemRouting(
+    request: ConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    allowConnecting = false
+  ): Promise<void> {
     this.stopProcessRoutingMonitor();
+    const generation = this.processRoutingGeneration;
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
     const hasProcessRouting = supportsDynamicProcessRouting(request);
     if (hasProcessRouting) {
-      await this.learnProcessRoutingIps(request);
+      await this.learnProcessRoutingIps(request, generation);
+      if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
+        return;
+      }
       this.appendDiagnostic(
         "warning",
         "Selected process-name routing is using dynamic process-IP PAC rules. Non-matching traffic stays direct, but already-open target app sockets may need reconnect; strict per-process enforcement still requires WFP/TUN."
@@ -407,6 +629,9 @@ export class LiveSshServiceBridge implements ServiceBridge {
       socksHost: socksEndpoint.host,
       socksPort: socksEndpoint.port
     });
+    if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
+      return;
+    }
     this.appendDiagnostic(result.applied ? "info" : "warning", result.message);
     if (hasProcessRouting) {
       this.startProcessRoutingMonitor(request, socksEndpoint);
@@ -422,29 +647,72 @@ export class LiveSshServiceBridge implements ServiceBridge {
     );
   }
 
+  private isRoutingStateActive(allowConnecting: boolean): boolean {
+    return this.status.state === "Connected" || (allowConnecting && this.status.state === "Connecting");
+  }
+
   private startProcessRoutingMonitor(request: ConnectRequest, socksEndpoint: { host: string; port: number }): void {
     this.stopProcessRoutingMonitor();
     if (!supportsDynamicProcessRouting(request)) {
       return;
     }
 
-    this.processRoutingMonitor = setInterval(() => {
-      void this.refreshProcessRouting(request, socksEndpoint);
-    }, PROCESS_ROUTE_REFRESH_INTERVAL_MS);
+    const generation = this.processRoutingGeneration;
+    this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
+  }
+
+  private scheduleProcessRoutingRefresh(
+    request: ConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number
+  ): void {
+    if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(true)) {
+      return;
+    }
+    this.processRoutingMonitor = setTimeout(() => {
+      this.processRoutingMonitor = undefined;
+      if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(true)) {
+        return;
+      }
+      if (this.processRoutingRefreshInFlight) {
+        this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
+        return;
+      }
+      this.processRoutingRefreshInFlight = true;
+      void this.enqueueMutation(() => this.refreshProcessRouting(request, socksEndpoint, generation))
+        .catch((error: unknown) => {
+          if (!this.processRoutingWarningEmitted) {
+            this.processRoutingWarningEmitted = true;
+            this.appendDiagnostic(
+              "warning",
+              `Process-name routing refresh failed: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        })
+        .finally(() => {
+          this.processRoutingRefreshInFlight = false;
+          this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
+        });
+    }, this.currentProcessRoutingRefreshIntervalMs());
     this.processRoutingMonitor.unref();
   }
 
   private stopProcessRoutingMonitor(): void {
+    this.processRoutingGeneration += 1;
     if (!this.processRoutingMonitor) {
       return;
     }
-    clearInterval(this.processRoutingMonitor);
+    clearTimeout(this.processRoutingMonitor);
     this.processRoutingMonitor = undefined;
   }
 
-  private async refreshProcessRouting(request: ConnectRequest, socksEndpoint: { host: string; port: number }): Promise<void> {
-    const changed = await this.learnProcessRoutingIps(request);
-    if (!changed) {
+  private async refreshProcessRouting(
+    request: ConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number
+  ): Promise<void> {
+    const changed = await this.learnProcessRoutingIps(request, generation);
+    if (!changed || generation !== this.processRoutingGeneration || this.status.state !== "Connected") {
       return;
     }
 
@@ -463,21 +731,24 @@ export class LiveSshServiceBridge implements ServiceBridge {
     );
   }
 
-  private async learnProcessRoutingIps(request: ConnectRequest): Promise<boolean> {
+  private async learnProcessRoutingIps(request: ConnectRequest, generation?: number): Promise<boolean> {
     if (!supportsDynamicProcessRouting(request)) {
       return false;
     }
 
     try {
       const processNames = enabledProcessRuleNames(request.routingRules);
-      const connections = await listWindowsProcessConnections();
+      const connections = await listWindowsProcessConnections(processNames);
+      if (generation !== undefined && generation !== this.processRoutingGeneration) {
+        return false;
+      }
       const now = Date.now();
-      const expiresBefore = now - PROCESS_ROUTE_TTL_MS;
+      const expiresBefore = now - this.currentProcessRoutingTtlMs();
       const nextIps = new Map([...this.processRoutingIps].filter((entry) => entry[1] >= expiresBefore));
       for (const connection of connections) {
         const processName = normalizeRuleValue("process.name", connection.processName);
         if (processNames.has(processName)) {
-          nextIps.set(connection.remoteAddress, now);
+          recordBoundedProcessRouteIp(nextIps, connection.remoteAddress, now);
         }
       }
 
@@ -506,6 +777,21 @@ export class LiveSshServiceBridge implements ServiceBridge {
       platformTarget: this.status.platformTarget
     };
     this.emit({ type: "status-changed", status: this.getStatus() });
+  }
+
+  private currentProcessRoutingRefreshIntervalMs(): number {
+    try {
+      const requested = this.processRoutingRefreshIntervalMs();
+      return Number.isFinite(requested) && requested >= 1_000
+        ? Math.min(requested, 10 * 60 * 1000)
+        : PROCESS_ROUTE_REFRESH_INTERVAL_MS;
+    } catch {
+      return PROCESS_ROUTE_REFRESH_INTERVAL_MS;
+    }
+  }
+
+  private currentProcessRoutingTtlMs(): number {
+    return Math.max(PROCESS_ROUTE_TTL_MS, this.currentProcessRoutingRefreshIntervalMs() * 3);
   }
 
   private appendDiagnostic(level: DiagnosticsEntry["level"], message: string): void {
@@ -580,8 +866,14 @@ function redactSecrets(message: string): string {
   return message.replace(/(password|passphrase|private key)\s*[:=]\s*\S+/giu, "$1=<redacted>");
 }
 
-function isNonRetryableConnectError(message: string): boolean {
-  return /SSH authentication failed|SSH private key|password auth rejected|private-key auth rejected|no auth method available|is unavailable|host key/i.test(message);
+function isNonRetryableConnectError(error: unknown): boolean {
+  if (error instanceof SshAuthenticationError) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /SSH authentication failed|SSH private key|password auth rejected|private-key auth rejected|no auth method available|is unavailable|host key|fingerprint|not trusted/i.test(
+    message
+  );
 }
 
 export function describeUnsupportedSelectedRouting(request: ConnectRequest, platform: NodeJS.Platform = process.platform): string | undefined {
@@ -601,7 +893,7 @@ export function buildSelectedRulesWithProcessIps(rules: RoutingRule[], processIp
   const now = new Date(0).toISOString();
   const dynamicRules = [...processIps]
     .map((ip) => ip.trim())
-    .filter(Boolean)
+    .filter((ip) => validateRoutingRuleValue("ip", ip).ok)
     .filter((ip) => !existingIpRules.has(ip.toLowerCase()))
     .sort()
     .map<RoutingRule>((ip) => ({
@@ -616,6 +908,30 @@ export function buildSelectedRulesWithProcessIps(rules: RoutingRule[], processIp
   return [...rules, ...dynamicRules];
 }
 
+export const MAX_LEARNED_PROCESS_ROUTE_IPS = 2048;
+
+export function recordBoundedProcessRouteIp(
+  entries: Map<string, number>,
+  ip: string,
+  observedAt: number,
+  maximum = MAX_LEARNED_PROCESS_ROUTE_IPS
+): void {
+  if (maximum <= 0) {
+    entries.clear();
+    return;
+  }
+  // Refresh insertion order so actively used destinations survive eviction.
+  entries.delete(ip);
+  entries.set(ip, observedAt);
+  while (entries.size > maximum) {
+    const oldest = entries.keys().next().value as string | undefined;
+    if (!oldest) {
+      break;
+    }
+    entries.delete(oldest);
+  }
+}
+
 function supportsDynamicProcessRouting(request: ConnectRequest, platform: NodeJS.Platform = process.platform): boolean {
   return platform === "win32" && request.routingMode === "selected-rules" && enabledProcessRuleNames(request.routingRules).size > 0;
 }
@@ -624,6 +940,7 @@ function enabledProcessRuleNames(rules: RoutingRule[]): Set<string> {
   return new Set(
     rules
       .filter((rule) => rule.enabled && rule.type === "process.name")
+      .filter((rule) => validateRoutingRuleValue(rule.type, rule.value).ok)
       .map((rule) => normalizeRuleValue("process.name", rule.value))
       .filter(Boolean)
   );

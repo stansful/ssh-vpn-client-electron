@@ -49,9 +49,12 @@ export function useLogsController({
     setFileLogBusy(true);
     api
       .readLogFile()
-      .then((log) => {
+      .then(async (log) => {
         setFileLog(log);
-        void navigator.clipboard.writeText(log || formatRuntimeDiagnostics(snapshot));
+        const copied = await api.copyText(log || formatRuntimeDiagnostics(snapshot));
+        if (!copied) {
+          throw new Error("Unable to copy diagnostics to the clipboard.");
+        }
       })
       .catch((error: unknown) => setNotice(toErrorMessage(error)))
       .finally(() => setFileLogBusy(false));

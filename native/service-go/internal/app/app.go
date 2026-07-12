@@ -21,12 +21,17 @@ type Options struct {
 }
 
 type App struct {
-	mu           sync.Mutex
-	authToken    string
-	driver       platform.Driver
-	status       RuntimeStatus
-	routingMode  routing.Mode
-	routingRules []routing.Rule
+	mu                   sync.Mutex
+	mutationMu           sync.Mutex
+	authToken            string
+	driver               platform.Driver
+	status               RuntimeStatus
+	routingMode          routing.Mode
+	routingRules         []routing.Rule
+	routingProxyDomains  []string
+	routingDirectDomains []string
+	checkEndpoint        string
+	shuttingDown         bool
 }
 
 func New(options Options) *App {
@@ -46,7 +51,7 @@ func New(options Options) *App {
 		ReconnectAttempt:    0,
 		Transport:           transport,
 		PlatformTarget:      driver.Capabilities().Target,
-		RealTunnelAvailable: driver.Capabilities().SSHCoreLinked,
+		RealTunnelAvailable: false,
 	}
 
 	return &App{
@@ -58,13 +63,32 @@ func New(options Options) *App {
 }
 
 func (a *App) HandleCommand(ctx context.Context, command protocol.Command) protocol.CommandResult {
+	if command.ProtocolVersion != protocol.Version {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, fmt.Errorf(
+			"unsupported service protocol version %d; expected %d",
+			command.ProtocolVersion,
+			protocol.Version,
+		))}
+	}
 	if err := a.authorize(command); err != nil {
 		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
+	}
+	if isStateChangingCommand(command.Type) {
+		a.mutationMu.Lock()
+		defer a.mutationMu.Unlock()
+		if a.shuttingDown && command.Type != "shutdown" {
+			return protocol.CommandResult{Response: protocol.Error(command.ID, errors.New("native service is shutting down"))}
+		}
 	}
 
 	switch command.Type {
 	case "get-status":
 		return a.ok(command.ID, a.currentStatus())
+	case "get-capabilities":
+		return a.ok(command.ID, map[string]any{
+			"protocolVersion": protocol.Version,
+			"capabilities":    a.driver.Capabilities(),
+		})
 	case "connect":
 		return a.handleConnect(ctx, command)
 	case "disconnect":
@@ -78,16 +102,29 @@ func (a *App) HandleCommand(ctx context.Context, command protocol.Command) proto
 	case "terminal-input":
 		return a.handleTerminalInput(command)
 	case "update-config":
-		return a.ok(command.ID, protocol.Accepted())
+		return a.handleUpdateConfig(command)
 	case "update-routing-rules":
 		return a.handleUpdateRoutingRules(command)
+	case "update-routing":
+		return a.handleUpdateRouting(command)
 	case "list-process-connections":
 		return a.handleListProcessConnections(ctx, command)
 	case "shutdown":
-		return a.ok(command.ID, protocol.Accepted(), diagnostic("info", "Native service shutdown requested."))
+		return a.handleShutdown(command)
 	default:
 		return protocol.CommandResult{Response: protocol.Error(command.ID, fmt.Errorf("unsupported service command %q", command.Type))}
 	}
+}
+
+func (a *App) Shutdown(ctx context.Context) error {
+	a.mutationMu.Lock()
+	defer a.mutationMu.Unlock()
+	if err := a.clearRoutingAndSetDisconnected(ctx, "Native service stopped."); err != nil {
+		a.setRoutingCleanupError(err)
+		return err
+	}
+	a.shuttingDown = true
+	return nil
 }
 
 func (a *App) handleListProcessConnections(ctx context.Context, command protocol.Command) protocol.CommandResult {
@@ -123,33 +160,20 @@ func (a *App) handleConnect(ctx context.Context, command protocol.Command) proto
 		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
 	}
 
-	routeRules := make([]platform.RoutingRule, 0, len(payload.RoutingRules))
-	for _, rule := range payload.RoutingRules {
-		routeRules = append(routeRules, platform.RoutingRule{
-			ID:      rule.ID,
-			Type:    string(rule.Type),
-			Value:   rule.Value,
-			Enabled: rule.Enabled,
-		})
-	}
-
-	routingErr := a.driver.ApplyRouting(ctx, platform.RoutingConfig{
-		Mode:          string(payload.RoutingMode),
-		Rules:         routeRules,
-		ProtectedHost: payload.Config.Host,
-		ProtectedPort: payload.Config.Port,
-		EnforceIPv4:   true,
-		EnforceIPv6:   true,
-		AllowUDP:      false,
-	})
+	// Routing must be the final step of a successful tunnel transaction. This
+	// binary has no live SSH engine, so fail closed and only clear stale routes.
+	routingErr := a.clearRouting(ctx)
 
 	a.mu.Lock()
 	a.routingMode = payload.RoutingMode
-	a.routingRules = payload.RoutingRules
+	a.routingRules = append([]routing.Rule(nil), payload.RoutingRules...)
+	a.routingProxyDomains = append([]string(nil), payload.RoutingProxyDomains...)
+	a.routingDirectDomains = append([]string(nil), payload.RoutingDirectDomains...)
+	a.checkEndpoint = payload.CheckEndpoint
 	a.status.State = "Error"
 	a.status.ActiveConfigID = payload.Config.ID
 	a.status.Message = "Native service refused to report a connected tunnel because the live SSH engine is not linked into this binary yet."
-	a.status.RealTunnelAvailable = a.driver.Capabilities().SSHCoreLinked
+	a.status.RealTunnelAvailable = false
 	status := a.status
 	a.mu.Unlock()
 
@@ -158,24 +182,40 @@ func (a *App) handleConnect(ctx context.Context, command protocol.Command) proto
 		diagnostic("error", "Native service reached routing/platform boundary, but live SSH/direct-tcpip/shell engine is unavailable in this binary."),
 	}
 	if routingErr != nil {
-		events = append(events, diagnostic("warning", "Routing driver did not apply OS interception: "+routingErr.Error()))
+		events = append(events, diagnostic("warning", "Unable to clear stale routing after failed connect: "+routingErr.Error()))
 	}
 
-	return a.ok(command.ID, status, events...)
+	return protocol.CommandResult{
+		Response: protocol.Error(command.ID, errors.New("native live SSH tunnel engine is unavailable")),
+		Events:   events,
+	}
 }
 
 func (a *App) handleDisconnect(ctx context.Context, command protocol.Command) protocol.CommandResult {
-	_ = a.driver.ClearRouting(ctx)
+	if err := a.clearRoutingAndSetDisconnected(ctx, "Disconnected."); err != nil {
+		status := a.setRoutingCleanupError(err)
+		return protocol.CommandResult{
+			Response: protocol.Error(command.ID, fmt.Errorf("clear routing: %w", err)),
+			Events:   []any{statusChanged(status), diagnostic("error", "Routing cleanup failed: "+err.Error())},
+		}
+	}
 
-	a.mu.Lock()
-	a.status.State = "Disconnected"
-	a.status.ActiveConfigID = ""
-	a.status.Message = "Disconnected."
-	a.status.ConnectedAt = ""
-	status := a.status
-	a.mu.Unlock()
-
+	status := a.currentStatus()
 	return a.ok(command.ID, status, statusChanged(status), diagnostic("info", "Tunnel state cleared."))
+}
+
+func (a *App) handleShutdown(command protocol.Command) protocol.CommandResult {
+	if err := a.clearRoutingAndSetDisconnected(context.Background(), "Native service stopped."); err != nil {
+		status := a.setRoutingCleanupError(err)
+		return protocol.CommandResult{
+			Response: protocol.Error(command.ID, fmt.Errorf("clear routing before shutdown: %w", err)),
+			Events:   []any{statusChanged(status), diagnostic("error", "Native service shutdown refused because routing cleanup failed: "+err.Error())},
+		}
+	}
+	a.shuttingDown = true
+	result := a.ok(command.ID, protocol.Accepted(), statusChanged(a.currentStatus()), diagnostic("info", "Native service shutdown requested."))
+	result.Shutdown = true
+	return result
 }
 
 func (a *App) handleCheckTunnel(command protocol.Command) protocol.CommandResult {
@@ -187,6 +227,9 @@ func (a *App) handleCheckTunnel(command protocol.Command) protocol.CommandResult
 	}
 	if strings.TrimSpace(payload.Endpoint) == "" {
 		return protocol.CommandResult{Response: protocol.Error(command.ID, errors.New("endpoint is required"))}
+	}
+	if len(payload.Endpoint) > 2048 {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, errors.New("endpoint is too long"))}
 	}
 
 	result := TunnelCheckResult{
@@ -205,7 +248,10 @@ func (a *App) handleOpenTerminal(command protocol.Command) protocol.CommandResul
 		Stream: "system",
 		Text:   "Native shell channel is unavailable until the live SSH engine is linked.\n",
 	}
-	return a.ok(command.ID, protocol.Accepted(), terminalOutput(line))
+	return protocol.CommandResult{
+		Response: protocol.Error(command.ID, errors.New("native SSH shell engine is unavailable")),
+		Events:   []any{terminalOutput(line)},
+	}
 }
 
 func (a *App) handleTerminalInput(command protocol.Command) protocol.CommandResult {
@@ -215,7 +261,23 @@ func (a *App) handleTerminalInput(command protocol.Command) protocol.CommandResu
 	if err := decodePayload(command.Payload, &payload); err != nil {
 		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
 	}
-	return a.ok(command.ID, protocol.Accepted(), diagnostic("warning", "Terminal input was rejected because no live SSH shell channel is active."))
+	return protocol.CommandResult{
+		Response: protocol.Error(command.ID, errors.New("native SSH shell engine is unavailable")),
+		Events:   []any{diagnostic("warning", "Terminal input was rejected because no live SSH shell channel is active.")},
+	}
+}
+
+func (a *App) handleUpdateConfig(command protocol.Command) protocol.CommandResult {
+	var payload struct {
+		Config SSHConfig `json:"config"`
+	}
+	if err := decodePayload(command.Payload, &payload); err != nil {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
+	}
+	if strings.TrimSpace(payload.Config.ID) == "" {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, errors.New("config id is required"))}
+	}
+	return a.ok(command.ID, protocol.Accepted())
 }
 
 func (a *App) handleUpdateRoutingRules(command protocol.Command) protocol.CommandResult {
@@ -226,12 +288,20 @@ func (a *App) handleUpdateRoutingRules(command protocol.Command) protocol.Comman
 		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
 	}
 
-	matcher := routing.NewMatcher(a.routingMode, payload.Rules)
-	summary := matcher.Summary()
+	a.mu.Lock()
+	mode := a.routingMode
+	proxyDomains := append([]string(nil), a.routingProxyDomains...)
+	a.mu.Unlock()
+	if err := validateRouting(mode, payload.Rules, proxyDomains); err != nil {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
+	}
 
 	a.mu.Lock()
-	a.routingRules = payload.Rules
+	a.routingRules = append([]routing.Rule(nil), payload.Rules...)
 	a.mu.Unlock()
+
+	matcher := routing.NewMatcher(mode, payload.Rules)
+	summary := matcher.Summary()
 
 	message := fmt.Sprintf("Service routing rules updated: enabled=%d domains=%d ips=%d processes=%d invalid=%d.",
 		summary.EnabledRules,
@@ -241,6 +311,83 @@ func (a *App) handleUpdateRoutingRules(command protocol.Command) protocol.Comman
 		summary.InvalidRules,
 	)
 	return a.ok(command.ID, protocol.Accepted(), diagnostic("info", message))
+}
+
+func (a *App) handleUpdateRouting(command protocol.Command) protocol.CommandResult {
+	var payload RoutingUpdatePayload
+	if err := decodePayload(command.Payload, &payload); err != nil {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
+	}
+	if err := validateRouting(payload.RoutingMode, payload.RoutingRules, payload.RoutingProxyDomains); err != nil {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
+	}
+
+	a.mu.Lock()
+	a.routingMode = payload.RoutingMode
+	a.routingRules = append([]routing.Rule(nil), payload.RoutingRules...)
+	a.routingProxyDomains = append([]string(nil), payload.RoutingProxyDomains...)
+	a.routingDirectDomains = append([]string(nil), payload.RoutingDirectDomains...)
+	a.checkEndpoint = payload.CheckEndpoint
+	a.mu.Unlock()
+
+	summary := routing.NewMatcher(payload.RoutingMode, payload.RoutingRules).Summary()
+	message := fmt.Sprintf(
+		"Service routing updated: mode=%s enabled=%d domains=%d ips=%d processes=%d invalid=%d proxyListDomains=%d directListDomains=%d.",
+		payload.RoutingMode,
+		summary.EnabledRules,
+		summary.DomainRules,
+		summary.IPRules,
+		summary.ProcessRules,
+		summary.InvalidRules,
+		len(payload.RoutingProxyDomains),
+		len(payload.RoutingDirectDomains),
+	)
+	return a.ok(command.ID, protocol.Accepted(), diagnostic("info", message))
+}
+
+func (a *App) clearRouting(ctx context.Context) error {
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	return a.driver.ClearRouting(cleanupCtx)
+}
+
+func (a *App) clearRoutingAndSetDisconnected(ctx context.Context, message string) error {
+	if err := a.clearRouting(ctx); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.status.State = "Disconnected"
+	a.status.ActiveConfigID = ""
+	a.status.Message = message
+	a.status.ConnectedAt = ""
+	a.status.RealTunnelAvailable = false
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *App) setRoutingCleanupError(err error) RuntimeStatus {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.status.State = "Error"
+	a.status.Message = "Routing cleanup failed: " + err.Error()
+	a.status.RealTunnelAvailable = false
+	return a.status
+}
+
+func cleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	// Route rollback must outlive a canceled request/service context, but remains
+	// bounded so shutdown cannot hang forever.
+	_ = parent
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+func isStateChangingCommand(commandType string) bool {
+	switch commandType {
+	case "connect", "disconnect", "open-terminal", "close-terminal", "terminal-input", "update-config", "update-routing-rules", "update-routing", "shutdown":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *App) ok(id string, payload any, events ...any) protocol.CommandResult {
@@ -270,17 +417,26 @@ func validateConnectPayload(payload ConnectPayload) error {
 	if strings.TrimSpace(payload.Config.Username) == "" {
 		return errors.New("config username is required")
 	}
-	if payload.RoutingMode == routing.ModeSelectedRules {
-		hasEnabled := false
-		for _, rule := range payload.RoutingRules {
-			if rule.Enabled {
-				hasEnabled = true
-				break
-			}
-		}
-		if !hasEnabled {
-			return errors.New("selected-rules mode requires at least one enabled routing rule")
+	return validateRouting(payload.RoutingMode, payload.RoutingRules, payload.RoutingProxyDomains)
+}
+
+func validateRouting(mode routing.Mode, rules []routing.Rule, proxyDomains []string) error {
+	if mode != routing.ModeProxyAll && mode != routing.ModeSelectedRules {
+		return fmt.Errorf("unsupported routing mode %q", mode)
+	}
+	if mode != routing.ModeSelectedRules {
+		return nil
+	}
+	// Count compiled rules, not merely enabled records. An enabled malformed IP
+	// or unknown rule type must not satisfy selected routing and silently turn
+	// into DIRECT-all behavior at the platform boundary.
+	if routing.NewMatcher(mode, rules).Summary().EnabledRules > 0 {
+		return nil
+	}
+	for _, domain := range proxyDomains {
+		if routing.ValidProxyDomain(domain) {
+			return nil
 		}
 	}
-	return nil
+	return errors.New("selected-rules mode requires at least one enabled routing rule or proxy-list domain")
 }

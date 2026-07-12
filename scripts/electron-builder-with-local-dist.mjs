@@ -1,6 +1,12 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const expectedElectronVersion = JSON.parse(
+  readFileSync(path.join(root, "node_modules", "electron", "package.json"), "utf8")
+).version;
 
 const platformMap = new Map([
   ["--win", "win32"],
@@ -12,21 +18,31 @@ const xrayPlatformMap = new Map([
   ["--mac", "macos"],
   ["--linux", "linux"]
 ]);
+const shadowDevBuildFlag = "--shadow-dev-build";
 
 const args = process.argv.slice(2);
 const platformFlag = args.find((arg) => platformMap.has(arg));
 const archFlag = args.find((arg) => arg === "--x64" || arg === "--arm64");
 const hasElectronDist = args.some((arg) => arg === "--config.electronDist" || arg.startsWith("--config.electronDist="));
-const builderArgs = [...args];
+const isShadowDevBuild = args.includes(shadowDevBuildFlag);
+const builderArgs = args.filter((arg) => arg !== shadowDevBuildFlag);
+
+if (isShadowDevBuild) {
+  builderArgs.push("--config.productName=Shadow SSH Dev");
+  builderArgs.push("--config.portable.artifactName=shadow-ssh-dev-${version}-windows-portable-${arch}.${ext}");
+}
 
 if (!hasElectronDist && platformFlag && archFlag) {
   const platform = platformMap.get(platformFlag);
   const arch = archFlag.slice(2);
-  const electronDist = path.join(".cache", `electron-${platform}-${arch}`);
-  if (existsSync(electronDist)) {
-    builderArgs.push(`--config.electronDist=${electronDist}`);
+  const cachedElectronDist = path.join(root, ".cache", `electron-${platform}-${arch}`);
+  const installedElectronDist = path.join(root, "node_modules", "electron", "dist");
+  if (hasExpectedElectronVersion(cachedElectronDist)) {
+    builderArgs.push(`--config.electronDist=${cachedElectronDist}`);
+  } else if (platform === process.platform && arch === process.arch && hasExpectedElectronVersion(installedElectronDist)) {
+    builderArgs.push(`--config.electronDist=${installedElectronDist}`);
   } else {
-    console.warn(`[electron-builder] Local Electron runtime not found at ${electronDist}; electron-builder may download it.`);
+    console.warn(`[electron-builder] Local Electron runtime not found for ${platform}/${arch}; electron-builder may download it.`);
   }
 }
 
@@ -34,10 +50,10 @@ if (platformFlag && archFlag) {
   const xrayPlatform = xrayPlatformMap.get(platformFlag);
   const arch = archFlag.slice(2);
   const executableName = platformFlag === "--win" ? "xray.exe" : "xray";
-  const runtimePath = path.join("resources", "xray", xrayPlatform, arch, executableName);
+  const runtimePath = path.join(root, "resources", "xray", xrayPlatform, arch, executableName);
   if (!existsSync(runtimePath)) {
     console.error([
-      `[electron-builder] Xray runtime is missing at ${runtimePath}.`,
+      `[electron-builder] Xray runtime is missing at ${path.relative(root, runtimePath)}.`,
       "The packaged Xray transport would fail at runtime without it.",
       platformFlag === "--win"
         ? "Run `npm run xray:download-win` before building Windows portable artifacts."
@@ -47,8 +63,13 @@ if (platformFlag && archFlag) {
   }
 }
 
-const builderBin = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "electron-builder.cmd" : "electron-builder");
-const child = spawn(builderBin, builderArgs, { stdio: "inherit", shell: false });
+const builderCli = path.join(root, "node_modules", "electron-builder", "cli.js");
+const child = spawn(process.execPath, [builderCli, ...builderArgs], { cwd: root, stdio: "inherit", shell: false });
+
+child.on("error", (error) => {
+  console.error(`[electron-builder] Unable to start: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+});
 
 child.on("exit", (code, signal) => {
   if (signal) {
@@ -57,3 +78,14 @@ child.on("exit", (code, signal) => {
   }
   process.exit(code ?? 1);
 });
+
+function hasExpectedElectronVersion(electronDist) {
+  if (!existsSync(electronDist)) {
+    return false;
+  }
+  try {
+    return readFileSync(path.join(electronDist, "version"), "utf8").trim() === expectedElectronVersion;
+  } catch {
+    return false;
+  }
+}

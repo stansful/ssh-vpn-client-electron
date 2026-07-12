@@ -1,5 +1,7 @@
 export type ChannelLifecycle = "opening" | "open" | "eof-sent" | "eof-received" | "closed";
 
+const MAXIMUM_OUTBOUND_CHANNEL_DATA_SIZE = 128 * 1024;
+
 export interface ChannelState {
   localId: number;
   remoteId?: number;
@@ -7,7 +9,11 @@ export interface ChannelState {
   lifecycle: ChannelLifecycle;
   localWindow: number;
   localWindowMaximum: number;
+  acknowledgedLocalBytes: number;
   remoteWindow: number;
+  localMaximumPacketSize: number;
+  remoteMaximumPacketSize?: number;
+  /** Effective remote maximum retained for backwards compatibility. */
   maximumPacketSize: number;
 }
 
@@ -24,7 +30,9 @@ export class ChannelStateManager {
       lifecycle: "opening",
       localWindow,
       localWindowMaximum: localWindow,
+      acknowledgedLocalBytes: 0,
       remoteWindow: 0,
+      localMaximumPacketSize: maximumPacketSize,
       maximumPacketSize
     };
     this.channels.set(localId, state);
@@ -36,9 +44,19 @@ export class ChannelStateManager {
     if (state.lifecycle !== "opening") {
       throw new Error(`Channel ${localId} is not opening.`);
     }
+    if (!Number.isInteger(remoteId) || remoteId < 0 || remoteId > 0xffff_ffff) {
+      throw new Error(`Channel ${localId} remote id is invalid.`);
+    }
+    if (!Number.isInteger(remoteWindow) || remoteWindow < 0 || remoteWindow > 0xffff_ffff) {
+      throw new Error(`Channel ${localId} remote window is invalid.`);
+    }
+    if (!Number.isInteger(maximumPacketSize) || maximumPacketSize <= 0 || maximumPacketSize > 0xffff_ffff) {
+      throw new Error(`Channel ${localId} remote maximum packet size is invalid.`);
+    }
     state.remoteId = remoteId;
     state.remoteWindow = remoteWindow;
-    state.maximumPacketSize = maximumPacketSize;
+    state.remoteMaximumPacketSize = maximumPacketSize;
+    state.maximumPacketSize = Math.min(maximumPacketSize, MAXIMUM_OUTBOUND_CHANNEL_DATA_SIZE);
     state.lifecycle = "open";
     return { ...state };
   }
@@ -59,6 +77,9 @@ export class ChannelStateManager {
     const state = this.require(localId);
     if (bytes < 0 || !Number.isInteger(bytes)) {
       throw new Error("Window bytes must be a non-negative integer.");
+    }
+    if (state.remoteWindow + bytes > 0xffff_ffff) {
+      throw new Error(`Channel ${localId} remote window overflow.`);
     }
     state.remoteWindow += bytes;
     return { ...state };
@@ -83,6 +104,29 @@ export class ChannelStateManager {
     }
     state.localWindow += bytes;
     return { ...state };
+  }
+
+  acknowledgeLocalData(localId: number, bytes: number): ChannelState {
+    const state = this.require(localId);
+    if (bytes < 0 || !Number.isInteger(bytes)) {
+      throw new Error("Acknowledged channel bytes must be a non-negative integer.");
+    }
+    const outstandingBytes = state.localWindowMaximum - state.localWindow - state.acknowledgedLocalBytes;
+    if (bytes > outstandingBytes) {
+      throw new Error(`Channel ${localId} acknowledged more data than it received.`);
+    }
+    state.acknowledgedLocalBytes += bytes;
+    return { ...state };
+  }
+
+  replenishAcknowledgedLocalWindow(localId: number): { state: ChannelState; bytesToAdd: number } {
+    const state = this.require(localId);
+    const bytesToAdd = state.acknowledgedLocalBytes;
+    if (bytesToAdd > 0) {
+      state.localWindow += bytesToAdd;
+      state.acknowledgedLocalBytes = 0;
+    }
+    return { state: { ...state }, bytesToAdd };
   }
 
   markEofSent(localId: number): ChannelState {

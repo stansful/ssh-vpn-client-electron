@@ -3,6 +3,7 @@ import { api } from "../api.js";
 import { toErrorMessage } from "../lib/labels.js";
 import { emptyConfigDraft, emptyKeyDraft, type ConfigDraft, type KeyDraft, type View } from "../types.js";
 import type { AppSnapshot, SshConfig, SshKeyMetadata, UpsertSshKeyInput } from "../../shared/types.js";
+import { validateSshServerFingerprint } from "../../shared/validation.js";
 
 export function useSshEntitiesController({
   setSnapshot,
@@ -10,7 +11,7 @@ export function useSshEntitiesController({
   setView
 }: {
   setSnapshot: Dispatch<SetStateAction<AppSnapshot | undefined>>;
-  setBusy: Dispatch<SetStateAction<boolean>>;
+  setBusy: (value: boolean) => void;
   setView: Dispatch<SetStateAction<View>>;
 }) {
   const [configDraft, setConfigDraft] = useState<ConfigDraft>(emptyConfigDraft);
@@ -42,8 +43,13 @@ export function useSshEntitiesController({
 
   function saveConfig(event: FormEvent): void {
     event.preventDefault();
-    setBusy(true);
     setConfigModalError("");
+    const fingerprintValidation = validateSshServerFingerprint(configDraft.expectedServerFingerprint);
+    if (!fingerprintValidation.ok) {
+      setConfigModalError(fingerprintValidation.message ?? "Invalid SSH server fingerprint.");
+      return;
+    }
+    setBusy(true);
     void api
       .upsertConfig({
         ...configDraft,

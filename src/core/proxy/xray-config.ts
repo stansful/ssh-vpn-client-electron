@@ -29,6 +29,8 @@ interface VmessPayload {
 
 export function buildXrayConfig(input: XrayConfigInput): string {
   const outbound = buildOutbound(input.rawUri);
+  // SOCKS/HTTP already supplies the destination and this client has a single
+  // outbound. Omitting Xray sniffing avoids redundant HTTP/TLS/QUIC DPI work.
   return JSON.stringify({
     log: { loglevel: "warning" },
     inbounds: [
@@ -38,12 +40,10 @@ export function buildXrayConfig(input: XrayConfigInput): string {
         listen: input.socksHost,
         port: input.socksPort,
         settings: {
-          udp: true,
+          // The supported desktop interception path is TCP-only. Do not keep
+          // an unused UDP association path alive inside Xray.
+          udp: false,
           auth: "noauth"
-        },
-        sniffing: {
-          enabled: true,
-          destOverride: ["http", "tls", "quic"]
         }
       },
       ...(input.httpHost && input.httpPort
@@ -53,11 +53,7 @@ export function buildXrayConfig(input: XrayConfigInput): string {
               protocol: "http",
               listen: input.httpHost,
               port: input.httpPort,
-              settings: {},
-              sniffing: {
-                enabled: true,
-                destOverride: ["http", "tls"]
-              }
+              settings: {}
             }
           ]
         : [])

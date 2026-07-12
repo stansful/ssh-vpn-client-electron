@@ -11,10 +11,17 @@ describe("xray config builder", () => {
         httpHost: "127.0.0.1",
         httpPort: 19081
       })
-    ) as { inbounds: Array<{ protocol: string; port: number }>; outbounds: Array<{ protocol: string; streamSettings?: { network?: string } }> };
+    ) as {
+      inbounds: Array<{ protocol: string; port: number; settings?: { udp?: boolean }; sniffing?: unknown }>;
+      outbounds: Array<{ protocol: string; streamSettings?: { network?: string } }>;
+    };
 
     expect(config.inbounds[0]).toMatchObject({ protocol: "socks", port: 19080 });
     expect(config.inbounds[1]).toMatchObject({ protocol: "http", port: 19081 });
+    expect(config.inbounds[0]?.settings?.udp).toBe(false);
+    // PAC/SOCKS already supplies the destination and this client has a single
+    // outbound, so protocol sniffing would only add per-connection DPI work.
+    expect(config.inbounds.every((inbound) => inbound.sniffing === undefined)).toBe(true);
     expect(config.outbounds[0]).toMatchObject({ protocol: "vless" });
     expect(config.outbounds[0]?.streamSettings?.network).toBe("ws");
   });

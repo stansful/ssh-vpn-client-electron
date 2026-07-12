@@ -14,7 +14,7 @@ export function useXrayController({
   setNotice: Dispatch<SetStateAction<string>>;
   updateSettings: (patch: Partial<AppSettings>) => void;
   commitSnapshotAction: (action: () => Promise<AppSnapshot>, successMessage?: string) => Promise<void>;
-  setBusy: Dispatch<SetStateAction<boolean>>;
+  setBusy: (value: boolean) => void;
 }) {
   async function upsertProxyProfile(input: UpsertProxyProfileInput): Promise<void> {
     await commitSnapshotAction(() => api.upsertProxyProfile(input), "Xray profile saved.");

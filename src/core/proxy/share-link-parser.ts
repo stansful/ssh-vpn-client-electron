@@ -3,6 +3,7 @@ import type { ParsedProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport }
 
 const MAX_LINK_LENGTH = 64 * 1024;
 const MAX_IMPORT_LINES = 10_000;
+const MAX_IMPORT_TEXT_LENGTH = 2 * 1024 * 1024;
 
 interface VmessPayload {
   ps?: string;
@@ -20,6 +21,13 @@ export interface ProxyImportParseResult {
 }
 
 export function parseProxyShareLinks(text: string): ProxyImportParseResult {
+  if (text.length > MAX_IMPORT_TEXT_LENGTH) {
+    return {
+      profiles: [],
+      errors: [`Import text is longer than ${MAX_IMPORT_TEXT_LENGTH} characters.`],
+      skipped: 0
+    };
+  }
   const lines = text.split(/\r?\n/u);
   const errors: string[] = [];
   const profiles: ParsedProxyProfile[] = [];
@@ -50,6 +58,9 @@ export function parseProxyShareLinks(text: string): ProxyImportParseResult {
 }
 
 export function parseProxyShareLink(rawUri: string): ParsedProxyProfile {
+  if (rawUri.length > MAX_LINK_LENGTH) {
+    throw new Error(`Proxy link is longer than ${MAX_LINK_LENGTH} characters.`);
+  }
   const protocol = detectProtocol(rawUri);
   if (protocol === "vmess") {
     return parseVmess(rawUri);

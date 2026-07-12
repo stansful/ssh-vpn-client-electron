@@ -169,7 +169,7 @@ export function AppViews({
         proxyList={store.routingProxyList}
         directList={store.routingDirectList}
         processSearch={routing.processSearch}
-        enabledCount={routing.routingDraft.filter((rule) => rule.enabled).length}
+        enabledCount={routing.enabledCount}
         onRuleTabChange={routing.setRuleTab}
         onRuleSearchChange={routing.setRuleSearch}
         onRuleValueChange={routing.setRuleValue}

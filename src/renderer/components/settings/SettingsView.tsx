@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import type { AppSettings, AppSnapshot, DesktopPlatform, RoutingMode, ThemeMode } from "../../../shared/types.js";
 import { Segmented } from "../ui/index.js";
 import { ThemeDesigner } from "./ThemeDesigner.js";
@@ -25,7 +26,10 @@ export function SettingsView({
   onUpdateSettings: (patch: Partial<AppSettings>) => void;
   platform: DesktopPlatform | undefined;
 }): JSX.Element {
-  const enabledRules = store.routingRules.filter((rule) => rule.enabled).length;
+  const enabledRules = useMemo(
+    () => store.routingRules.reduce((count, rule) => count + (rule.enabled ? 1 : 0), 0),
+    [store.routingRules]
+  );
   const enabledProxyListDomains = store.routingProxyList.enabled ? store.routingProxyList.domains.length : 0;
   const windowsStartupAvailable = platform === "windows";
 
@@ -102,6 +106,15 @@ export function SettingsView({
           <label className="switch-row">
             <input
               type="checkbox"
+              disabled={!store.settings.closeToTrayEnabled}
+              checked={store.settings.closeToTrayEnabled && store.settings.releaseRendererInTrayEnabled}
+              onChange={(event) => onUpdateSettings({ releaseRendererInTrayEnabled: event.target.checked })}
+            />
+            <span>Release interface memory after 30 seconds in tray</span>
+          </label>
+          <label className="switch-row">
+            <input
+              type="checkbox"
               disabled={!windowsStartupAvailable}
               checked={store.settings.startWithWindowsInTray}
               onChange={(event) => onUpdateSettings({ startWithWindowsInTray: event.target.checked })}
@@ -109,6 +122,11 @@ export function SettingsView({
             <span>Start with Windows in tray</span>
           </label>
         </div>
+        {store.settings.closeToTrayEnabled && store.settings.releaseRendererInTrayEnabled && (
+          <div className="warning-row spaced">
+            Unsaved form edits are discarded after 30 seconds in the tray. The active tunnel stays connected and the interface reloads its latest saved state when reopened.
+          </div>
+        )}
       </section>
 
       <section className="panel">

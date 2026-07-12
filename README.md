@@ -6,6 +6,9 @@ The default app path uses the built-in live SSH service in the Electron main pro
 connection setup, KEX, host-key fingerprint verification, password/private-key auth, keepalive, direct-tcpip checks,
 and shell channel terminal IO through the custom SSH core.
 
+An OpenSSH `SHA256:...` server fingerprint can be pinned optionally. Leaving it blank connects immediately after the
+SSH key-exchange signature is verified, matching the default connection workflow.
+
 A native service binary also exists for Windows/macOS/Linux x64/arm64 packaging and Windows Service Control Manager
 tests. Use `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1` when you explicitly want Electron to start that native service
 binary instead of the built-in live SSH service.
@@ -14,7 +17,7 @@ binary instead of the built-in live SSH service.
 
 - Windows 10/11 for Windows EXE validation.
 - PowerShell 5.1+ or PowerShell 7+.
-- Node.js 20, 22, or 24.
+- Node.js 22.12+ or 24+ (matching the Electron 42 build-tool requirement).
 - npm 10+.
 - Go 1.23+ for production packaging, because native service binaries are rebuilt for Windows/macOS/Linux x64/arm64
   before packaged artifacts are produced.
@@ -72,7 +75,9 @@ On macOS/Linux the default endpoint is a Unix socket under `SHADOW_SSH_RUNTIME_D
 and adds a startup diagnostic warning.
 
 Set `SHADOW_SSH_SERVICE_TOKEN` in both Electron and the service process to require a shared local command token on the
-IPC protocol. Windows named-pipe ACL hardening still needs validation in the native Windows service.
+IPC protocol. The Windows installer pins the named-pipe ACL to the installing user's SID (plus LocalSystem and
+administrators). Set `SHADOW_SSH_ALLOWED_CLIENT_SID` before `npm run service:install` only when installation is run
+under a different administrator account than the desktop user.
 
 ## Build
 
@@ -186,7 +191,8 @@ release/shadow-ssh-0.1.0-linux-portable-arm64.AppImage
 If a signing certificate is configured through Electron Builder environment variables such as `CSC_LINK` and
 `CSC_KEY_PASSWORD`, production packaging will use it.
 
-The canonical app icon is `icon.svg`; generated package icons live in `resources/icons/`.
+The canonical app icon is `icon.svg`; generated package icons live in `resources/icons/`. macOS uses a separate
+16x16/32x32 monochrome template image for the menu bar so the system can tint it correctly in light and dark modes.
 
 Development EXE:
 
@@ -225,8 +231,8 @@ The repository includes service management scaffolding:
 .\scripts\uninstall-service.ps1
 ```
 
-`SHADOW_SSH_SERVICE_EXE` may point to a native service executable. Without it, the scripts expect
-`native\windows\x64\shadow-ssh-service.exe`.
+`SHADOW_SSH_SERVICE_EXE` may point to a native service executable. Without it, the installer selects
+`native\windows\x64\shadow-ssh-service.exe` or `native\windows\arm64\shadow-ssh-service.exe` from the current OS architecture.
 
 Check code signing variables:
 
@@ -239,6 +245,10 @@ Check code signing variables:
 Diagnostics are available from the main screen under the Diagnostics panel. The expanded/collapsed preference is
 persisted. Logs are reset on a new user Connect action and can be copied with Copy logs.
 
+If the initial state cannot be loaded, the startup screen shows the IPC/preload error and a Retry button instead of
+remaining on `Loading Shadow SSH...`. On Windows, the startup log is `%APPDATA%\Shadow SSH\logs\main.log`; successful
+startup contains `Renderer snapshot IPC handshake completed` and `startupState=ready`.
+
 Diagnostics must not include:
 
 - SSH passwords;
@@ -246,6 +256,33 @@ Diagnostics must not include:
 - private key passphrases;
 - terminal commands;
 - terminal output.
+
+## Client resource and power policy
+
+The client keeps the active SSH/Xray data path independent from its power policy, so battery and thermal state do not
+throttle tunnel throughput. Only low-priority UI and process-routing discovery work is reduced:
+
+- a Windows login start in the tray does not create a Chromium renderer until the window is first opened;
+- after 30 seconds in the tray, the renderer is released by default to return its Chromium/React memory to the OS;
+  the SSH/Xray services keep running in the main process and the window is recreated on demand (unsaved form input is
+  discarded; the behavior can be disabled in Settings);
+- hidden/minimized renderers receive no streaming terminal or diagnostic IPC and resynchronize from a bounded snapshot
+  when shown again;
+- process-name routing refreshes every 30 seconds with a foreground window on AC power, every 60 seconds in the
+  background, and every 120 seconds on battery or when the OS reports thermal/CPU pressure;
+- SSH keepalive and time-based rekey share one deadline timer, while byte-based rekey is checked on active traffic and
+  causes no idle polling;
+- accepted SSH upload frames are pipelined through a bounded 4 MiB socket buffer instead of waiting for one
+  Windows write callback per packet, while a real full buffer still pauses on `drain`;
+- loopback proxy sockets use native inactivity deadlines and no redundant TCP keepalive probes;
+- terminal history is capped at 2 MiB in the main process and at 1 MiB in the visible DOM; large routing/profile lists
+  are rendered in explicit pages; live diagnostics are capped at 1 MiB in aggregate and 64 KiB per message;
+- routing lookups and DNS/process caches use bounded indexes instead of repeated full scans, while stalled proxy queues,
+  persisted stores, and profile/domain collections have explicit memory and disk safety limits;
+- update metadata and binary downloads bypass the renderer/web cache, avoiding duplicate cached copies on disk.
+
+The renderer keeps Electron background throttling enabled, omits unused WebGL, and avoids continuous hidden animation
+or backdrop-blur composition. The single-outbound Xray configuration also omits redundant HTTP/TLS/QUIC sniffing.
 
 ## Storage
 
@@ -301,6 +338,11 @@ Connect without enabled rules.
 
 The default live SSH service starts a local HTTP/SOCKS listener after SSH auth succeeds. Traffic accepted by that
 listener is forwarded through SSH `direct-tcpip` channels.
+
+The Windows system-proxy/PAC path cannot attach a private credential to each loopback proxy request, so the ephemeral
+HTTP/SOCKS listener is loopback-only but unauthenticated. On a shared/RDP host, another local OS user may be able to
+discover and use that port; use this portable backend only with trusted local accounts. Strict per-user isolation
+requires a privileged WFP dataplane, which is not bundled here.
 
 On Windows, the app applies user-level system proxy settings while connected and restores the previous settings on
 Disconnect/app quit:

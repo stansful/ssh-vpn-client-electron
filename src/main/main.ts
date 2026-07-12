@@ -1,14 +1,15 @@
-import { app, BrowserWindow, clipboard, ipcMain, Menu, shell } from "electron";
+import { app, BrowserWindow, clipboard, ipcMain, Menu, powerMonitor, session, shell, webContents, webFrameMain } from "electron";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { AppStorage } from "./storage/app-storage.js";
 import { listActiveProcesses } from "./processes.js";
 import { createPlatformTarget, nativeServiceExists, resolveNativeServicePath } from "./platform/targets.js";
 import { createDefaultRuntimeStatus, RUSSIA_INSIDE_PROXY_LIST_URL, RUSSIA_OUTSIDE_DIRECT_LIST_URL } from "../shared/defaults.js";
-import { IPC_CHANNELS, type ServiceEvent } from "../shared/ipc.js";
+import { IPC_CHANNELS, type RendererEvent, type ServiceEvent } from "../shared/ipc.js";
 import { parseDomainProxyList } from "../core/routing/domain-proxy-list.js";
+import { recoverWindowsSystemProxy, WindowsSystemProxyManager } from "../core/network/windows-system-proxy.js";
 import { LocalIpcServiceBridge } from "../service/local-ipc-client.js";
 import { defaultServiceEndpoint } from "../service/local-ipc-protocol.js";
 import { NativeProcessServiceBridge } from "../service/native-process-client.js";
@@ -17,10 +18,29 @@ import { XrayServiceBridge } from "../service/xray-service.js";
 import { createMainWindow } from "./app/main-window.js";
 import { resolveUserDataPath, resolveXrayExecutablePath } from "./app/paths.js";
 import { PortableUpdateController } from "./app/portable-update-controller.js";
+import { RotatingFileLog } from "./app/rotating-file-log.js";
+import { hasSelectedRoutingTargets, routingMutationAction } from "./app/routing-targets.js";
+import { acquireSingleInstanceLock, waitForSecondaryInstanceExit } from "./app/single-instance.js";
+import { TransportMutationCoordinator } from "./app/transport-mutation-coordinator.js";
 import { refreshPublicProxyProfiles } from "./app/public-proxy-refresh.js";
-import { formatError, formatRuntimePath as formatRuntimePathValue } from "./app/runtime-format.js";
+import {
+  formatError,
+  formatRuntimePath as formatRuntimePathValue,
+  formatRuntimeUrl as formatRuntimeUrlValue
+} from "./app/runtime-format.js";
+import { assessRendererIpcTrust } from "./app/renderer-security.js";
+import { TerminalOutputBatcher } from "./app/terminal-output-batcher.js";
 import { TrayController, resolveTrayIconPaths } from "./app/tray.js";
+import { shouldDeliverRendererEvent, SystemEnergyPolicy, type ThermalState } from "./app/energy-policy.js";
 import { GITHUB_REPOSITORY_URL, ROUTING_DOMAIN_LIST_SOURCE_URL } from "../shared/links.js";
+import { fetchTextWithLimit as fetchBoundedText, type FetchImplementation } from "../shared/http-fetch.js";
+import {
+  appendBoundedDiagnosticEntries,
+  MAX_DIAGNOSTICS_HISTORY_BYTES,
+  MAX_DIAGNOSTICS_HISTORY_ENTRIES,
+  normalizeDiagnosticEntry
+} from "../shared/diagnostics-history.js";
+import { appendBoundedTerminalLine } from "../shared/terminal-history.js";
 import type {
   AppSettings,
   AppSnapshot,
@@ -43,7 +63,7 @@ import type { ServiceBridge } from "../service/service-bridge.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, "..", "..");
 const rendererDist = path.join(__dirname, "..", "renderer");
-const preloadPath = path.join(__dirname, "..", "preload", "preload.js");
+const preloadPath = path.join(__dirname, "..", "preload", "preload.mjs");
 const iconPath = app.isPackaged ? path.join(rendererDist, "icon.svg") : path.join(projectRoot, "icon.svg");
 const runtimeFormatOptions = { packaged: app.isPackaged, resourcesPath: process.resourcesPath };
 const trayIconPaths = resolveTrayIconPaths({ packaged: app.isPackaged, projectRoot, resourcesPath: process.resourcesPath });
@@ -56,14 +76,20 @@ const xrayRuntimeDataPath = path.join(explicitUserDataPath, "xray");
 const updateDownloadPath = path.join(explicitUserDataPath, "updates");
 const DEFAULT_WINDOW_WIDTH = 980;
 const DEFAULT_WINDOW_HEIGHT = 680;
-const MAX_DIAGNOSTICS_IN_MEMORY = 500;
-const MAX_TERMINAL_LINES_IN_MEMORY = 2000;
 const START_MINIMIZED_TO_TRAY_ARG = "--shadow-ssh-start-minimized-to-tray";
 const ROUTING_PROXY_LIST_TIMEOUT_MS = 15_000;
 const MAX_ROUTING_PROXY_LIST_BYTES = 2 * 1024 * 1024;
+const MAX_MAIN_LOG_BYTES = 5 * 1024 * 1024;
+const MAX_MAIN_LOG_READ_BYTES = 1024 * 1024;
+const MAIN_LOG_BACKUP_COUNT = 2;
+const MAX_CLIPBOARD_TEXT_CHARACTERS = 2 * 1024 * 1024;
+const MAX_TERMINAL_INPUT_CHARACTERS = 64 * 1024;
 
 const formatRuntimePath = (value: string): string => formatRuntimePathValue(runtimeFormatOptions, value);
+const formatRuntimeUrl = (value: string): string => formatRuntimeUrlValue(runtimeFormatOptions, value);
 const startMinimizedToTray = process.argv.includes(START_MINIMIZED_TO_TRAY_ARG);
+const electronSessionFetch: FetchImplementation = (input, init) => session.defaultSession.fetch(input, init);
+const trustedRendererEntryUrl = process.env.VITE_DEV_SERVER_URL ?? pathToFileURL(path.join(rendererDist, "index.html")).href;
 
 let runtime: RuntimeStatus;
 let diagnostics: DiagnosticsEntry[] = [];
@@ -76,12 +102,57 @@ let fileLoggingEnabled = true;
 let loggingMasterEnabled = true;
 let applicationQuitting = false;
 let activeTransport: "ssh" | "xray" = "ssh";
-const portableUpdates = new PortableUpdateController(updateDownloadPath);
+let storageInitialized = false;
+let windowShowRequested = false;
+let windowCreationAllowed = false;
+let mainWindowCreation: Promise<void> | undefined;
+let applicationServicesReadyResolved = false;
+let applicationServicesInitialization: Promise<void> | undefined;
+let rejectedRendererIpcReported = false;
+let rendererSnapshotHandshakeReported = false;
+const trustedRendererWebContentsIds = new Set<number>();
+let resolveApplicationServicesReady!: () => void;
+const applicationServicesReady = new Promise<void>((resolve) => {
+  resolveApplicationServicesReady = resolve;
+});
+const mainLogger = new RotatingFileLog(mainLogPath, {
+  maxFileBytes: MAX_MAIN_LOG_BYTES,
+  maxReadBytes: MAX_MAIN_LOG_READ_BYTES,
+  backupCount: MAIN_LOG_BACKUP_COUNT
+});
+const sharedSystemProxy = new WindowsSystemProxyManager({ pacDirectory: routingDataPath });
+const transportMutations = new TransportMutationCoordinator();
+const portableUpdates = new PortableUpdateController(
+  updateDownloadPath,
+  (download) => broadcast({ type: "update-download-changed", download }),
+  electronSessionFetch
+);
+const terminalOutputBatcher = new TerminalOutputBatcher<"ssh" | "xray">(({ source, lines, droppedBytes }) => {
+  if (source !== activeTransport) {
+    return;
+  }
+  const output = [...lines];
+  if (droppedBytes > 0) {
+    output.push({
+      id: randomUUID(),
+      at: new Date().toISOString(),
+      stream: "system",
+      text: `\n[terminal output truncated: ${droppedBytes} UTF-8 bytes exceeded the renderer rate limit]\n`
+    });
+  }
+  for (const line of output) {
+    terminal = appendBoundedTerminalLine(terminal, line);
+    broadcast({ type: "terminal-output", line });
+  }
+});
 
 app.setName(appDisplayName);
 registerProcessErrorHandlers();
 await preloadLoggingPreference();
 await ensureExplicitUserDataPath();
+if (!acquireSingleInstanceLock(app, { userDataPath: explicitUserDataPath })) {
+  await waitForSecondaryInstanceExit();
+}
 await writeMainLog(`Main module loaded. pid=${process.pid}, platform=${process.platform}, arch=${process.arch}, userData=${explicitUserDataPath}`);
 
 await app.whenReady();
@@ -91,6 +162,31 @@ await writeMainLog(
 );
 
 const platformTarget = createPlatformTarget();
+const systemEnergyPolicy = new SystemEnergyPolicy({
+  onBatteryPower: powerMonitor.isOnBatteryPower(),
+  thermalState: process.platform === "darwin" ? powerMonitor.getCurrentThermalState() : "unknown"
+});
+let systemSessionActive = true;
+powerMonitor.on("on-battery", () => systemEnergyPolicy.setOnBatteryPower(true));
+powerMonitor.on("on-ac", () => systemEnergyPolicy.setOnBatteryPower(false));
+powerMonitor.on("suspend", () => {
+  systemSessionActive = false;
+});
+powerMonitor.on("resume", () => {
+  systemSessionActive = true;
+});
+if (process.platform === "darwin") {
+  powerMonitor.on("thermal-state-change", ({ state }) => systemEnergyPolicy.setThermalState(state as ThermalState));
+}
+if (process.platform === "darwin" || process.platform === "win32") {
+  powerMonitor.on("speed-limit-change", ({ limit }) => systemEnergyPolicy.setCpuSpeedLimitPercent(limit));
+  powerMonitor.on("lock-screen", () => {
+    systemSessionActive = false;
+  });
+  powerMonitor.on("unlock-screen", () => {
+    systemSessionActive = true;
+  });
+}
 const nativeBinaryAvailable = nativeServiceExists(projectRoot, platformTarget);
 runtime = {
   ...createDefaultRuntimeStatus(platformTarget),
@@ -108,7 +204,8 @@ const xrayService = new XrayServiceBridge(
     message: "Xray transport is ready."
   },
   {
-    pacDirectory: path.join(routingDataPath, "xray"),
+    systemProxy: sharedSystemProxy,
+    processRoutingRefreshIntervalMs: currentProcessRoutingRefreshIntervalMs,
     runtimeDirectory: xrayRuntimeDataPath,
     executablePath: resolveXrayExecutablePath({
       packaged: app.isPackaged,
@@ -121,52 +218,115 @@ const xrayEventUnsubscribe = xrayService.onEvent(handleXrayServiceEvent);
 const trayController = new TrayController({
   appName: appDisplayName,
   iconPaths: trayIconPaths,
-  isCloseToTrayEnabled: () => storage.getStore().settings.closeToTrayEnabled,
-  isTrayRequired: () => startMinimizedToTray || storage.getStore().settings.closeToTrayEnabled,
+  isCloseToTrayEnabled: () => storage.getSettings().closeToTrayEnabled,
+  isRendererReleaseEnabled: () => storage.getSettings().releaseRendererInTrayEnabled,
+  isTrayRequired: () => startMinimizedToTray || storage.getSettings().closeToTrayEnabled,
   isQuitting: () => applicationQuitting,
+  onIconLoaded: ({ width, height, scaleFactors, template }) => {
+    void writeMainLog(
+      `Tray icon loaded. size=${width}x${height}, scaleFactors=${scaleFactors.join(",") || "none"}, template=${template}`
+    );
+  },
+  onShowRequested: requestWindowShow,
   onQuit: () => {
     applicationQuitting = true;
+    trayController.prepareForQuit();
     app.quit();
   }
 });
+app.on("second-instance", () => {
+  if (BrowserWindow.getAllWindows().length > 0) {
+    trayController.showWindow();
+  } else {
+    requestWindowShow();
+  }
+});
 
+await initializeApplicationStorage();
+await restoreStaleWindowsProxyState();
 registerIpcHandlers();
-await createWindow();
-void initializeApplicationServices();
+windowCreationAllowed = true;
+// A minimized startup can omit Chromium entirely. If tray creation failed,
+// fall back to a visible window so the application never becomes unreachable.
+if (!startMinimizedToTray || !trayController.isCreated) {
+  await createWindow();
+}
+if (windowShowRequested) {
+  windowShowRequested = false;
+  requestWindowShow();
+}
+if (storageInitialized) {
+  applicationServicesInitialization = initializeApplicationServices();
+  void applicationServicesInitialization;
+} else {
+  markApplicationServicesReady();
+}
 
 app.on("activate", () => {
   const windows = BrowserWindow.getAllWindows();
   if (windows.length > 0) {
     trayController.showWindow();
   } else {
-    void createWindow();
+    requestWindowShow();
   }
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin" && !storage.getStore().settings.closeToTrayEnabled) {
+  if (process.platform !== "darwin" && (!storage.getSettings().closeToTrayEnabled || !trayController.isCreated)) {
     app.quit();
   }
 });
 
 let serviceDisposeStarted = false;
+let allowFinalQuit = false;
 app.on("before-quit", (event) => {
   applicationQuitting = true;
-  if (serviceDisposeStarted) {
+  trayController.prepareForQuit();
+  if (allowFinalQuit) {
     return;
   }
   event.preventDefault();
+  if (serviceDisposeStarted) {
+    return;
+  }
   serviceDisposeStarted = true;
-  void Promise.all([service.dispose?.() ?? Promise.resolve(), xrayService.dispose()]).finally(() => {
-    trayController.destroy();
-    serviceEventUnsubscribe?.();
-    xrayEventUnsubscribe?.();
-    app.quit();
+  transportMutations.stopAcceptingIntents();
+  // Release queued intents immediately. Shutdown still awaits the complete
+  // initialization promise below; bridge connect/request operations have
+  // their own deadlines, and a late acquired service is disposed before exit.
+  markApplicationServicesReady();
+  void enqueueTransportMutation(async () => {
+    const cleanups: Array<{ label: string; run: () => Promise<void> }> = [
+      { label: "active SSH service", run: async () => service.dispose?.() },
+      { label: "Xray service", run: async () => xrayService.dispose() },
+      { label: "service initialization", run: waitForApplicationServicesInitializationOnShutdown }
+    ];
+    const results = await Promise.allSettled(cleanups.map(({ run }) => run()));
+    for (const [index, result] of results.entries()) {
+      if (result.status === "rejected") {
+        await writeMainLog(`Shutdown cleanup failed for ${cleanups[index].label}: ${formatError(result.reason)}`);
+      }
+    }
+    // Close only after cleanup diagnostics have been appended. The logger can
+    // otherwise reopen its lazy handle for a late failure message.
+    await mainLogger.close().catch(() => undefined);
+  }).finally(() => {
+    try {
+      trayController.destroy();
+      serviceEventUnsubscribe?.();
+      xrayEventUnsubscribe?.();
+    } finally {
+      allowFinalQuit = true;
+      app.quit();
+    }
   });
 });
 
 async function createWindow(): Promise<void> {
-  await createMainWindow({
+  if (mainWindowCreation) {
+    return mainWindowCreation;
+  }
+  const creation = createMainWindow({
     ...runtimeFormatOptions,
     appName: app.getName(),
     rendererDist,
@@ -174,13 +334,54 @@ async function createWindow(): Promise<void> {
     iconPath,
     width: DEFAULT_WINDOW_WIDTH,
     height: DEFAULT_WINDOW_HEIGHT,
-    startHidden: startMinimizedToTray,
+    startHidden: false,
     devServerUrl: process.env.VITE_DEV_SERVER_URL,
+    onCreated: (window) => {
+      const webContentsId = window.webContents.id;
+      trustedRendererWebContentsIds.add(webContentsId);
+      window.once("closed", () => trustedRendererWebContentsIds.delete(webContentsId));
+    },
     onClosed: () => undefined,
     onClose: (event, window) => trayController.handleWindowClose(event, window),
     appendError,
     writeLog: writeMainLog
+  }).then(() => undefined);
+  mainWindowCreation = creation;
+  try {
+    await creation;
+  } finally {
+    if (mainWindowCreation === creation) {
+      mainWindowCreation = undefined;
+    }
+  }
+}
+
+function requestWindowShow(): void {
+  if (!windowCreationAllowed) {
+    windowShowRequested = true;
+    return;
+  }
+  void showOrCreateWindow().catch((error: unknown) => {
+    const message = `Unable to show application window: ${formatError(error)}`;
+    appendError(message);
+    void writeMainLog(message);
   });
+}
+
+async function showOrCreateWindow(): Promise<void> {
+  if (!BrowserWindow.getAllWindows().some((window) => !window.isDestroyed())) {
+    await createWindow();
+  }
+  trayController.showWindow();
+}
+
+function currentProcessRoutingRefreshIntervalMs(): number {
+  const hasForegroundWindow =
+    systemSessionActive &&
+    BrowserWindow.getAllWindows().some(
+      (window) => !window.isDestroyed() && window.isVisible() && !window.isMinimized()
+    );
+  return systemEnergyPolicy.processRoutingRefreshIntervalMs(hasForegroundWindow);
 }
 
 function registerProcessErrorHandlers(): void {
@@ -199,11 +400,6 @@ function registerProcessErrorHandlers(): void {
 
 async function initializeApplicationServices(): Promise<void> {
   try {
-    await writeMainLog("Initializing storage.");
-    await storage.init();
-    applyLoggingSettings(storage.getStore().settings);
-    syncWindowsStartupSetting(storage.getStore().settings);
-    trayController.sync();
     const initialRuntime: RuntimeStatus = {
       ...createDefaultRuntimeStatus(platformTarget),
       realTunnelAvailable: false,
@@ -213,7 +409,13 @@ async function initializeApplicationServices(): Promise<void> {
         : "Live SSH service is active. Native service binary is missing."
     };
     const next = await createServiceBridge(initialRuntime);
+    if (applicationQuitting) {
+      await next.service.dispose?.();
+      markApplicationServicesReady();
+      return;
+    }
     activateService(next.service);
+    markApplicationServicesReady();
     if (next.startupDiagnostic) {
       if (appendDiagnosticEntry(next.startupDiagnostic)) {
         broadcast({ type: "diagnostics-appended", entry: next.startupDiagnostic });
@@ -224,6 +426,11 @@ async function initializeApplicationServices(): Promise<void> {
     await autoConnectOnStartup();
   } catch (error) {
     const message = `Startup failed: ${formatError(error)}`;
+    if (applicationQuitting) {
+      markApplicationServicesReady();
+      await writeMainLog(message);
+      return;
+    }
     activateService(
       new InProcessServiceBridge({
         ...runtime,
@@ -233,6 +440,73 @@ async function initializeApplicationServices(): Promise<void> {
         message
       })
     );
+    markApplicationServicesReady();
+    appendError(message);
+    await writeMainLog(message);
+  }
+}
+
+function markApplicationServicesReady(): void {
+  if (applicationServicesReadyResolved) {
+    return;
+  }
+  applicationServicesReadyResolved = true;
+  resolveApplicationServicesReady();
+}
+
+async function waitForApplicationServicesInitializationOnShutdown(): Promise<void> {
+  const initialization = applicationServicesInitialization;
+  if (!initialization) {
+    return;
+  }
+  await initialization;
+}
+
+async function initializeApplicationStorage(): Promise<void> {
+  try {
+    await writeMainLog("Initializing storage.");
+    await storage.init();
+    const settings = storage.getSettings();
+    applyLoggingSettings(settings);
+    try {
+      syncWindowsStartupSetting(settings);
+    } catch (error) {
+      const message = `Windows startup integration failed: ${formatError(error)}`;
+      appendError(message);
+      await writeMainLog(message);
+    }
+    try {
+      trayController.sync();
+    } catch (error) {
+      const message = `Tray initialization failed: ${formatError(error)}`;
+      appendError(message);
+      await writeMainLog(message);
+    }
+    storageInitialized = true;
+    await writeMainLog("Storage initialized before renderer startup.");
+  } catch (error) {
+    const message = `Storage initialization failed: ${formatError(error)}`;
+    runtime = {
+      ...runtime,
+      state: "Error",
+      message
+    };
+    appendError(message);
+    await writeMainLog(message);
+  }
+}
+
+async function restoreStaleWindowsProxyState(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+  try {
+    const recovered = await recoverWindowsSystemProxy([routingDataPath, path.join(routingDataPath, "xray")]);
+    if (recovered) {
+      await writeMainLog("Recovered stale Windows proxy state from the previous application run.");
+    }
+  } catch (error) {
+    const message = `Stale Windows proxy recovery failed: ${formatError(error)}`;
     appendError(message);
     await writeMainLog(message);
   }
@@ -247,95 +521,102 @@ function activateService(nextService: ServiceBridge): void {
 }
 
 function registerIpcHandlers(): void {
-  ipcMain.handle(IPC_CHANNELS.loadSnapshot, () => createSnapshot());
-  ipcMain.handle(IPC_CHANNELS.upsertConfig, async (_event, input: UpsertSshConfigInput) => {
+  handleTrustedIpc(IPC_CHANNELS.loadSnapshot, () => {
+    if (!rendererSnapshotHandshakeReported) {
+      rendererSnapshotHandshakeReported = true;
+      void writeMainLog("Renderer snapshot IPC handshake completed.");
+    }
+    return createSnapshot();
+  });
+  handleTrustedIpc(IPC_CHANNELS.upsertConfig, async (_event, input: UpsertSshConfigInput) => {
     const store = await storage.upsertConfig(input);
     const config = store.sshConfigs.find((candidate) => candidate.id === input.id) ?? store.sshConfigs.at(-1);
     if (config) {
       await service.updateConfig(config);
     }
-    return createSnapshot();
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.deleteConfig, async (_event, id: string) => {
-    await storage.deleteConfig(id);
-    return createSnapshot();
+  handleTrustedIpc(IPC_CHANNELS.deleteConfig, async (_event, id: string) => {
+    const store = await storage.deleteConfig(id);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.selectConfig, async (_event, id: string) => {
-    await storage.selectConfig(id);
-    return createSnapshot();
+  handleTrustedIpc(IPC_CHANNELS.selectConfig, async (_event, id: string) => {
+    const store = await storage.selectConfig(id);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.upsertKey, async (_event, input: UpsertSshKeyInput) => {
-    await storage.upsertKey(input);
-    return createSnapshot();
+  handleTrustedIpc(IPC_CHANNELS.upsertKey, async (_event, input: UpsertSshKeyInput) => {
+    const store = await storage.upsertKey(input);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.copyPrivateKey, (_event, id: string) => {
+  handleTrustedIpc(IPC_CHANNELS.copyPrivateKey, (_event, id: string) => {
     clipboard.writeText(storage.readPrivateKeyText(id));
     return true;
   });
-  ipcMain.handle(IPC_CHANNELS.deleteKey, async (_event, id: string) => {
-    await storage.deleteKey(id);
-    return createSnapshot();
+  handleTrustedIpc(IPC_CHANNELS.deleteKey, async (_event, id: string) => {
+    const store = await storage.deleteKey(id);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.upsertProxyProfile, async (_event, input: UpsertProxyProfileInput) => {
-    await storage.upsertProxyProfile(input);
-    return createSnapshot();
+  handleTrustedIpc(IPC_CHANNELS.upsertProxyProfile, async (_event, input: UpsertProxyProfileInput) => {
+    const store = await storage.upsertProxyProfile(input);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.importProxyProfiles, async (_event, input: ImportProxyProfilesInput) => {
+  handleTrustedIpc(IPC_CHANNELS.importProxyProfiles, async (_event, input: ImportProxyProfilesInput) => {
     const result = await storage.importProxyProfiles(input);
-    return { snapshot: createSnapshot(), result: result.result };
+    return { snapshot: createSnapshot(result.store), result: result.result };
   });
-  ipcMain.handle(IPC_CHANNELS.refreshProxyProfiles, async () => {
-    const result = await refreshPublicProxyProfiles(storage);
+  handleTrustedIpc(IPC_CHANNELS.refreshProxyProfiles, async () => {
+    const result = await refreshPublicProxyProfiles(storage, { fetchImpl: electronSessionFetch });
     return { snapshot: createSnapshot(), result };
   });
-  ipcMain.handle(IPC_CHANNELS.selectProxyProfile, async (_event, id: string) => {
-    await storage.selectProxyProfile(id);
-    return createSnapshot();
+  handleTrustedIpc(IPC_CHANNELS.selectProxyProfile, async (_event, id: string) => {
+    const store = await storage.selectProxyProfile(id);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.toggleProxyProfilePin, async (_event, id: string) => {
-    await storage.toggleProxyProfilePin(id);
-    return createSnapshot();
+  handleTrustedIpc(IPC_CHANNELS.toggleProxyProfilePin, async (_event, id: string) => {
+    const store = await storage.toggleProxyProfilePin(id);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.deleteProxyProfile, async (_event, id: string) => {
+  handleTrustedIpc(IPC_CHANNELS.deleteProxyProfile, async (_event, id: string) => {
     if (activeTransport === "xray" && xrayService.getStatus().activeConfigId === id) {
-      await xrayService.disconnect();
+      await disconnectActiveTransport();
     }
-    await storage.deleteProxyProfile(id);
-    return createSnapshot();
+    const store = await storage.deleteProxyProfile(id);
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.deleteUnpinnedProxyProfiles, async () => {
+  handleTrustedIpc(IPC_CHANNELS.deleteUnpinnedProxyProfiles, async () => {
     if (activeTransport === "xray") {
-      await xrayService.disconnect();
+      await disconnectActiveTransport();
     }
-    await storage.deleteUnpinnedProxyProfiles();
-    return createSnapshot();
+    const store = await storage.deleteUnpinnedProxyProfiles();
+    return createSnapshot(store);
   });
-  ipcMain.handle(IPC_CHANNELS.updateSettings, async (_event, settings: AppSettings) => {
-    applyLoggingSettings(settings);
-    await storage.updateSettings(settings);
-    syncWindowsStartupSetting(settings);
-    trayController.sync();
-    return createSnapshot();
-  });
-  ipcMain.handle(IPC_CHANNELS.updateRoutingMode, async (_event, mode: RoutingMode) => {
-    const previousMode = storage.getStore().routingMode;
-    const previousStatus = activeTunnelService().getStatus();
-    await storage.updateRoutingMode(mode);
-    if (mode !== previousMode && shouldReconnectForRoutingModeChange(previousStatus)) {
-      await applyActiveTransportRoutingChange(mode);
+  handleTrustedIpc(IPC_CHANNELS.updateSettings, async (_event, patch: Partial<AppSettings>) => {
+    const previousSettings = storage.getSettings();
+    const nextStore = await storage.updateSettings(patch);
+    const nextSettings = nextStore.settings;
+    applyLoggingSettings(nextSettings);
+    if (previousSettings.startWithWindowsInTray !== nextSettings.startWithWindowsInTray) {
+      syncWindowsStartupSetting(nextSettings);
     }
-    return createSnapshot();
-  });
-  ipcMain.handle(IPC_CHANNELS.updateRoutingRules, async (_event, rules: RoutingRule[]) => {
-    await storage.updateRoutingRules(rules);
-    if (activeTransport === "xray") {
-      await xrayService.updateRoutingRules(rules);
-    } else {
-      await service.updateRoutingRules(rules);
+    if (
+      previousSettings.closeToTrayEnabled !== nextSettings.closeToTrayEnabled ||
+      previousSettings.releaseRendererInTrayEnabled !== nextSettings.releaseRendererInTrayEnabled
+    ) {
+      trayController.sync();
     }
-    return createSnapshot();
+    return createSnapshot(nextStore);
   });
-  ipcMain.handle(IPC_CHANNELS.updateRoutingProxyListEnabled, async (_event, enabled: boolean) => {
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingMode, async (_event, mode: RoutingMode) => {
+    const store = await storage.updateRoutingMode(mode);
+    await applyActiveTransportRoutingChange(mode);
+    return createSnapshot(store);
+  });
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingRules, async (_event, rules: RoutingRule[]) => {
+    const store = await storage.updateRoutingRules(rules);
+    await applyRoutingConfigurationAfterMutation();
+    return createSnapshot(store);
+  });
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingProxyListEnabled, async (_event, enabled: boolean) => {
     const current = storage.getStore().routingProxyList;
     if (enabled && current.domains.length === 0) {
       await refreshRoutingProxyList({ enabled: true });
@@ -345,12 +626,12 @@ function registerIpcHandlers(): void {
     await applyRoutingListsChange();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.refreshRoutingProxyList, async () => {
+  handleTrustedIpc(IPC_CHANNELS.refreshRoutingProxyList, async () => {
     await refreshRoutingProxyList();
     await applyRoutingListsChange();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.updateRoutingDirectListEnabled, async (_event, enabled: boolean) => {
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingDirectListEnabled, async (_event, enabled: boolean) => {
     const current = storage.getStore().routingDirectList;
     if (enabled && current.domains.length === 0) {
       await refreshRoutingDirectList({ enabled: true });
@@ -360,47 +641,50 @@ function registerIpcHandlers(): void {
     await applyRoutingListsChange();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.refreshRoutingDirectList, async () => {
+  handleTrustedIpc(IPC_CHANNELS.refreshRoutingDirectList, async () => {
     await refreshRoutingDirectList();
     await applyRoutingListsChange();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.clearDiagnostics, () => {
+  handleTrustedIpc(IPC_CHANNELS.clearDiagnostics, () => {
     diagnostics = [];
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.readLogFile, () => readMainLogContent());
-  ipcMain.handle(IPC_CHANNELS.clearLogFile, () => clearMainLogFiles());
-  ipcMain.handle(IPC_CHANNELS.listProcesses, () => listActiveProcesses());
-  ipcMain.handle(IPC_CHANNELS.connect, async () => {
+  handleTrustedIpc(IPC_CHANNELS.readLogFile, () => readMainLogContent());
+  handleTrustedIpc(IPC_CHANNELS.clearLogFile, () => clearMainLogFiles());
+  handleTrustedIpc(IPC_CHANNELS.listProcesses, () => listActiveProcesses());
+  handleTrustedIpc(IPC_CHANNELS.connect, async () => {
     await connect();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.connectProxy, async () => {
+  handleTrustedIpc(IPC_CHANNELS.connectProxy, async () => {
     await connectProxy();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.disconnect, async () => {
+  handleTrustedIpc(IPC_CHANNELS.disconnect, async () => {
     await disconnectActiveTransport();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.checkTunnel, async (_event, endpoint?: string) => {
-    const store = storage.getStore();
-    lastTunnelCheck = await activeTunnelService().checkTunnel(endpoint ?? store.settings.checkEndpoint);
+  handleTrustedIpc(IPC_CHANNELS.checkTunnel, async (_event, endpoint?: string) => {
+    const settings = storage.getSettings();
+    lastTunnelCheck = await activeTunnelService().checkTunnel(endpoint ?? settings.checkEndpoint);
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.openTerminal, async () => {
+  handleTrustedIpc(IPC_CHANNELS.openTerminal, async () => {
     await activeTunnelService().openTerminal();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.closeTerminal, async () => {
+  handleTrustedIpc(IPC_CHANNELS.closeTerminal, async () => {
     await activeTunnelService().closeTerminal();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.terminalInput, async (_event, input: string) => {
+  handleTrustedIpc(IPC_CHANNELS.terminalInput, async (_event, input: string) => {
+    if (typeof input !== "string" || input.length === 0 || input.length > MAX_TERMINAL_INPUT_CHARACTERS) {
+      throw new Error("Terminal input is invalid or too large.");
+    }
     await activeTunnelService().terminalInput(input);
   });
-  ipcMain.handle(IPC_CHANNELS.checkForUpdates, async (_event, force?: boolean) => {
+  handleTrustedIpc(IPC_CHANNELS.checkForUpdates, async (_event, force?: boolean) => {
     const update = await portableUpdates.check({
       currentVersion: app.getVersion(),
       platformTarget,
@@ -409,27 +693,72 @@ function registerIpcHandlers(): void {
     });
     return { snapshot: createSnapshot(), update };
   });
-  ipcMain.handle(IPC_CHANNELS.downloadUpdate, async () => {
+  handleTrustedIpc(IPC_CHANNELS.downloadUpdate, async () => {
     await portableUpdates.downloadSelected();
     return createSnapshot();
   });
-  ipcMain.handle(IPC_CHANNELS.revealDownloadedUpdate, async () => {
+  handleTrustedIpc(IPC_CHANNELS.revealDownloadedUpdate, async () => {
     if (!portableUpdates.download.filePath) {
       return false;
     }
     shell.showItemInFolder(portableUpdates.download.filePath);
     return true;
   });
-  ipcMain.handle(IPC_CHANNELS.copyText, (_event, text: string) => {
-    if (typeof text !== "string" || text.length > 10_000) {
+  handleTrustedIpc(IPC_CHANNELS.copyText, (_event, text: string) => {
+    if (typeof text !== "string" || text.length > MAX_CLIPBOARD_TEXT_CHARACTERS) {
       throw new Error("Clipboard payload is invalid.");
     }
     clipboard.writeText(text);
     return true;
   });
-  ipcMain.handle(IPC_CHANNELS.openExternal, async (_event, url: string) => {
+  handleTrustedIpc(IPC_CHANNELS.openExternal, async (_event, url: string) => {
     await shell.openExternal(assertAllowedExternalUrl(url));
     return true;
+  });
+}
+
+function handleTrustedIpc<TArgs extends unknown[], TResult>(
+  channel: string,
+  listener: (event: Electron.IpcMainInvokeEvent, ...args: TArgs) => TResult | Promise<TResult>
+): void {
+  ipcMain.handle(channel, (event, ...args) => {
+    const frame = event.senderFrame ?? webFrameMain.fromId(event.processId, event.frameId) ?? null;
+    const mainFrame = event.sender.mainFrame;
+    const senderUrl = event.sender.getURL();
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+    const senderIsRegisteredWindow = Boolean(
+      ownerWindow &&
+        !ownerWindow.isDestroyed() &&
+        !event.sender.isDestroyed() &&
+        trustedRendererWebContentsIds.has(event.sender.id)
+    );
+    const applicationWindowWebContentsIds = senderIsRegisteredWindow ? [event.sender.id] : [];
+    const frameWebContentsId = frame && !frame.detached ? webContents.fromFrame(frame)?.id : undefined;
+    const trust = assessRendererIpcTrust({
+      senderWebContentsId: event.sender.id,
+      applicationWindowWebContentsIds,
+      senderUrl,
+      trustedUrl: trustedRendererEntryUrl,
+      senderFrame: frame,
+      mainFrame,
+      frameWebContentsId
+    });
+    if (!trust.trusted) {
+      if (!rejectedRendererIpcReported) {
+        rejectedRendererIpcReported = true;
+        void writeMainLog(
+          `Rejected renderer IPC. channel=${channel}, reason=${trust.reason}, senderId=${event.sender.id}, appWindowIds=${
+            applicationWindowWebContentsIds.join(",") || "none"
+          }, frameTree=${frame?.frameTreeNodeId ?? "none"}, mainTree=${mainFrame.frameTreeNodeId}, detached=${
+            frame?.detached ?? "unknown"
+          }, sender=${formatRuntimeUrl(senderUrl)}, frame=${formatRuntimeUrl(frame?.url ?? "")}, trusted=${formatRuntimeUrl(
+            trustedRendererEntryUrl
+          )}`
+        );
+      }
+      throw new Error("Rejected IPC request from an untrusted renderer frame.");
+    }
+    return listener(event, ...(args as TArgs));
   });
 }
 
@@ -473,7 +802,10 @@ async function createServiceBridge(initialRuntime: RuntimeStatus): Promise<{ ser
       ...initialRuntime,
       transport: "live-ssh",
       message: "Live SSH service is active."
-    }, { pacDirectory: routingDataPath })
+    }, {
+      systemProxy: sharedSystemProxy,
+      processRoutingRefreshIntervalMs: currentProcessRoutingRefreshIntervalMs
+    })
   };
 }
 
@@ -493,27 +825,20 @@ function simulatorFallback(initialRuntime: RuntimeStatus, message: string): { se
   };
 }
 
-async function connect(): Promise<void> {
+async function connect(expectedGeneration?: number): Promise<boolean> {
   const store = storage.getStore();
   const config = store.sshConfigs.find((candidate) => candidate.id === store.selectedConfigId);
   if (!config) {
     appendError("Select or create an SSH configuration before connecting.");
-    return;
+    return false;
   }
 
   if (store.routingMode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
     appendError("Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain.");
-    return;
+    return false;
   }
 
-  diagnostics = [];
-  terminal = [];
-  lastTunnelCheck = undefined;
-  if (activeTransport === "xray") {
-    await xrayService.disconnect();
-  }
-  activeTransport = "ssh";
-  await service.connect({
+  const request = {
     config,
     routingMode: store.routingMode,
     routingRules: store.routingRules,
@@ -521,31 +846,42 @@ async function connect(): Promise<void> {
     routingDirectDomains: activeRoutingDirectDomains(),
     checkEndpoint: store.settings.checkEndpoint,
     secrets: storage.resolveServiceSecrets(config)
-  });
-  await rememberLastConnectedTransport("ssh");
+  };
+  return requestTransportIntent(async (generation) => {
+    diagnostics = [];
+    terminalOutputBatcher.clear();
+    terminal = [];
+    lastTunnelCheck = undefined;
+    if (activeTransport === "xray") {
+      await xrayService.disconnect();
+    }
+    if (!transportMutations.isCurrent(generation)) {
+      return;
+    }
+    activeTransport = "ssh";
+    await service.connect(request);
+    if (!transportMutations.isCurrent(generation)) {
+      await service.disconnect();
+      return;
+    }
+    await rememberLastConnectedTransport("ssh");
+  }, expectedGeneration);
 }
 
-async function connectProxy(): Promise<void> {
+async function connectProxy(expectedGeneration?: number): Promise<boolean> {
   const store = storage.getStore();
   const profile = store.proxyProfiles.find((candidate) => candidate.id === store.selectedProxyProfileId);
   if (!profile) {
     appendError("Select or import an Xray profile before connecting.");
-    return;
+    return false;
   }
 
   if (store.routingMode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
     appendError("Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain.");
-    return;
+    return false;
   }
 
-  diagnostics = [];
-  terminal = [];
-  lastTunnelCheck = undefined;
-  if (activeTransport === "ssh") {
-    await service.disconnect();
-  }
-  activeTransport = "xray";
-  await xrayService.connect({
+  const request = {
     profile,
     routingMode: store.routingMode,
     routingRules: store.routingRules,
@@ -553,14 +889,36 @@ async function connectProxy(): Promise<void> {
     routingDirectDomains: activeRoutingDirectDomains(),
     checkEndpoint: store.settings.checkEndpoint,
     secrets: storage.resolveProxySecrets(profile)
-  });
-  await rememberLastConnectedTransport("xray");
+  };
+  return requestTransportIntent(async (generation) => {
+    diagnostics = [];
+    terminalOutputBatcher.clear();
+    terminal = [];
+    lastTunnelCheck = undefined;
+    if (activeTransport === "ssh") {
+      await service.disconnect();
+    }
+    if (!transportMutations.isCurrent(generation)) {
+      return;
+    }
+    activeTransport = "xray";
+    await xrayService.connect(request);
+    if (!transportMutations.isCurrent(generation)) {
+      await xrayService.disconnect();
+      return;
+    }
+    await rememberLastConnectedTransport("xray");
+  }, expectedGeneration);
 }
 
 async function autoConnectOnStartup(): Promise<void> {
   const store = storage.getStore();
   if (!store.settings.autoConnectOnStartup) {
     await writeMainLog("Auto-connect on startup is disabled.");
+    return;
+  }
+  if (transportMutations.generation !== 0 || transportMutations.isStopping) {
+    await writeMainLog("Auto-connect skipped because a newer user transport action is already pending.");
     return;
   }
 
@@ -578,7 +936,11 @@ async function autoConnectOnStartup(): Promise<void> {
         return;
       }
       await writeMainLog(`Auto-connect starting Xray profile "${profile.name}".`);
-      await connectProxy();
+      const connected = await connectProxy(0);
+      if (!connected) {
+        await writeMainLog("Auto-connect skipped because a newer user transport action superseded it.");
+        return;
+      }
       await writeMainLog(`Auto-connect completed with Xray profile "${profile.name}".`);
       return;
     }
@@ -589,7 +951,11 @@ async function autoConnectOnStartup(): Promise<void> {
       return;
     }
     await writeMainLog(`Auto-connect starting SSH configuration "${config.name}".`);
-    await connect();
+    const connected = await connect(0);
+    if (!connected) {
+      await writeMainLog("Auto-connect skipped because a newer user transport action superseded it.");
+      return;
+    }
     await writeMainLog(`Auto-connect completed with SSH configuration "${config.name}".`);
   } catch (error) {
     const message = `Auto-connect failed: ${formatError(error)}`;
@@ -599,18 +965,26 @@ async function autoConnectOnStartup(): Promise<void> {
 }
 
 async function rememberLastConnectedTransport(transport: GlobalTab): Promise<void> {
-  const settings = storage.getStore().settings;
+  const settings = storage.getSettings();
   if (settings.lastConnectedTransport === transport && settings.activeGlobalTab === transport) {
     return;
   }
   await storage.updateSettings({
-    ...settings,
     activeGlobalTab: transport,
     lastConnectedTransport: transport
   });
 }
 
 async function disconnectActiveTransport(): Promise<void> {
+  await requestTransportIntent(async (generation) => {
+    if (!transportMutations.isCurrent(generation)) {
+      return;
+    }
+    await disconnectActiveTransportInternal();
+  });
+}
+
+async function disconnectActiveTransportInternal(): Promise<void> {
   if (activeTransport === "xray") {
     await xrayService.disconnect();
   } else {
@@ -619,41 +993,58 @@ async function disconnectActiveTransport(): Promise<void> {
 }
 
 async function applyActiveTransportRoutingChange(mode: RoutingMode): Promise<void> {
-  const store = storage.getStore();
-  if (mode === "selected-rules" && !hasSelectedRoutingTargets(store)) {
-    await disconnectActiveTransport();
-    appendError("Selected rules mode requires at least one enabled routing rule or enabled proxy-list domain. Active tunnel was disconnected because routing mode changed.");
-    return;
-  }
-
-  if (activeTransport === "xray") {
-    await xrayService.updateRouting({
-      routingMode: mode,
-      routingRules: store.routingRules,
-      routingProxyDomains: activeRoutingProxyDomains(),
-      routingDirectDomains: activeRoutingDirectDomains(),
-      checkEndpoint: store.settings.checkEndpoint
-    });
-  } else {
-    await service.updateRouting({
-      routingMode: mode,
-      routingRules: store.routingRules,
-      routingProxyDomains: activeRoutingProxyDomains(),
-      routingDirectDomains: activeRoutingDirectDomains(),
-      checkEndpoint: store.settings.checkEndpoint
-    });
-  }
+  void mode;
+  await applyRoutingConfigurationAfterMutation();
 }
 
 async function applyRoutingListsChange(): Promise<void> {
-  const store = storage.getStore();
-  await activeTunnelService().updateRouting({
-    routingMode: store.routingMode,
-    routingRules: store.routingRules,
-    routingProxyDomains: activeRoutingProxyDomains(),
-    routingDirectDomains: activeRoutingDirectDomains(),
-    checkEndpoint: store.settings.checkEndpoint
+  await applyRoutingConfigurationAfterMutation();
+}
+
+async function applyRoutingConfigurationAfterMutation(): Promise<void> {
+  await enqueueTransportMutation(async () => {
+    await applicationServicesReady;
+    if (applicationQuitting) {
+      return;
+    }
+    const store = storage.getStore();
+    const activeService = activeTunnelService();
+    const action = routingMutationAction(store, activeService.getStatus().state);
+    if (action === "disconnect") {
+      await disconnectActiveTransportInternal();
+      appendError(
+        "Selected-rules routing no longer has any enabled rules or enabled proxy-list domains. The active tunnel was disconnected to prevent unintended DIRECT-all routing."
+      );
+      return;
+    }
+    if (action === "idle") {
+      return;
+    }
+    await activeService.updateRouting({
+      routingMode: store.routingMode,
+      routingRules: store.routingRules,
+      routingProxyDomains: activeRoutingProxyDomains(),
+      routingDirectDomains: activeRoutingDirectDomains(),
+      checkEndpoint: store.settings.checkEndpoint
+    });
   });
+}
+
+function requestTransportIntent(
+  operation: (generation: number) => Promise<void>,
+  expectedGeneration?: number
+): Promise<boolean> {
+  return transportMutations.requestIntent(async (generation) => {
+    await applicationServicesReady;
+    if (!transportMutations.isCurrent(generation) || applicationQuitting) {
+      return;
+    }
+    await operation(generation);
+  }, { expectedGeneration });
+}
+
+function enqueueTransportMutation<T>(operation: () => Promise<T>): Promise<T> {
+  return transportMutations.enqueue(operation);
 }
 
 async function refreshRoutingProxyList(options: { enabled?: boolean } = {}): Promise<void> {
@@ -691,29 +1082,16 @@ async function refreshRoutingDirectList(options: { enabled?: boolean } = {}): Pr
 }
 
 async function fetchTextWithLimit(url: string, maxBytes: number, timeoutMs: number): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  timer.unref();
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: { "User-Agent": "shadow-ssh-desktop-routing-list" }
-    });
-    if (!response.ok) {
-      throw new Error(`Routing list download failed: ${response.status} ${response.statusText}`);
-    }
-    const contentLength = Number(response.headers.get("content-length") ?? "0");
-    if (contentLength > maxBytes) {
-      throw new Error("Routing list is larger than the allowed limit.");
-    }
-    const text = await response.text();
-    if (Buffer.byteLength(text, "utf8") > maxBytes) {
-      throw new Error("Routing list is larger than the allowed limit.");
-    }
-    return text;
-  } finally {
-    clearTimeout(timer);
-  }
+  return fetchBoundedText({
+    fetchImpl: electronSessionFetch,
+    url,
+    headers: { "User-Agent": "shadow-ssh-desktop-routing-list" },
+    maxBytes,
+    timeoutMs,
+    failureMessagePrefix: "Routing list download failed",
+    limitMessage: "Routing list is larger than the allowed limit.",
+    timeoutMessage: "Routing list download timed out."
+  });
 }
 
 function activeRoutingProxyDomains(): string[] {
@@ -726,26 +1104,21 @@ function activeRoutingDirectDomains(): string[] {
   return directList.enabled ? directList.domains : [];
 }
 
-function hasSelectedRoutingTargets(store: AppStore): boolean {
-  return store.routingRules.some((rule) => rule.enabled) || (store.routingProxyList.enabled && store.routingProxyList.domains.length > 0);
-}
-
-function shouldReconnectForRoutingModeChange(status: RuntimeStatus): boolean {
-  return status.state === "Connected" || status.state === "Connecting" || status.state === "Reconnecting";
-}
-
 function activeTunnelService(): ServiceBridge | XrayServiceBridge {
   return activeTransport === "xray" ? xrayService : service;
 }
 
-function createSnapshot(): AppSnapshot {
+function createSnapshot(store: AppStore = storage.getStore()): AppSnapshot {
   runtime = activeTransport === "xray" ? xrayService.getStatus() : service.getStatus();
   return {
-    store: storage.getStore(),
+    store,
     runtime,
-    diagnostics: structuredClone(diagnostics),
+    // Electron serializes the IPC result with structured clone. A shallow
+    // array copy protects main-process ownership without needlessly cloning
+    // the same large strings twice.
+    diagnostics: diagnostics.slice(),
     logFilePaths: uniqueLogPaths(),
-    terminal: structuredClone(terminal),
+    terminal: terminal.slice(),
     lastTunnelCheck,
     updateInfo: portableUpdates.info,
     updateDownload: portableUpdates.download
@@ -769,21 +1142,22 @@ function handleRuntimeEvent(source: "ssh" | "xray", event: ServiceEvent): void {
     runtime = event.status;
   }
   if (event.type === "diagnostics-appended") {
-    if (shouldPersistDiagnostic(event.entry)) {
-      void writeMainLog(`${event.entry.level.toUpperCase()} ${event.entry.message}`);
+    const entry = normalizeDiagnosticEntry(event.entry);
+    if (shouldPersistDiagnostic(entry)) {
+      void writeMainLog(`${entry.level.toUpperCase()} ${entry.message}`);
     }
-    if (!appendDiagnosticEntry(event.entry)) {
+    if (!appendDiagnosticEntry(entry)) {
       return;
     }
+    broadcast({ type: "diagnostics-appended", entry });
+    return;
   }
   if (event.type === "terminal-output") {
     if (!isActive) {
       return;
     }
-    terminal.push(event.line);
-    if (terminal.length > MAX_TERMINAL_LINES_IN_MEMORY) {
-      terminal = terminal.slice(-MAX_TERMINAL_LINES_IN_MEMORY);
-    }
+    terminalOutputBatcher.enqueue(source, event.line);
+    return;
   }
   if (event.type === "tunnel-check-result") {
     if (!isActive) {
@@ -792,49 +1166,53 @@ function handleRuntimeEvent(source: "ssh" | "xray", event: ServiceEvent): void {
     lastTunnelCheck = event.result;
   }
   if (event.type === "error") {
-    void writeMainLog(`ERROR ${event.message}`);
-    appendError(event.message);
+    const entry = appendError(event.message);
+    void writeMainLog(`ERROR ${entry.message}`);
     return;
   }
-  if (isActive || event.type === "diagnostics-appended") {
+  if (isActive) {
     broadcast(event);
   }
 }
 
-function appendError(message: string): void {
-  const entry: DiagnosticsEntry = {
+function appendError(message: string): DiagnosticsEntry {
+  const entry = normalizeDiagnosticEntry({
     id: randomUUID(),
     at: new Date().toISOString(),
     level: "error",
     message
-  };
+  });
   if (appendDiagnosticEntry(entry)) {
     broadcast({ type: "diagnostics-appended", entry });
   }
+  return entry;
 }
 
 function appendInfo(message: string): void {
-  const entry: DiagnosticsEntry = {
+  const entry = normalizeDiagnosticEntry({
     id: randomUUID(),
     at: new Date().toISOString(),
     level: "info",
     message
-  };
+  });
   if (appendDiagnosticEntry(entry)) {
     broadcast({ type: "diagnostics-appended", entry });
   }
-  void writeMainLog(`INFO ${message}`);
+  void writeMainLog(`INFO ${entry.message}`);
 }
 
-function appendDiagnosticEntry(entry: DiagnosticsEntry): boolean {
+function appendDiagnosticEntry(entry: DiagnosticsEntry): DiagnosticsEntry | undefined {
   if (!diagnosticsLoggingEnabled) {
-    return false;
+    return undefined;
   }
-  diagnostics.push(entry);
-  if (diagnostics.length > MAX_DIAGNOSTICS_IN_MEMORY) {
-    diagnostics = diagnostics.slice(-MAX_DIAGNOSTICS_IN_MEMORY);
-  }
-  return true;
+  const normalized = normalizeDiagnosticEntry(entry);
+  diagnostics = appendBoundedDiagnosticEntries(
+    diagnostics,
+    [normalized],
+    MAX_DIAGNOSTICS_HISTORY_ENTRIES,
+    MAX_DIAGNOSTICS_HISTORY_BYTES
+  );
+  return normalized;
 }
 
 function shouldPersistDiagnostic(entry: DiagnosticsEntry): boolean {
@@ -854,9 +1232,24 @@ function isHighVolumeProxyDiagnostic(message: string): boolean {
   );
 }
 
-function broadcast(event: ServiceEvent): void {
+function broadcast(event: RendererEvent): void {
   for (const window of BrowserWindow.getAllWindows()) {
-    window.webContents.send(IPC_CHANNELS.serviceEvent, event);
+    const windowDestroyed = window.isDestroyed();
+    if (windowDestroyed) {
+      continue;
+    }
+    const contents = window.webContents;
+    if (
+      !shouldDeliverRendererEvent({
+        windowDestroyed,
+        webContentsDestroyed: contents.isDestroyed(),
+        visible: window.isVisible(),
+        minimized: window.isMinimized()
+      })
+    ) {
+      continue;
+    }
+    contents.send(IPC_CHANNELS.serviceEvent, event);
   }
 }
 
@@ -867,44 +1260,27 @@ async function writeMainLog(message: string): Promise<void> {
   if (!fileLoggingEnabled) {
     return;
   }
-  for (const logPath of uniqueLogPaths()) {
-    try {
-      await mkdir(path.dirname(logPath), { recursive: true });
-      await appendFile(logPath, `[${new Date().toISOString()}] ${message}\n`, "utf8");
-    } catch {
-      // Logging must never break app startup.
-    }
+  try {
+    await mainLogger.append(`[${new Date().toISOString()}] ${message}`);
+  } catch {
+    // Logging must never break app startup.
   }
 }
 
 async function readMainLogContent(): Promise<string> {
-  const sections: string[] = [];
-  const seen = new Set<string>();
-  for (const logPath of uniqueLogPaths()) {
-    try {
-      const content = await readFile(logPath, "utf8");
-      if (!content || seen.has(content)) {
-        continue;
-      }
-      seen.add(content);
-      sections.push(`### ${logPath}\n${content.trimEnd()}`);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        sections.push(`### ${logPath}\nUnable to read log file: ${formatError(error)}`);
-      }
-    }
+  try {
+    const content = await mainLogger.readTail();
+    return content ? `### ${mainLogPath}\n${content.trimEnd()}` : "";
+  } catch (error) {
+    return `### ${mainLogPath}\nUnable to read log file: ${formatError(error)}`;
   }
-  return sections.join("\n\n");
 }
 
 async function clearMainLogFiles(): Promise<string> {
-  for (const logPath of uniqueLogPaths()) {
-    try {
-      await mkdir(path.dirname(logPath), { recursive: true });
-      await writeFile(logPath, "", "utf8");
-    } catch {
-      // Clearing one log path should not block clearing another path.
-    }
+  try {
+    await mainLogger.clear();
+  } catch {
+    // Clearing logs should not destabilize the application.
   }
   return readMainLogContent();
 }
@@ -929,7 +1305,7 @@ async function preloadLoggingPreference(): Promise<void> {
 }
 
 function uniqueLogPaths(): string[] {
-  return [mainLogPath];
+  return [mainLogPath, ...Array.from({ length: MAIN_LOG_BACKUP_COUNT }, (_, index) => `${mainLogPath}.${index + 1}`)];
 }
 
 function assertAllowedExternalUrl(value: string): string {

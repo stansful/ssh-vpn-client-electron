@@ -142,7 +142,9 @@ func serviceControlHandler(control uint32, _ uint32, _ uintptr, _ uintptr) uintp
 
 	switch control {
 	case serviceControlStop, serviceControlShutdown:
-		setStatus(runtime, serviceStopPending, 0, 1, 3000)
+		// The runner waits for any in-flight bounded mutation and performs up to
+		// two five-second routing rollbacks before returning.
+		setStatus(runtime, serviceStopPending, 0, 1, 20000)
 		runtime.cancel()
 	}
 	return 0

@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { IPC_CHANNELS, type ServiceEvent, type ShadowSshApi } from "../shared/ipc.js";
+import { IPC_CHANNELS, type RendererEvent, type ShadowSshApi } from "../shared/ipc.js";
 import type {
   AppSettings,
   ImportProxyProfilesInput,
@@ -25,7 +25,7 @@ const api: ShadowSshApi = {
   toggleProxyProfilePin: (id: string) => ipcRenderer.invoke(IPC_CHANNELS.toggleProxyProfilePin, id),
   deleteProxyProfile: (id: string) => ipcRenderer.invoke(IPC_CHANNELS.deleteProxyProfile, id),
   deleteUnpinnedProxyProfiles: () => ipcRenderer.invoke(IPC_CHANNELS.deleteUnpinnedProxyProfiles),
-  updateSettings: (settings: AppSettings) => ipcRenderer.invoke(IPC_CHANNELS.updateSettings, settings),
+  updateSettings: (patch: Partial<AppSettings>) => ipcRenderer.invoke(IPC_CHANNELS.updateSettings, patch),
   updateRoutingMode: (mode: RoutingMode) => ipcRenderer.invoke(IPC_CHANNELS.updateRoutingMode, mode),
   updateRoutingRules: (rules: RoutingRule[]) => ipcRenderer.invoke(IPC_CHANNELS.updateRoutingRules, rules),
   updateRoutingProxyListEnabled: (enabled: boolean) => ipcRenderer.invoke(IPC_CHANNELS.updateRoutingProxyListEnabled, enabled),
@@ -48,8 +48,8 @@ const api: ShadowSshApi = {
   revealDownloadedUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.revealDownloadedUpdate),
   copyText: (text: string) => ipcRenderer.invoke(IPC_CHANNELS.copyText, text),
   openExternal: (url: string) => ipcRenderer.invoke(IPC_CHANNELS.openExternal, url),
-  onServiceEvent: (callback: (event: ServiceEvent) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, payload: ServiceEvent): void => {
+  onServiceEvent: (callback: (event: RendererEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: RendererEvent): void => {
       callback(payload);
     };
     ipcRenderer.on(IPC_CHANNELS.serviceEvent, listener);

@@ -11,7 +11,7 @@ export function useEndpointController({
 }: {
   settings: AppSettings;
   setSnapshot: Dispatch<SetStateAction<AppSnapshot | undefined>>;
-  setBusy: Dispatch<SetStateAction<boolean>>;
+  setBusy: (value: boolean) => void;
 }) {
   const [endpointModalOpen, setEndpointModalOpen] = useState(false);
   const [endpointModalError, setEndpointModalError] = useState("");
@@ -34,7 +34,7 @@ export function useEndpointController({
     setBusy(true);
     setEndpointModalError("");
     void api
-      .updateSettings({ ...settings, checkEndpoint: endpoint })
+      .updateSettings({ checkEndpoint: endpoint })
       .then((next) => {
         setSnapshot(next);
         setEndpointModalOpen(false);

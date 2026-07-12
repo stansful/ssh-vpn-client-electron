@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { access, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { checkSocks5Connect, parseEndpoint } from "../core/network/socks5-check.js";
@@ -11,22 +11,30 @@ import { buildXrayConfig } from "../core/proxy/xray-config.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { DiagnosticsEntry, ProxyConnectRequest, RoutingRule, RoutingUpdateRequest, RuntimeStatus, TunnelCheckResult } from "../shared/types.js";
 import { normalizeRuleValue } from "../shared/validation.js";
-import { buildSelectedRulesWithProcessIps } from "./live-ssh-service.js";
-import { reserveLocalTcpPort, terminateProcess, waitForProcessStartup, type XrayProcess } from "./xray/process-utils.js";
+import { buildSelectedRulesWithProcessIps, recordBoundedProcessRouteIp } from "./live-ssh-service.js";
+import { reserveDistinctLocalTcpPorts, terminateProcess, waitForProcessStartup, type XrayProcess } from "./xray/process-utils.js";
 
 export interface XrayServiceBridgeOptions {
   pacDirectory?: string;
   runtimeDirectory: string;
   executablePath?: string;
+  systemProxy?: WindowsSystemProxyManager;
+  processRoutingRefreshIntervalMs?: () => number;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
 const PROCESS_ROUTE_REFRESH_INTERVAL_MS = 30 * 1000;
+const MAX_XRAY_PROCESS_LOG_LINES = 80;
+const MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS = 64 * 1024;
+const MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS = 4096;
 
 export class XrayServiceBridge {
   private readonly events = new EventEmitter();
   private readonly systemProxy: WindowsSystemProxyManager;
+  private readonly processRoutingRefreshIntervalMs: () => number;
   private readonly runtimeDirectory: string;
+  private readonly configPath: string;
+  private readonly startupConfigCleanup: Promise<void>;
   private readonly executablePath: string | undefined;
   private status: RuntimeStatus;
   private process: XrayProcess | undefined;
@@ -35,17 +43,27 @@ export class XrayServiceBridge {
   private lastRequest: ProxyConnectRequest | undefined;
   private disconnectRequested = false;
   private reconnectTimer: NodeJS.Timeout | undefined;
+  private startupAbortController: AbortController | undefined;
   private routingRules: RoutingRule[] = [];
   private processRoutingMonitor: NodeJS.Timeout | undefined;
+  private processRoutingRefreshInFlight = false;
+  private processRoutingGeneration = 0;
   private processRoutingIps = new Map<string, number>();
   private processRoutingLastSignature = "";
   private processRoutingWarningEmitted = false;
   private processLogLines = 0;
-  private stoppingProcess = false;
+  private readonly processLogDrainers = new WeakMap<XrayProcess, () => void>();
+  private mutationTail: Promise<void> = Promise.resolve();
+  private lifecycleGeneration = 0;
+  private routingGeneration = 0;
+  private disposed = false;
 
   constructor(initialStatus: RuntimeStatus, options: XrayServiceBridgeOptions) {
-    this.systemProxy = new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
+    this.systemProxy = options.systemProxy ?? new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
+    this.processRoutingRefreshIntervalMs = options.processRoutingRefreshIntervalMs ?? (() => PROCESS_ROUTE_REFRESH_INTERVAL_MS);
     this.runtimeDirectory = options.runtimeDirectory;
+    this.configPath = path.join(this.runtimeDirectory, "xray-config.json");
+    this.startupConfigCleanup = rm(this.configPath, { force: true }).catch(() => undefined);
     this.executablePath = options.executablePath;
     this.status = {
       ...initialStatus,
@@ -65,29 +83,42 @@ export class XrayServiceBridge {
     return structuredClone(this.status);
   }
 
-  async updateRoutingRules(rules: RoutingRule[]): Promise<void> {
+  updateRoutingRules(rules: RoutingRule[]): Promise<void> {
+    if (this.disposed) {
+      return Promise.resolve();
+    }
     this.routingRules = rules;
-    const summary = new RoutingMatcher("selected-rules", rules).summary();
     if (this.lastRequest) {
       this.lastRequest = { ...this.lastRequest, routingRules: rules };
     }
-    if (this.status.state === "Connected" && this.lastRequest && this.socksEndpoint) {
-      const request = { ...this.lastRequest, routingRules: rules };
+    const routingGeneration = ++this.routingGeneration;
+    const lifecycleGeneration = this.lifecycleGeneration;
+    return this.enqueueMutation(async () => {
+      if (!this.isCurrentMutation(lifecycleGeneration, routingGeneration)) {
+        return;
+      }
+      const summary = new RoutingMatcher("selected-rules", rules).summary();
+      const request = this.lastRequest;
+      const socksEndpoint = this.socksEndpoint;
+      if (this.status.state === "Connected" && request && socksEndpoint) {
+        this.appendDiagnostic(
+          "info",
+          `Routing rules changed while Xray transport is connected: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing.`
+        );
+        await this.applySystemRouting(request, socksEndpoint);
+        return;
+      }
       this.appendDiagnostic(
         "info",
-        `Routing rules changed while Xray transport is connected: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing.`
+        `Routing rules prepared for Xray transport: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
       );
-      await this.applySystemRouting(request, this.socksEndpoint);
-      this.lastRequest = request;
-      return;
-    }
-    this.appendDiagnostic(
-      "info",
-      `Routing rules prepared for Xray transport: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
-    );
+    });
   }
 
-  async updateRouting(update: RoutingUpdateRequest): Promise<void> {
+  updateRouting(update: RoutingUpdateRequest): Promise<void> {
+    if (this.disposed) {
+      return Promise.resolve();
+    }
     this.routingRules = update.routingRules;
     if (this.lastRequest) {
       this.lastRequest = {
@@ -99,33 +130,41 @@ export class XrayServiceBridge {
         checkEndpoint: update.checkEndpoint
       };
     }
-    const summary = new RoutingMatcher(update.routingMode, update.routingRules).summary();
-    if (this.status.state === "Connected" && this.lastRequest && this.socksEndpoint) {
+    const routingGeneration = ++this.routingGeneration;
+    const lifecycleGeneration = this.lifecycleGeneration;
+    return this.enqueueMutation(async () => {
+      if (!this.isCurrentMutation(lifecycleGeneration, routingGeneration)) {
+        return;
+      }
+      const summary = new RoutingMatcher(update.routingMode, update.routingRules).summary();
+      const request = this.lastRequest;
+      const socksEndpoint = this.socksEndpoint;
+      if (this.status.state === "Connected" && request && socksEndpoint) {
+        this.appendDiagnostic(
+          "info",
+          `Routing mode changed while Xray transport is connected: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing without Xray restart.`
+        );
+        await this.applySystemRouting(request, socksEndpoint);
+        return;
+      }
       this.appendDiagnostic(
         "info",
-        `Routing mode changed while Xray transport is connected: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing without Xray restart.`
+        `Routing prepared for Xray transport: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
       );
-      await this.applySystemRouting(this.lastRequest, this.socksEndpoint);
-      return;
-    }
-    this.appendDiagnostic(
-      "info",
-      `Routing prepared for Xray transport: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}.`
-    );
+    });
   }
 
-  async connect(request: ProxyConnectRequest): Promise<void> {
+  connect(request: ProxyConnectRequest): Promise<void> {
+    if (this.disposed) {
+      return Promise.reject(new Error("Xray service has been disposed."));
+    }
     this.clearReconnectTimer();
+    this.cancelProcessStartup();
     this.lastRequest = request;
     this.routingRules = request.routingRules;
+    this.routingGeneration += 1;
     this.disconnectRequested = false;
-    this.processLogLines = 0;
-    this.processRoutingIps.clear();
-    this.processRoutingLastSignature = "";
-    this.processRoutingWarningEmitted = false;
-    await this.stopRouting();
-    await this.stopXrayProcess();
-
+    const generation = ++this.lifecycleGeneration;
     this.setStatus({
       state: "Connecting",
       activeConfigId: request.profile.id,
@@ -133,58 +172,108 @@ export class XrayServiceBridge {
       realTunnelAvailable: false,
       message: `Starting ${request.profile.protocol.toUpperCase()} profile ${request.profile.name}.`
     });
+    return this.enqueueMutation(() => this.connectInternal(request, generation));
+  }
+
+  private async connectInternal(request: ProxyConnectRequest, generation: number): Promise<void> {
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
+    this.processLogLines = 0;
+    this.processRoutingIps.clear();
+    this.processRoutingLastSignature = "";
+    this.processRoutingWarningEmitted = false;
+    await this.stopRouting();
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
+    await this.stopXrayProcess(this.process);
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
     this.appendDiagnostic(
       "info",
       `Xray connect requested for ${request.profile.protocol.toUpperCase()} ${request.profile.host}:${request.profile.port}, transport=${request.profile.transport}, security=${request.profile.security}, routing=${request.routingMode}.`
     );
 
+    let acquiredProcess: XrayProcess | undefined;
     try {
       const executablePath = await this.requireExecutablePath();
-      const socksEndpoint = await reserveLocalTcpPort();
-      const httpEndpoint = await reserveLocalTcpPort();
-      const configPath = path.join(this.runtimeDirectory, "xray-config.json");
-      await mkdir(this.runtimeDirectory, { recursive: true });
-      await writeFile(
-        configPath,
+      if (!this.isCurrentLifecycle(generation)) {
+        return;
+      }
+      const [socksEndpoint, httpEndpoint] = await reserveDistinctLocalTcpPorts(2);
+      if (!socksEndpoint || !httpEndpoint) {
+        throw new Error("Unable to reserve distinct Xray listener ports.");
+      }
+      if (!this.isCurrentLifecycle(generation)) {
+        return;
+      }
+      await this.writeRuntimeConfig(
         buildXrayConfig({
           rawUri: request.secrets.rawUri,
           socksHost: socksEndpoint.host,
           socksPort: socksEndpoint.port,
           httpHost: httpEndpoint.host,
           httpPort: httpEndpoint.port
-        }),
-        "utf8"
+        })
       );
-      const processHandle = spawn(executablePath, ["run", "-config", configPath], {
+      if (!this.isCurrentLifecycle(generation)) {
+        await this.removeRuntimeConfig();
+        return;
+      }
+      const processHandle = spawn(executablePath, ["run", "-config", this.configPath], {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true
       });
+      acquiredProcess = processHandle;
       this.process = processHandle;
-      processHandle.stdout.setEncoding("utf8");
-      processHandle.stderr.setEncoding("utf8");
-      processHandle.stdout.on("data", (data: string) => this.appendProcessLog("info", data));
-      processHandle.stderr.on("data", (data: string) => this.appendProcessLog("warning", data));
+      this.attachProcessLogging(processHandle, generation);
+      processHandle.on("error", (error) => this.handleXrayFailure(processHandle, generation, error));
       processHandle.once("close", (code, signal) => {
-        this.process = undefined;
-        void this.handleXrayClose(code, signal);
+        this.handleXrayClose(processHandle, generation, code, signal);
       });
-      await waitForProcessStartup(processHandle);
+      const startupAbortController = new AbortController();
+      this.startupAbortController = startupAbortController;
+      try {
+        await waitForProcessStartup(processHandle, [socksEndpoint, httpEndpoint], {
+          signal: startupAbortController.signal
+        });
+      } finally {
+        if (this.startupAbortController === startupAbortController) {
+          this.startupAbortController = undefined;
+        }
+      }
+      if (!this.isCurrentLifecycle(generation) || this.process !== processHandle) {
+        await this.cleanupProcessResources(processHandle);
+        return;
+      }
       this.socksEndpoint = socksEndpoint;
       this.httpEndpoint = httpEndpoint;
+      const effectiveRequest = this.lastRequest ?? request;
+      await this.applySystemRouting(effectiveRequest, socksEndpoint);
+      if (!this.isCurrentLifecycle(generation) || this.process !== processHandle) {
+        await this.cleanupProcessResources(processHandle);
+        return;
+      }
       this.setStatus({
         state: "Connected",
-        activeConfigId: request.profile.id,
+        activeConfigId: effectiveRequest.profile.id,
         connectedAt: new Date().toISOString(),
         reconnectAttempt: 0,
         realTunnelAvailable: true,
-        message: `Connected to ${request.profile.name}. Xray HTTP proxy ${httpEndpoint.host}:${httpEndpoint.port} and SOCKS proxy ${socksEndpoint.host}:${socksEndpoint.port} are live.`
+        message: `Connected to ${effectiveRequest.profile.name}. Xray HTTP proxy ${httpEndpoint.host}:${httpEndpoint.port} and SOCKS proxy ${socksEndpoint.host}:${socksEndpoint.port} are live.`
       });
-      this.appendDiagnostic("info", `Xray runtime started for ${request.profile.protocol.toUpperCase()} ${request.profile.host}:${request.profile.port}.`);
-      await this.applySystemRouting(request, socksEndpoint);
+      this.appendDiagnostic(
+        "info",
+        `Xray runtime started for ${effectiveRequest.profile.protocol.toUpperCase()} ${effectiveRequest.profile.host}:${effectiveRequest.profile.port}.`
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.stopRouting();
-      await this.stopXrayProcess();
+      await this.cleanupProcessResources(acquiredProcess);
+      if (!this.isCurrentLifecycle(generation)) {
+        return;
+      }
       this.setStatus({
         state: "Error",
         activeConfigId: request.profile.id,
@@ -195,11 +284,33 @@ export class XrayServiceBridge {
     }
   }
 
-  async disconnect(): Promise<void> {
+  disconnect(): Promise<void> {
+    if (this.disposed) {
+      return this.mutationTail;
+    }
     this.disconnectRequested = true;
     this.clearReconnectTimer();
+    this.cancelProcessStartup();
+    const generation = ++this.lifecycleGeneration;
+    this.setStatus({
+      state: "Disconnecting",
+      realTunnelAvailable: false,
+      message: "Disconnecting Xray transport."
+    });
+    return this.enqueueMutation(() => this.disconnectInternal(generation));
+  }
+
+  private async disconnectInternal(generation: number): Promise<void> {
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
+    const processHandle = this.process;
+    this.process = undefined;
     await this.stopRouting();
-    await this.stopXrayProcess();
+    await this.stopXrayProcess(processHandle);
+    if (!this.isCurrentLifecycle(generation)) {
+      return;
+    }
     this.setStatus({
       state: "Disconnected",
       activeConfigId: undefined,
@@ -254,11 +365,21 @@ export class XrayServiceBridge {
     this.emitError("SSH terminal is available only for SSH transport.");
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposed) {
+      return this.mutationTail;
+    }
+    this.disposed = true;
     this.disconnectRequested = true;
     this.clearReconnectTimer();
-    await this.stopRouting();
-    await this.stopXrayProcess();
+    this.cancelProcessStartup();
+    const generation = ++this.lifecycleGeneration;
+    this.setStatus({
+      state: "Disconnecting",
+      realTunnelAvailable: false,
+      message: "Stopping Xray service."
+    });
+    return this.enqueueMutation(() => this.disconnectInternal(generation));
   }
 
   private async requireExecutablePath(): Promise<string> {
@@ -274,25 +395,46 @@ export class XrayServiceBridge {
     }
   }
 
-  private async handleXrayClose(code: number | null, signal: NodeJS.Signals | null): Promise<void> {
-    await this.stopRouting();
-    this.socksEndpoint = undefined;
-    if (this.stoppingProcess) {
-      this.stoppingProcess = false;
-      this.httpEndpoint = undefined;
-      return;
-    }
-    if (this.disconnectRequested) {
+  private handleXrayClose(
+    processHandle: XrayProcess,
+    generation: number,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): void {
+    if (this.process !== processHandle || !this.isCurrentLifecycle(generation)) {
       return;
     }
     const reason = `Xray runtime exited${code === null ? "" : ` with code ${code}`}${signal ? ` signal ${signal}` : ""}.`;
-    this.appendDiagnostic("error", reason);
-    this.httpEndpoint = undefined;
-    this.scheduleReconnect(reason);
+    this.handleXrayFailure(processHandle, generation, new Error(reason));
   }
 
-  private scheduleReconnect(reason: string): void {
-    if (this.disconnectRequested || !this.lastRequest || this.reconnectTimer) {
+  private handleXrayFailure(processHandle: XrayProcess, generation: number, error: Error): void {
+    if (this.process !== processHandle || !this.isCurrentLifecycle(generation)) {
+      return;
+    }
+    const failureGeneration = ++this.lifecycleGeneration;
+    this.process = undefined;
+    this.socksEndpoint = undefined;
+    this.httpEndpoint = undefined;
+    this.clearReconnectTimer();
+    this.setStatus({
+      state: "Error",
+      realTunnelAvailable: false,
+      message: error.message
+    });
+    this.appendDiagnostic("error", error.message);
+    void this.enqueueMutation(async () => {
+      await this.stopRouting();
+      await this.stopXrayProcess(processHandle);
+      if (!this.isCurrentLifecycle(failureGeneration) || this.disconnectRequested) {
+        return;
+      }
+      this.scheduleReconnect(error.message, failureGeneration);
+    });
+  }
+
+  private scheduleReconnect(reason: string, generation: number): void {
+    if (this.disposed || !this.isCurrentLifecycle(generation) || this.disconnectRequested || !this.lastRequest || this.reconnectTimer) {
       return;
     }
     const attempt = this.status.reconnectAttempt + 1;
@@ -307,7 +449,7 @@ export class XrayServiceBridge {
     });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      if (this.lastRequest && !this.disconnectRequested) {
+      if (this.lastRequest && this.isCurrentLifecycle(generation) && !this.disconnectRequested) {
         void this.connect(this.lastRequest);
       }
     }, delayMs);
@@ -319,6 +461,11 @@ export class XrayServiceBridge {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+  }
+
+  private cancelProcessStartup(): void {
+    this.startupAbortController?.abort();
+    this.startupAbortController = undefined;
   }
 
   private async stopRouting(): Promise<void> {
@@ -334,27 +481,124 @@ export class XrayServiceBridge {
     this.httpEndpoint = undefined;
   }
 
-  private async stopXrayProcess(): Promise<void> {
-    const processHandle = this.process;
-    if (!processHandle) {
+  private async stopXrayProcess(processHandle: XrayProcess | undefined): Promise<void> {
+    try {
+      if (processHandle) {
+        this.stopParsingProcessLogs(processHandle);
+        if (this.process === processHandle) {
+          this.process = undefined;
+        }
+        await terminateProcess(processHandle);
+      }
+    } catch (error) {
+      this.appendDiagnostic("warning", `Xray process cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await this.removeRuntimeConfig();
+    }
+  }
+
+  private async writeRuntimeConfig(contents: string): Promise<void> {
+    await this.startupConfigCleanup;
+    await mkdir(this.runtimeDirectory, { recursive: true, mode: 0o700 });
+    await chmod(this.runtimeDirectory, 0o700).catch(() => undefined);
+    const temporaryPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporaryPath, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      await rm(this.configPath, { force: true });
+      await rename(temporaryPath, this.configPath);
+      await chmod(this.configPath, 0o600).catch(() => undefined);
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async removeRuntimeConfig(): Promise<void> {
+    await this.startupConfigCleanup;
+    await rm(this.configPath, { force: true }).catch(() => undefined);
+  }
+
+  private async cleanupProcessResources(processHandle: XrayProcess | undefined): Promise<void> {
+    if (this.process === processHandle) {
+      this.process = undefined;
+    }
+    await this.stopRouting();
+    await this.stopXrayProcess(processHandle);
+  }
+
+  private appendProcessLogFor(
+    processHandle: XrayProcess,
+    generation: number,
+    level: DiagnosticsEntry["level"],
+    chunk: string
+  ): boolean {
+    if (this.process === processHandle && this.isCurrentLifecycle(generation)) {
+      return this.appendProcessLog(level, chunk);
+    }
+    return false;
+  }
+
+  private attachProcessLogging(processHandle: XrayProcess, generation: number): void {
+    processHandle.stdout.setEncoding("utf8");
+    processHandle.stderr.setEncoding("utf8");
+    const stdoutLog = (data: string): void => {
+      if (!this.appendProcessLogFor(processHandle, generation, "info", data)) {
+        this.stopParsingProcessLogs(processHandle);
+      }
+    };
+    const stderrLog = (data: string): void => {
+      if (!this.appendProcessLogFor(processHandle, generation, "warning", data)) {
+        this.stopParsingProcessLogs(processHandle);
+      }
+    };
+    const drainWithoutParsing = (): void => {
+      processHandle.stdout.off("data", stdoutLog);
+      processHandle.stderr.off("data", stderrLog);
+      // Child stdio must remain flowing: pausing an unread pipe can eventually
+      // block the Xray process. resume() discards future output in native stream
+      // machinery without JS line parsing, UUIDs, IPC or renderer updates.
+      processHandle.stdout.resume();
+      processHandle.stderr.resume();
+    };
+    this.processLogDrainers.set(processHandle, drainWithoutParsing);
+    processHandle.stdout.on("data", stdoutLog);
+    processHandle.stderr.on("data", stderrLog);
+  }
+
+  private stopParsingProcessLogs(processHandle: XrayProcess): void {
+    const drain = this.processLogDrainers.get(processHandle);
+    if (!drain) {
       return;
     }
-    this.process = undefined;
-    this.stoppingProcess = true;
-    try {
-      await terminateProcess(processHandle);
-    } finally {
-      await rm(path.join(this.runtimeDirectory, "xray-config.json"), { force: true }).catch(() => undefined);
-    }
+    this.processLogDrainers.delete(processHandle);
+    drain();
+  }
+
+  private enqueueMutation(operation: () => Promise<void>): Promise<void> {
+    const result = this.mutationTail.then(operation, operation);
+    this.mutationTail = result.catch(() => undefined);
+    return result;
+  }
+
+  private isCurrentLifecycle(generation: number): boolean {
+    return generation === this.lifecycleGeneration;
+  }
+
+  private isCurrentMutation(lifecycleGeneration: number, routingGeneration: number): boolean {
+    return !this.disposed && this.isCurrentLifecycle(lifecycleGeneration) && routingGeneration === this.routingGeneration;
   }
 
   private async applySystemRouting(request: ProxyConnectRequest, socksEndpoint: { host: string; port: number }): Promise<void> {
     this.stopProcessRoutingMonitor();
+    const generation = this.processRoutingGeneration;
     const httpEndpoint = this.httpEndpoint ?? socksEndpoint;
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
     const hasProcessRouting = supportsDynamicProcessRouting(request.routingMode, request.routingRules);
     if (hasProcessRouting) {
-      await this.learnProcessRoutingIps(request.routingRules);
+      await this.learnProcessRoutingIps(request.routingRules, generation);
+      if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+        return;
+      }
       this.appendDiagnostic(
         "warning",
         "Selected process-name routing is using dynamic process-IP PAC rules. Non-matching traffic stays direct, but already-open target app sockets may need reconnect; strict per-process enforcement still requires WFP/TUN."
@@ -373,6 +617,9 @@ export class XrayServiceBridge {
       socksPort: httpEndpoint.port,
       proxyProtocol: "http"
     });
+    if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+      return;
+    }
     this.appendDiagnostic(result.applied ? "info" : "warning", result.message);
     if (hasProcessRouting) {
       this.startProcessRoutingMonitor(request, socksEndpoint);
@@ -394,23 +641,62 @@ export class XrayServiceBridge {
       return;
     }
 
-    this.processRoutingMonitor = setInterval(() => {
-      void this.refreshProcessRouting(request, socksEndpoint);
-    }, PROCESS_ROUTE_REFRESH_INTERVAL_MS);
+    const generation = this.processRoutingGeneration;
+    this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
+  }
+
+  private scheduleProcessRoutingRefresh(
+    request: ProxyConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number
+  ): void {
+    if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+      return;
+    }
+    this.processRoutingMonitor = setTimeout(() => {
+      this.processRoutingMonitor = undefined;
+      if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+        return;
+      }
+      if (this.processRoutingRefreshInFlight) {
+        this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
+        return;
+      }
+      this.processRoutingRefreshInFlight = true;
+      void this.enqueueMutation(() => this.refreshProcessRouting(request, socksEndpoint, generation))
+        .catch((error: unknown) => {
+          if (!this.processRoutingWarningEmitted) {
+            this.processRoutingWarningEmitted = true;
+            this.appendDiagnostic(
+              "warning",
+              `Process-name routing refresh failed for Xray transport: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        })
+        .finally(() => {
+          this.processRoutingRefreshInFlight = false;
+          this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
+        });
+    }, this.currentProcessRoutingRefreshIntervalMs());
     this.processRoutingMonitor.unref();
   }
 
   private stopProcessRoutingMonitor(): void {
+    this.processRoutingGeneration += 1;
     if (!this.processRoutingMonitor) {
       return;
     }
-    clearInterval(this.processRoutingMonitor);
+    clearTimeout(this.processRoutingMonitor);
     this.processRoutingMonitor = undefined;
   }
 
-  private async refreshProcessRouting(request: ProxyConnectRequest, socksEndpoint: { host: string; port: number }): Promise<void> {
-    const changed = await this.learnProcessRoutingIps(request.routingRules);
-    if (!changed) {
+  private async refreshProcessRouting(
+    request: ProxyConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number
+  ): Promise<void> {
+    const changed = await this.learnProcessRoutingIps(request.routingRules, generation);
+    if (!changed || generation !== this.processRoutingGeneration || this.status.state !== "Connected") {
       return;
     }
 
@@ -430,21 +716,24 @@ export class XrayServiceBridge {
     );
   }
 
-  private async learnProcessRoutingIps(rules: RoutingRule[]): Promise<boolean> {
+  private async learnProcessRoutingIps(rules: RoutingRule[], generation?: number): Promise<boolean> {
     if (!supportsDynamicProcessRouting("selected-rules", rules)) {
       return false;
     }
 
     try {
       const processNames = enabledProcessRuleNames(rules);
-      const connections = await listWindowsProcessConnections();
+      const connections = await listWindowsProcessConnections(processNames);
+      if (generation !== undefined && generation !== this.processRoutingGeneration) {
+        return false;
+      }
       const now = Date.now();
-      const expiresBefore = now - PROCESS_ROUTE_TTL_MS;
+      const expiresBefore = now - this.currentProcessRoutingTtlMs();
       const nextIps = new Map([...this.processRoutingIps].filter((entry) => entry[1] >= expiresBefore));
       for (const connection of connections) {
         const processName = normalizeRuleValue("process.name", connection.processName);
         if (processNames.has(processName)) {
-          nextIps.set(connection.remoteAddress, now);
+          recordBoundedProcessRouteIp(nextIps, connection.remoteAddress, now);
         }
       }
 
@@ -475,18 +764,44 @@ export class XrayServiceBridge {
     this.emit({ type: "status-changed", status: this.getStatus() });
   }
 
-  private appendProcessLog(level: DiagnosticsEntry["level"], chunk: string): void {
-    if (this.processLogLines >= 80) {
-      return;
+  private currentProcessRoutingRefreshIntervalMs(): number {
+    try {
+      const requested = this.processRoutingRefreshIntervalMs();
+      return Number.isFinite(requested) && requested >= 1_000
+        ? Math.min(requested, 10 * 60 * 1000)
+        : PROCESS_ROUTE_REFRESH_INTERVAL_MS;
+    } catch {
+      return PROCESS_ROUTE_REFRESH_INTERVAL_MS;
     }
-    for (const line of chunk.split(/\r?\n/u).map((entry) => entry.trim()).filter(Boolean)) {
-      this.processLogLines += 1;
-      if (this.processLogLines === 80) {
-        this.appendDiagnostic("info", "Further Xray runtime diagnostics are suppressed for this session.");
-        return;
+  }
+
+  private currentProcessRoutingTtlMs(): number {
+    return Math.max(PROCESS_ROUTE_TTL_MS, this.currentProcessRoutingRefreshIntervalMs() * 3);
+  }
+
+  private appendProcessLog(level: DiagnosticsEntry["level"], chunk: string): boolean {
+    if (this.processLogLines >= MAX_XRAY_PROCESS_LOG_LINES) {
+      return false;
+    }
+    const boundedChunk = chunk.length > MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS
+      ? chunk.slice(0, MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS)
+      : chunk;
+    for (const entry of boundedChunk.split(/\r?\n/u)) {
+      const line = entry.trim();
+      if (!line) {
+        continue;
       }
-      this.appendDiagnostic(level, `Xray: ${line}`);
+      this.processLogLines += 1;
+      if (this.processLogLines === MAX_XRAY_PROCESS_LOG_LINES) {
+        this.appendDiagnostic("info", "Further Xray runtime diagnostics are suppressed for this session.");
+        return false;
+      }
+      const boundedLine = line.length > MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS
+        ? `${line.slice(0, MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS)}…`
+        : line;
+      this.appendDiagnostic(level, `Xray: ${boundedLine}`);
     }
+    return true;
   }
 
   private appendDiagnostic(level: DiagnosticsEntry["level"], message: string): void {
@@ -511,6 +826,10 @@ export class XrayServiceBridge {
 
   private currentProcessRoutingIps(): Set<string> {
     return new Set(this.processRoutingIps.keys());
+  }
+
+  private isRoutingApplicable(): boolean {
+    return this.status.state === "Connecting" || this.status.state === "Connected";
   }
 }
 

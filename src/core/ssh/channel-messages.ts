@@ -1,11 +1,13 @@
 import { SshBinaryWriter } from "./binary.js";
 
 export const SSH_MSG_CHANNEL_OPEN = 90;
+export const SSH_MSG_CHANNEL_OPEN_FAILURE = 92;
 export const SSH_MSG_CHANNEL_DATA = 94;
 export const SSH_MSG_CHANNEL_WINDOW_ADJUST = 93;
 export const SSH_MSG_CHANNEL_EOF = 96;
 export const SSH_MSG_CHANNEL_CLOSE = 97;
 export const SSH_MSG_CHANNEL_REQUEST = 98;
+export const SSH_MSG_CHANNEL_FAILURE = 100;
 
 export interface ChannelOpenBase {
   senderChannel: number;
@@ -115,7 +117,18 @@ export function encodeWindowChangeRequest(request: WindowChangeRequest): Buffer 
 }
 
 export function encodeChannelData(request: ChannelData): Buffer {
-  return new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(request.recipientChannel).string(request.data).toBuffer();
+  if (!Number.isInteger(request.recipientChannel) || request.recipientChannel < 0 || request.recipientChannel > 0xffff_ffff) {
+    throw new Error("SSH channel recipient is outside uint32 range.");
+  }
+  // CHANNEL_DATA is the dominant upload hot path. Allocate its exact wire
+  // payload once instead of creating byte/uint32/string fragments and joining
+  // them through Buffer.concat before packet encryption.
+  const payload = Buffer.allocUnsafe(9 + request.data.length);
+  payload.writeUInt8(SSH_MSG_CHANNEL_DATA, 0);
+  payload.writeUInt32BE(request.recipientChannel, 1);
+  payload.writeUInt32BE(request.data.length, 5);
+  request.data.copy(payload, 9);
+  return payload;
 }
 
 export function encodeChannelWindowAdjust(recipientChannel: number, bytesToAdd: number): Buffer {
@@ -128,4 +141,23 @@ export function encodeChannelEof(recipientChannel: number): Buffer {
 
 export function encodeChannelClose(recipientChannel: number): Buffer {
   return new SshBinaryWriter().byte(SSH_MSG_CHANNEL_CLOSE).uint32(recipientChannel).toBuffer();
+}
+
+export function encodeChannelOpenFailure(
+  recipientChannel: number,
+  reasonCode = 1,
+  description = "Server-initiated channels are not supported.",
+  language = ""
+): Buffer {
+  return new SshBinaryWriter()
+    .byte(SSH_MSG_CHANNEL_OPEN_FAILURE)
+    .uint32(recipientChannel)
+    .uint32(reasonCode)
+    .string(description)
+    .string(language)
+    .toBuffer();
+}
+
+export function encodeChannelFailure(recipientChannel: number): Buffer {
+  return new SshBinaryWriter().byte(SSH_MSG_CHANNEL_FAILURE).uint32(recipientChannel).toBuffer();
 }

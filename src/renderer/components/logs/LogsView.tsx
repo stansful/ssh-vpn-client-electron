@@ -1,4 +1,5 @@
 import { Clipboard, RefreshCw, Trash2 } from "lucide-react";
+import { useMemo } from "react";
 import { formatRuntimeDiagnostics } from "../../lib/diagnostics.js";
 import type { AppSettings, AppSnapshot } from "../../../shared/types.js";
 
@@ -19,6 +20,11 @@ export function LogsView({
   onCopy: () => void;
   onClear: () => void;
 }): JSX.Element {
+  const displayedLog = useMemo(
+    () => fileLog || formatRuntimeDiagnostics(snapshot) || "No log content.",
+    [fileLog, snapshot.diagnostics]
+  );
+
   return (
     <section className="screen logs-screen">
       <section className="panel logs-control-panel">
@@ -66,7 +72,7 @@ export function LogsView({
             </button>
           </div>
         </div>
-        <textarea className="file-log-output" readOnly value={fileLog || formatRuntimeDiagnostics(snapshot) || "No log content."} />
+        <textarea className="file-log-output" readOnly value={displayedLog} />
       </section>
     </section>
   );

@@ -22,8 +22,11 @@ export interface SshKexInit {
 export const DEFAULT_KEX_INIT: Omit<SshKexInit, "cookie"> = {
   kexAlgorithms: ["curve25519-sha256", "curve25519-sha256@libssh.org", "diffie-hellman-group14-sha256"],
   serverHostKeyAlgorithms: ["rsa-sha2-512", "rsa-sha2-256", "ssh-ed25519"],
-  encryptionAlgorithmsClientToServer: ["aes256-ctr", "aes192-ctr", "aes128-ctr"],
-  encryptionAlgorithmsServerToClient: ["aes256-ctr", "aes192-ctr", "aes128-ctr"],
+  // Prefer AES-128 for lower client CPU cost and higher bulk throughput while
+  // retaining a full 128-bit security level; stronger-key variants remain
+  // available for servers whose policy requires them.
+  encryptionAlgorithmsClientToServer: ["aes128-ctr", "aes256-ctr", "aes192-ctr"],
+  encryptionAlgorithmsServerToClient: ["aes128-ctr", "aes256-ctr", "aes192-ctr"],
   macAlgorithmsClientToServer: ["hmac-sha2-256", "hmac-sha2-512"],
   macAlgorithmsServerToClient: ["hmac-sha2-256", "hmac-sha2-512"],
   compressionAlgorithmsClientToServer: ["none"],

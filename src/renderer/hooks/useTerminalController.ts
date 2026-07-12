@@ -1,28 +1,41 @@
 import { useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
 import { api } from "../api.js";
 import { toErrorMessage } from "../lib/labels.js";
+import { TerminalDisplayBuffer } from "../lib/terminal-display-buffer.js";
 import type { AppSnapshot, RuntimeStatus } from "../../shared/types.js";
 
 export function useTerminalController({
   snapshot,
   runtime,
+  terminalVisible,
   setSnapshot,
   setNotice
 }: {
   snapshot: AppSnapshot | undefined;
   runtime: RuntimeStatus | undefined;
+  terminalVisible: boolean;
   setSnapshot: Dispatch<SetStateAction<AppSnapshot | undefined>>;
   setNotice: Dispatch<SetStateAction<string>>;
 }) {
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalOpening, setTerminalOpening] = useState(false);
-  const [terminalShellOpen, setTerminalShellOpen] = useState(false);
   const terminalStartupNormalized = useRef(false);
-  const terminalText = useMemo(() => (snapshot?.terminal ?? []).map((line) => line.text).join(""), [snapshot?.terminal]);
+  const terminalShellOpenRef = useRef(false);
+  const terminalMutationRef = useRef<Promise<void>>();
+  const terminalDisplayBuffer = useRef<TerminalDisplayBuffer>();
+  if (!terminalDisplayBuffer.current) {
+    terminalDisplayBuffer.current = new TerminalDisplayBuffer();
+  }
+  const runtimeConnectedRef = useRef(runtime?.state === "Connected");
+  runtimeConnectedRef.current = runtime?.state === "Connected";
+  const terminalText = useMemo(
+    () => terminalDisplayBuffer.current?.update(snapshot?.terminal ?? [], terminalVisible) ?? "",
+    [snapshot?.terminal, terminalVisible]
+  );
 
   useEffect(() => {
     if (snapshot?.runtime.state !== "Connected") {
-      setTerminalShellOpen(false);
+      terminalShellOpenRef.current = false;
     }
   }, [snapshot?.runtime.state]);
 
@@ -33,7 +46,7 @@ export function useTerminalController({
     terminalStartupNormalized.current = true;
     if (snapshot.runtime.state !== "Connected" && snapshot.store.settings.terminalExpanded) {
       void api
-        .updateSettings({ ...snapshot.store.settings, terminalExpanded: false })
+        .updateSettings({ terminalExpanded: false })
         .then(setSnapshot)
         .catch((error: unknown) => setNotice(toErrorMessage(error)));
     }
@@ -50,7 +63,7 @@ export function useTerminalController({
     if (!terminalInput.trim()) {
       return;
     }
-    void api.terminalInput(`${terminalInput}\n`);
+    void api.terminalInput(`${terminalInput}\n`).catch((error: unknown) => setNotice(toErrorMessage(error)));
     setTerminalInput("");
   }
 
@@ -59,11 +72,11 @@ export function useTerminalController({
       return;
     }
     try {
-      const next = await api.updateSettings({ ...snapshot.store.settings, terminalExpanded: open });
+      const next = await api.updateSettings({ terminalExpanded: open });
       setSnapshot(next);
       if (open) {
         await ensureTerminalShellOpen();
-      } else if (terminalShellOpen && runtime?.state === "Connected") {
+      } else {
         await closeTerminalShell(false);
       }
     } catch (error) {
@@ -72,39 +85,50 @@ export function useTerminalController({
   }
 
   async function ensureTerminalShellOpen(): Promise<void> {
-    if (runtime?.state !== "Connected" || terminalShellOpen || terminalOpening) {
-      return;
-    }
-    setTerminalOpening(true);
     try {
-      const next = await api.openTerminal();
-      setSnapshot(next);
-      setTerminalShellOpen(true);
+      await enqueueTerminalMutation(async () => {
+        if (!runtimeConnectedRef.current || terminalShellOpenRef.current) {
+          return;
+        }
+        const next = await api.openTerminal();
+        setSnapshot(next);
+        const opened = runtimeConnectedRef.current && next.runtime.state === "Connected";
+        terminalShellOpenRef.current = opened;
+      });
     } catch (error) {
       setNotice(toErrorMessage(error));
-    } finally {
-      setTerminalOpening(false);
     }
   }
 
   async function closeTerminalShell(collapse = true): Promise<void> {
-    if (terminalOpening) {
-      return;
-    }
-    setTerminalOpening(true);
     try {
-      const next = await api.closeTerminal();
-      setSnapshot(next);
-      setTerminalShellOpen(false);
+      await enqueueTerminalMutation(async () => {
+        if (terminalShellOpenRef.current && runtimeConnectedRef.current) {
+          const next = await api.closeTerminal();
+          setSnapshot(next);
+        }
+        terminalShellOpenRef.current = false;
+      });
       if (collapse && snapshot) {
-        const collapsed = await api.updateSettings({ ...snapshot.store.settings, terminalExpanded: false });
+        const collapsed = await api.updateSettings({ terminalExpanded: false });
         setSnapshot(collapsed);
       }
     } catch (error) {
       setNotice(toErrorMessage(error));
-    } finally {
-      setTerminalOpening(false);
     }
+  }
+
+  function enqueueTerminalMutation(operation: () => Promise<void>): Promise<void> {
+    const previous = terminalMutationRef.current ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(operation);
+    terminalMutationRef.current = next;
+    setTerminalOpening(true);
+    return next.finally(() => {
+      if (terminalMutationRef.current === next) {
+        terminalMutationRef.current = undefined;
+        setTerminalOpening(false);
+      }
+    });
   }
 
   return {

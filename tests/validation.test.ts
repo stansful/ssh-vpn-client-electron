@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateDomainPattern, validateIpOrCidr, validateProcessName } from "../src/shared/validation.js";
+import { validateDomainPattern, validateIpOrCidr, validateProcessName, validateSshServerFingerprint } from "../src/shared/validation.js";
 
 describe("routing rule validation", () => {
   it("accepts exact and wildcard domain patterns", () => {
@@ -29,5 +29,12 @@ describe("routing rule validation", () => {
     expect(validateProcessName("chrome.exe").ok).toBe(true);
     expect(validateProcessName("Google Chrome").ok).toBe(true);
     expect(validateProcessName("C:\\Windows\\notepad.exe").ok).toBe(false);
+  });
+
+  it("validates OpenSSH SHA256 server fingerprint pins", () => {
+    expect(validateSshServerFingerprint(`SHA256:${"A".repeat(43)}`).ok).toBe(true);
+    expect(validateSshServerFingerprint("").ok).toBe(true);
+    expect(validateSshServerFingerprint("", false).ok).toBe(false);
+    expect(validateSshServerFingerprint("sha256:not-a-pin").ok).toBe(false);
   });
 });

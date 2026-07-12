@@ -4,17 +4,23 @@ package platform
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"unsafe"
 )
 
 const (
-	afInet                  = 2
-	afInet6                 = 23
-	tcpTableOwnerPIDAll     = 5
-	processQueryLimitedInfo = 0x1000
+	afInet                   = 2
+	afInet6                  = 23
+	tcpTableOwnerPIDAll      = 5
+	processQueryLimitedInfo  = 0x1000
+	errorInsufficientBuffer  = 122
+	extendedTableMaxAttempts = 3
+	extendedTableMaxBytes    = 64 * 1024 * 1024
+	maxProcessConnections    = 20_000
 )
 
 var (
@@ -46,18 +52,22 @@ type mibTCP6RowOwnerPID struct {
 }
 
 func listWindowsProcessConnections() ([]ProcessConnection, error) {
-	ipv4, err := listWindowsTCP4Connections()
+	// A process commonly owns many sockets. Resolve its image path once per
+	// snapshot instead of issuing OpenProcess/QueryFullProcessImageName for every
+	// row in both address families.
+	processNames := make(map[int]string)
+	ipv4, err := listWindowsTCP4Connections(processNames, maxProcessConnections)
 	if err != nil {
 		return nil, err
 	}
-	ipv6, err := listWindowsTCP6Connections()
+	ipv6, err := listWindowsTCP6Connections(processNames, maxProcessConnections-len(ipv4))
 	if err != nil {
 		return nil, err
 	}
 	return append(ipv4, ipv6...), nil
 }
 
-func listWindowsTCP4Connections() ([]ProcessConnection, error) {
+func listWindowsTCP4Connections(processNames map[int]string, limit int) ([]ProcessConnection, error) {
 	buffer, err := extendedTCPTableBuffer(afInet)
 	if err != nil {
 		return nil, err
@@ -68,6 +78,7 @@ func listWindowsTCP4Connections() ([]ProcessConnection, error) {
 
 	count := *(*uint32)(unsafe.Pointer(&buffer[0]))
 	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
+	count = boundedRowCount(count, len(buffer), rowSize, limit)
 	connections := make([]ProcessConnection, 0, count)
 	for index := uint32(0); index < count; index++ {
 		offset := uintptr(4) + uintptr(index)*rowSize
@@ -78,7 +89,7 @@ func listWindowsTCP4Connections() ([]ProcessConnection, error) {
 		pid := int(row.OwningPID)
 		connections = append(connections, ProcessConnection{
 			PID:           pid,
-			ProcessName:   processName(pid),
+			ProcessName:   cachedProcessName(processNames, pid),
 			LocalAddress:  ipv4FromDWORD(row.LocalAddr),
 			LocalPort:     portFromDWORD(row.LocalPort),
 			RemoteAddress: ipv4FromDWORD(row.RemoteAddr),
@@ -89,7 +100,7 @@ func listWindowsTCP4Connections() ([]ProcessConnection, error) {
 	return connections, nil
 }
 
-func listWindowsTCP6Connections() ([]ProcessConnection, error) {
+func listWindowsTCP6Connections(processNames map[int]string, limit int) ([]ProcessConnection, error) {
 	buffer, err := extendedTCPTableBuffer(afInet6)
 	if err != nil {
 		return nil, err
@@ -100,6 +111,7 @@ func listWindowsTCP6Connections() ([]ProcessConnection, error) {
 
 	count := *(*uint32)(unsafe.Pointer(&buffer[0]))
 	rowSize := unsafe.Sizeof(mibTCP6RowOwnerPID{})
+	count = boundedRowCount(count, len(buffer), rowSize, limit)
 	connections := make([]ProcessConnection, 0, count)
 	for index := uint32(0); index < count; index++ {
 		offset := uintptr(4) + uintptr(index)*rowSize
@@ -110,10 +122,10 @@ func listWindowsTCP6Connections() ([]ProcessConnection, error) {
 		pid := int(row.OwningPID)
 		connections = append(connections, ProcessConnection{
 			PID:           pid,
-			ProcessName:   processName(pid),
-			LocalAddress:  netip.AddrFrom16(row.LocalAddr).String(),
+			ProcessName:   cachedProcessName(processNames, pid),
+			LocalAddress:  scopedIPv6(row.LocalAddr, row.LocalScopeID),
 			LocalPort:     portFromDWORD(row.LocalPort),
-			RemoteAddress: netip.AddrFrom16(row.RemoteAddr).String(),
+			RemoteAddress: scopedIPv6(row.RemoteAddr, row.RemoteScopeID),
 			RemotePort:    portFromDWORD(row.RemotePort),
 			Protocol:      "tcp6",
 		})
@@ -123,23 +135,72 @@ func listWindowsTCP6Connections() ([]ProcessConnection, error) {
 
 func extendedTCPTableBuffer(addressFamily uint32) ([]byte, error) {
 	var size uint32
-	_, _, _ = procGetExtendedTCPTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, uintptr(addressFamily), uintptr(tcpTableOwnerPIDAll), 0)
+	result, _, _ := procGetExtendedTCPTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, uintptr(addressFamily), uintptr(tcpTableOwnerPIDAll), 0)
+	if result != 0 && result != errorInsufficientBuffer {
+		return nil, syscall.Errno(result)
+	}
 	if size == 0 {
 		return nil, nil
 	}
-	buffer := make([]byte, size)
-	result, _, err := procGetExtendedTCPTable.Call(
-		uintptr(unsafe.Pointer(&buffer[0])),
-		uintptr(unsafe.Pointer(&size)),
-		1,
-		uintptr(addressFamily),
-		uintptr(tcpTableOwnerPIDAll),
-		0,
-	)
-	if result != 0 {
-		return nil, err
+	if size > extendedTableMaxBytes {
+		return nil, fmt.Errorf("Windows TCP table requires %d bytes; limit is %d", size, extendedTableMaxBytes)
 	}
-	return buffer[:size], nil
+
+	for attempt := 0; attempt < extendedTableMaxAttempts; attempt++ {
+		buffer := make([]byte, size)
+		result, _, _ = procGetExtendedTCPTable.Call(
+			uintptr(unsafe.Pointer(&buffer[0])),
+			uintptr(unsafe.Pointer(&size)),
+			1,
+			uintptr(addressFamily),
+			uintptr(tcpTableOwnerPIDAll),
+			0,
+		)
+		if result == 0 {
+			if size > uint32(len(buffer)) {
+				return nil, syscall.Errno(errorInsufficientBuffer)
+			}
+			return buffer[:size], nil
+		}
+		if result != errorInsufficientBuffer || size == 0 {
+			return nil, syscall.Errno(result)
+		}
+		if size > extendedTableMaxBytes {
+			return nil, fmt.Errorf("Windows TCP table requires %d bytes; limit is %d", size, extendedTableMaxBytes)
+		}
+	}
+	return nil, syscall.Errno(errorInsufficientBuffer)
+}
+
+func boundedRowCount(reported uint32, bufferLength int, rowSize uintptr, limit int) uint32 {
+	if bufferLength <= 4 || rowSize == 0 || limit <= 0 {
+		return 0
+	}
+	available := uint32(uintptr(bufferLength-4) / rowSize)
+	if reported > available {
+		reported = available
+	}
+	if reported > uint32(limit) {
+		return uint32(limit)
+	}
+	return reported
+}
+
+func cachedProcessName(cache map[int]string, pid int) string {
+	if name, exists := cache[pid]; exists {
+		return name
+	}
+	name := processName(pid)
+	cache[pid] = name
+	return name
+}
+
+func scopedIPv6(value [16]byte, scopeID uint32) string {
+	address := netip.AddrFrom16(value)
+	if scopeID != 0 {
+		address = address.WithZone(strconv.FormatUint(uint64(scopeID), 10))
+	}
+	return address.String()
 }
 
 func processName(pid int) string {

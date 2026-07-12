@@ -87,7 +87,7 @@ func NewMatcher(mode Mode, rules []Rule) Matcher {
 		normalized := normalizeRuleValue(rule.Type, rule.Value)
 		switch rule.Type {
 		case RuleDomain:
-			if normalized == "" {
+			if !validDomainPattern(normalized) {
 				matcher.invalid++
 				continue
 			}
@@ -104,7 +104,7 @@ func NewMatcher(mode Mode, rules []Rule) Matcher {
 			}
 			matcher.ips = append(matcher.ips, compiledIPRule{id: rule.ID, prefix: prefix})
 		case RuleProcessName:
-			if normalized == "" {
+			if !validProcessName(normalized) {
 				matcher.invalid++
 				continue
 			}
@@ -114,6 +114,52 @@ func NewMatcher(mode Mode, rules []Rule) Matcher {
 		}
 	}
 	return matcher
+}
+
+func validDomainPattern(value string) bool {
+	domain := strings.TrimPrefix(value, "*.")
+	return validDomainName(domain, true)
+}
+
+func ValidProxyDomain(value string) bool {
+	domain := strings.ToLower(strings.TrimSpace(value))
+	domain = strings.TrimPrefix(domain, "*.")
+	domain = strings.TrimPrefix(domain, ".")
+	return validDomainName(domain, false)
+}
+
+func validDomainName(domain string, requireMultipleLabels bool) bool {
+	if domain == "" || len(domain) > 253 || requireMultipleLabels && !strings.Contains(domain, ".") {
+		return false
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) < 1 || len(label) > 63 || !isASCIIAlphaNumeric(label[0]) || !isASCIIAlphaNumeric(label[len(label)-1]) {
+			return false
+		}
+		for index := 1; index < len(label)-1; index++ {
+			if !isASCIIAlphaNumeric(label[index]) && label[index] != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validProcessName(value string) bool {
+	if value == "" || len(value) > 260 || strings.ContainsAny(value, `/\\`) {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if !isASCIIAlphaNumeric(character) && !strings.ContainsRune("._+- ", rune(character)) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
 }
 
 func (m Matcher) Decide(descriptor Descriptor) Decision {

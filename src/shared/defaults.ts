@@ -25,6 +25,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   diagnosticsLoggingEnabled: true,
   fileLoggingEnabled: true,
   closeToTrayEnabled: true,
+  releaseRendererInTrayEnabled: true,
   startWithWindowsInTray: false,
   autoConnectOnStartup: true,
   sidebarCollapsed: false,

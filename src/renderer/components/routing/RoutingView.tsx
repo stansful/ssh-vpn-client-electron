@@ -1,9 +1,12 @@
 import { Copy, Download, ExternalLink, FileText, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
-import { useMemo, useState, type ChangeEvent, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useMemo, useState, type ChangeEvent, type Dispatch, type SetStateAction } from "react";
 import { placeholderForRule, routingSaveLabel } from "../../lib/labels.js";
+import { nextRenderPageCount, sliceRenderPage } from "../../lib/render-page.js";
 import type { RoutingSaveState } from "../../types.js";
 import type { RoutingDirectList, RoutingProxyList, RoutingRule, RoutingRuleType } from "../../../shared/types.js";
 import { EmptyState, Modal, Segmented } from "../ui/index.js";
+
+const RULE_RENDER_PAGE_SIZE = 200;
 
 export function RoutingView({
   ruleTab,
@@ -60,9 +63,19 @@ export function RoutingView({
   onCopySource: () => void;
   onUpdateRules: (mutator: (rules: RoutingRule[]) => RoutingRule[]) => void;
 }): JSX.Element {
+  const rulePageKey = JSON.stringify([ruleTab, ruleSearch, filteredRules.length]);
   const [openList, setOpenList] = useState<{ title: string; domains: string[] } | undefined>();
+  const [rulePage, setRulePage] = useState(() => ({ key: rulePageKey, count: RULE_RENDER_PAGE_SIZE }));
   const openListText = useMemo(() => openList?.domains.join("\n") ?? "", [openList]);
   const enabledDomainCount = (proxyList.enabled ? proxyList.domains.length : 0) + (directList.enabled ? directList.domains.length : 0);
+  const visibleRuleCount = rulePage.key === rulePageKey ? rulePage.count : RULE_RENDER_PAGE_SIZE;
+  const visibleRules = sliceRenderPage(filteredRules, visibleRuleCount);
+
+  useEffect(() => {
+    setRulePage((current) => current.key === rulePageKey
+      ? current
+      : { key: rulePageKey, count: RULE_RENDER_PAGE_SIZE });
+  }, [rulePageKey]);
 
   return (
     <section className="screen">
@@ -193,7 +206,7 @@ export function RoutingView({
         )}
 
         <div className="rules-list">
-          {filteredRules.map((rule) => (
+          {visibleRules.map((rule) => (
             <article className="rule-row" key={rule.id}>
               <label className="toggle">
                 <input
@@ -224,6 +237,20 @@ export function RoutingView({
           ))}
           {filteredRules.length === 0 && <EmptyState text="No rules match this view." />}
         </div>
+        {visibleRules.length < filteredRules.length && (
+          <div className="button-row">
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => setRulePage({
+                key: rulePageKey,
+                count: nextRenderPageCount(visibleRuleCount, filteredRules.length, RULE_RENDER_PAGE_SIZE)
+              })}
+            >
+              Show more ({filteredRules.length - visibleRules.length} remaining)
+            </button>
+          </div>
+        )}
       </section>
     </section>
   );

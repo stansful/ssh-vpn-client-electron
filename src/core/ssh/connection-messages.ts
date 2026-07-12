@@ -44,6 +44,25 @@ export interface ChannelDataPayload {
   data: Buffer;
 }
 
+export interface ChannelExtendedDataPayload extends ChannelDataPayload {
+  dataTypeCode: number;
+}
+
+export interface ChannelOpenRequest {
+  channelType: string;
+  senderChannel: number;
+  initialWindowSize: number;
+  maximumPacketSize: number;
+  requestData: Buffer;
+}
+
+export interface ChannelRequest {
+  recipientChannel: number;
+  requestType: string;
+  wantReply: boolean;
+  requestData: Buffer;
+}
+
 export function messageNumber(payload: Buffer): number {
   if (payload.length === 0) {
     throw new Error("SSH payload is empty.");
@@ -110,6 +129,38 @@ export function decodeChannelData(payload: Buffer): ChannelDataPayload {
   };
   ensureEof(reader, "CHANNEL_DATA");
   return data;
+}
+
+export function decodeChannelExtendedData(payload: Buffer): ChannelExtendedDataPayload {
+  const reader = expectMessage(payload, SSH_MSG_CHANNEL_EXTENDED_DATA);
+  const data = {
+    recipientChannel: reader.uint32(),
+    dataTypeCode: reader.uint32(),
+    data: reader.string()
+  };
+  ensureEof(reader, "CHANNEL_EXTENDED_DATA");
+  return data;
+}
+
+export function decodeChannelOpen(payload: Buffer): ChannelOpenRequest {
+  const reader = expectMessage(payload, 90);
+  return {
+    channelType: reader.utf8String(),
+    senderChannel: reader.uint32(),
+    initialWindowSize: reader.uint32(),
+    maximumPacketSize: reader.uint32(),
+    requestData: reader.remaining()
+  };
+}
+
+export function decodeChannelRequest(payload: Buffer): ChannelRequest {
+  const reader = expectMessage(payload, 98);
+  return {
+    recipientChannel: reader.uint32(),
+    requestType: reader.utf8String(),
+    wantReply: reader.boolean(),
+    requestData: reader.remaining()
+  };
 }
 
 export function decodeChannelEndpoint(payload: Buffer, expectedMessage: number): number {

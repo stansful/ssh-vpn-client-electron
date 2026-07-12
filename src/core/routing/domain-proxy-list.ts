@@ -1,5 +1,6 @@
 const MAX_PROXY_DOMAINS = 20_000;
-const DOMAIN_TOKEN = /^[*.]?[a-z0-9][a-z0-9.-]*[a-z0-9]$/iu;
+const MAX_DOMAIN_LENGTH = 253;
+const DOMAIN_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/iu;
 
 export function parseDomainProxyList(text: string): string[] {
   const domains = new Set<string>();
@@ -21,12 +22,21 @@ export function normalizeProxyDomain(value: string): string | undefined {
   if (!trimmed || trimmed.startsWith("#")) {
     return undefined;
   }
-  const normalized = trimmed.startsWith("*.") ? trimmed.slice(1) : trimmed;
-  if (normalized.includes("/") || normalized.includes(":") || normalized.includes("@")) {
+  const suffixRule = trimmed.startsWith(".") || trimmed.startsWith("*.");
+  const domain = trimmed.startsWith("*.")
+    ? trimmed.slice(2)
+    : trimmed.startsWith(".")
+      ? trimmed.slice(1)
+      : trimmed;
+  if (!domain || domain.length > MAX_DOMAIN_LENGTH) {
     return undefined;
   }
-  if (!DOMAIN_TOKEN.test(normalized)) {
+  const labels = domain.split(".");
+  // A leading dot intentionally represents a TLD suffix such as `.ru` in the
+  // built-in country list. Bare single-label hostnames (for example
+  // `localhost`) are not valid proxy-list domains.
+  if ((!suffixRule && labels.length < 2) || !labels.every((label) => DOMAIN_LABEL.test(label))) {
     return undefined;
   }
-  return normalized;
+  return suffixRule ? `.${domain}` : domain;
 }

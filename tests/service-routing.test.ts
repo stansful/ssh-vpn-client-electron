@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildSelectedRulesWithProcessIps, describeUnsupportedSelectedRouting } from "../src/service/live-ssh-service.js";
+import {
+  buildSelectedRulesWithProcessIps,
+  describeUnsupportedSelectedRouting,
+  recordBoundedProcessRouteIp
+} from "../src/service/live-ssh-service.js";
 import type { ConnectRequest, RoutingRule, SshConfig } from "../src/shared/types.js";
 
 describe("live service routing support checks", () => {
@@ -51,6 +55,29 @@ describe("live service routing support checks", () => {
 
     expect(augmented.filter((rule) => rule.type === "ip" && rule.value === "149.154.167.41")).toHaveLength(1);
     expect(augmented).toEqual(expect.arrayContaining([expect.objectContaining({ type: "ip", value: "149.154.167.50" })]));
+  });
+
+  it("does not turn invalid learned endpoints into PAC IP rules", () => {
+    const rules: RoutingRule[] = [
+      { id: "proc", type: "process.name", value: "telegram.exe", enabled: true, createdAt: "", updatedAt: "" }
+    ];
+
+    const augmented = buildSelectedRulesWithProcessIps(rules, new Set(["*", "0", "999.1.1.1", "149.154.167.50"]));
+
+    expect(augmented.filter((rule) => rule.type === "ip").map((rule) => rule.value)).toEqual(["149.154.167.50"]);
+  });
+
+  it("bounds learned process destinations and retains recently refreshed IPs", () => {
+    const entries = new Map<string, number>();
+    recordBoundedProcessRouteIp(entries, "1.1.1.1", 1, 2);
+    recordBoundedProcessRouteIp(entries, "2.2.2.2", 2, 2);
+    recordBoundedProcessRouteIp(entries, "1.1.1.1", 3, 2);
+    recordBoundedProcessRouteIp(entries, "3.3.3.3", 4, 2);
+
+    expect([...entries]).toEqual([
+      ["1.1.1.1", 3],
+      ["3.3.3.3", 4]
+    ]);
   });
 });
 

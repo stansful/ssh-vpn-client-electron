@@ -1,6 +1,7 @@
+import { memo } from "react";
 import { StatusPill } from "../ui/index.js";
 
-export function Topbar({ title, message, state }: { title: string; message: string | undefined; state: string }): JSX.Element {
+export const Topbar = memo(function Topbar({ title, message, state }: { title: string; message: string | undefined; state: string }): JSX.Element {
   return (
     <header className="topbar">
       <div>
@@ -10,4 +11,4 @@ export function Topbar({ title, message, state }: { title: string; message: stri
       <StatusPill state={state} />
     </header>
   );
-}
+});

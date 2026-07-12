@@ -119,6 +119,7 @@ export interface AppSettings {
   diagnosticsLoggingEnabled: boolean;
   fileLoggingEnabled: boolean;
   closeToTrayEnabled: boolean;
+  releaseRendererInTrayEnabled: boolean;
   startWithWindowsInTray: boolean;
   autoConnectOnStartup: boolean;
   sidebarCollapsed: boolean;

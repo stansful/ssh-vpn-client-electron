@@ -52,8 +52,15 @@ export function ConfigForm({
             </select>
           </Field>
         )}
-        <Field label="Expected server fingerprint">
-          <input value={draft.expectedServerFingerprint} onChange={(event) => set("expectedServerFingerprint", event.target.value)} />
+        <Field label="Expected server fingerprint (optional)">
+          <input
+            value={draft.expectedServerFingerprint}
+            placeholder="SHA256:base64-fingerprint"
+            spellCheck={false}
+            autoCapitalize="off"
+            onChange={(event) => set("expectedServerFingerprint", event.target.value)}
+          />
+          <small className="field-hint">Leave blank to connect without a pinned server fingerprint.</small>
         </Field>
         <Field label="Keepalive interval, sec">
           <input type="number" min={60} max={3600} value={draft.keepaliveIntervalSec} onChange={(event) => set("keepaliveIntervalSec", Number(event.target.value))} />

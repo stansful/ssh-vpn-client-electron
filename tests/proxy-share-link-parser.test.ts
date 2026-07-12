@@ -69,4 +69,12 @@ describe("proxy share-link parser", () => {
       "vless://11111111-1111-4111-8111-111111111111@example.com:443?type=h2&security=tls#h2"
     )).toMatchObject({ transport: "http" });
   });
+
+  it("rejects oversized direct links and bulk input before parsing", () => {
+    expect(() => parseProxyShareLink(`vless://${"a".repeat(64 * 1024)}`)).toThrow(/longer/u);
+
+    const result = parseProxyShareLinks("a".repeat(2 * 1024 * 1024 + 1));
+    expect(result.profiles).toEqual([]);
+    expect(result.errors[0]).toMatch(/Import text is longer/u);
+  });
 });

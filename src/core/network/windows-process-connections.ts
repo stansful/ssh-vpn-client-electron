@@ -18,21 +18,46 @@ interface RawPowerShellConnection {
   state?: unknown;
 }
 
-export async function listWindowsProcessConnections(): Promise<WindowsProcessConnection[]> {
+export async function listWindowsProcessConnections(processNames?: Iterable<string>): Promise<WindowsProcessConnection[]> {
   if (process.platform !== "win32") {
     return [];
   }
 
+  const targets = processNames === undefined
+    ? undefined
+    : [...new Set([...processNames].map((name) => name.trim().toLowerCase()).filter(Boolean))];
+  if (targets?.length === 0) {
+    return [];
+  }
+  const encodedTargets = targets === undefined
+    ? ""
+    : Buffer.from(JSON.stringify(targets), "utf8").toString("base64");
+
   const script = [
     "$ErrorActionPreference = 'SilentlyContinue'",
+    encodedTargets
+      ? `$targetJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedTargets}'))`
+      : "$targetJson = '[]'",
+    "$targets = @{}",
+    "@($targetJson | ConvertFrom-Json) | ForEach-Object { $targets[[string]$_.ToLowerInvariant()] = $true }",
+    "$connections = @(Get-NetTCPConnection -State Established,SynSent)",
     "$p = @{}",
-    "Get-Process | ForEach-Object { $p[[int]$_.Id] = ($_.ProcessName + '.exe') }",
-    "Get-NetTCPConnection -State Established,SynSent | ForEach-Object {",
+    "$ids = @($connections | Select-Object -ExpandProperty OwningProcess -Unique)",
+    "if ($ids.Count -gt 0) {",
+    "  Get-Process -Id $ids | ForEach-Object {",
+    "    $name = ($_.ProcessName + '.exe')",
+    "    if ($targets.Count -eq 0 -or $targets.ContainsKey($name.ToLowerInvariant())) { $p[[int]$_.Id] = $name }",
+    "  }",
+    "}",
+    "$connections | ForEach-Object {",
+    "  $name = $p[[int]$_.OwningProcess]",
+    "  if ($name) {",
     "  [PSCustomObject]@{",
-    "    processName = $p[[int]$_.OwningProcess]",
+    "    processName = $name",
     "    remoteAddress = [string]$_.RemoteAddress",
     "    remotePort = [int]$_.RemotePort",
     "    state = [string]$_.State",
+    "  }",
     "  }",
     "} | ConvertTo-Json -Compress"
   ].join("\n");

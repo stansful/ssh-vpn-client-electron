@@ -47,6 +47,7 @@ describe("SSH algorithm negotiation", () => {
     const negotiated = negotiateAlgorithms(client, server);
     expect(negotiated.kexAlgorithm).toBe("curve25519-sha256");
     expect(negotiated.encryptionClientToServer).toBe("aes128-ctr");
+    expect(client.encryptionAlgorithmsClientToServer[0]).toBe("aes128-ctr");
   });
 
   it("computes SHA256 host key fingerprints", () => {

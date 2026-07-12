@@ -8,7 +8,7 @@ import {
   exportSshPublicKeyBlob,
   verifySshSignature
 } from "../src/core/ssh/host-key.js";
-import { deriveKey, deriveTransportKeys, transportKeyLengthsFor } from "../src/core/ssh/key-derivation.js";
+import { deriveDirectionalTransportKeys, deriveKey, deriveTransportKeys, transportKeyLengthsFor } from "../src/core/ssh/key-derivation.js";
 import { bufferToBigInt } from "../src/core/ssh/kex-group14.js";
 import { SshPacketProtector } from "../src/core/ssh/packet-codec.js";
 import {
@@ -20,6 +20,7 @@ import {
   signSshData
 } from "../src/core/ssh/private-key.js";
 import { SshBinaryReader, SshBinaryWriter } from "../src/core/ssh/binary.js";
+import { assertNegotiatedHostKeyAndSignature } from "../src/core/ssh/session-state.js";
 
 describe("SSH transport key derivation and packet protection", () => {
   it("derives deterministic RFC-style keys", () => {
@@ -30,6 +31,21 @@ describe("SSH transport key derivation and packet protection", () => {
     expect(first).toHaveLength(40);
     expect(first).toEqual(second);
     expect(first).not.toEqual(different);
+  });
+
+  it("derives direction-specific key lengths for asymmetric negotiation", () => {
+    const keys = deriveDirectionalTransportKeys(
+      123n,
+      Buffer.alloc(32, 1),
+      Buffer.alloc(32, 2),
+      transportKeyLengthsFor("aes256-ctr", "hmac-sha2-512"),
+      transportKeyLengthsFor("aes128-ctr", "hmac-sha2-256")
+    );
+
+    expect(keys.encryptionKeyClientToServer).toHaveLength(32);
+    expect(keys.encryptionKeyServerToClient).toHaveLength(16);
+    expect(keys.integrityKeyClientToServer).toHaveLength(64);
+    expect(keys.integrityKeyServerToClient).toHaveLength(32);
   });
 
   it("encrypts, authenticates, and decrypts packets", () => {
@@ -86,6 +102,10 @@ describe("SSH host-key verification and private-key signing", () => {
 
     expect(verifySshSignature(hostKeyBlob, data, signatureBlob)).toBe(true);
     expect(verifySshSignature(hostKeyBlob, Buffer.from("wrong"), signatureBlob)).toBe(false);
+    expect(() => assertNegotiatedHostKeyAndSignature("rsa-sha2-256", hostKeyBlob, signatureBlob)).not.toThrow();
+    expect(() => assertNegotiatedHostKeyAndSignature("rsa-sha2-512", hostKeyBlob, signatureBlob)).toThrow(
+      "inconsistent with negotiated algorithm"
+    );
   });
 
   it("verifies Ed25519 SSH signature blobs", () => {

@@ -13,6 +13,21 @@ describe("DNS cache and traffic policy", () => {
     expect(cache.get("youtube.com", 1011)).toEqual([]);
   });
 
+  it("bounds DNS entries and keeps the reverse index consistent across LRU eviction", () => {
+    const cache = new DomainIpCache({ maxEntries: 2, maxAddressesPerEntry: 2, maxTtlMs: 1000 });
+    cache.set("first.example", ["1.1.1.1", "1.1.1.2", "1.1.1.3"], 60_000, 0);
+    cache.set("second.example", ["2.2.2.2"], 60_000, 0);
+    expect(cache.get("first.example", 10)).toEqual(["1.1.1.1", "1.1.1.2"]);
+
+    cache.set("third.example", ["3.3.3.3"], 60_000, 10);
+
+    expect(cache.size).toBe(2);
+    expect(cache.get("second.example", 20)).toEqual([]);
+    expect(cache.findDomainsForIp("2.2.2.2", 20)).toEqual([]);
+    expect(cache.findDomainsForIp("1.1.1.1", 20)).toEqual(["first.example"]);
+    expect(cache.get("first.example", 1001)).toEqual([]);
+  });
+
   it("blocks UDP when TCP-only policy is configured", () => {
     const policy = new TrafficPolicy("proxy-all", [], false);
 

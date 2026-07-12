@@ -53,5 +53,7 @@ Electron starts the matching native binary over `--stdio` when `SHADOW_SSH_USE_N
 `SHADOW_SSH_SERVICE_ENDPOINT` is configured. The process bridge sends `shutdown` and kills the child on app quit if it
 does not exit quickly, so local runs do not leave a service process hanging.
 
-The native host includes Windows SCM service mode, named-pipe ACLs, routing capability contracts, and Windows TCP
-process-to-connection attribution. The default live SSH tunnel path is implemented in Electron main.
+The native host includes Windows SCM service mode, per-user named-pipe ACLs, routing capability contracts, and Windows
+TCP process-to-connection attribution. `scripts/install-service.ps1` passes the installing user's SID; use
+`SHADOW_SSH_ALLOWED_CLIENT_SID` when the intended desktop user differs from the elevated installer account. The
+default live SSH tunnel path is implemented in Electron main.
