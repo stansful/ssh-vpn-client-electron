@@ -1,6 +1,6 @@
 {
   "name": "shadow-ssh-desktop",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "private": true,
   "description": "Desktop client for shadow-ssh with Electron, TypeScript, and a platform-ready service boundary.",
   "type": "module",
