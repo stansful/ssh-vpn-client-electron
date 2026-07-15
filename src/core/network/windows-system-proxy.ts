@@ -78,6 +78,7 @@ const PROXY_SNAPSHOT_VERSION = 1;
 const MAX_PROXY_SNAPSHOT_BYTES = 256 * 1024;
 const MAX_PROXY_REGISTRY_STRING_LENGTH = 64 * 1024;
 const MAX_SERVED_PAC_VERSIONS = 8;
+const MAX_RETAINED_PAC_ENDPOINTS = 4;
 
 export class WindowsSystemProxyManager {
   private snapshot: ProxySnapshot | undefined;
@@ -86,7 +87,9 @@ export class WindowsSystemProxyManager {
   private readonly pacServerFactory: (requestListener: RequestListener) => Server;
   private pacServer: Server | undefined;
   private readonly retainedPacServers = new Set<Server>();
+  private readonly currentPacFallbackServers = new Set<Server>();
   private pacContent = "";
+  private publishedPacContent = "";
   private readonly pacVersions = new Map<string, string>();
   private registeredPacUrl: string | undefined;
   private registryPacUrl: string | undefined;
@@ -136,6 +139,11 @@ export class WindowsSystemProxyManager {
         await regAddDword("ProxyEnable", "1");
         await regAddString("ProxyServer", staticProxy);
         await regDeleteValue("AutoConfigURL");
+        // ProxyOverride belongs to the previous user configuration. Leaving a
+        // broad value such as `*` active would silently bypass Shadow's static
+        // proxy-all endpoint even though ProxyEnable and ProxyServer are set.
+        // The persisted snapshot restores the exact prior value on disconnect.
+        await regDeleteValue("ProxyOverride");
         this.registryPacUrl = undefined;
         this.pendingPacNotificationUrl = undefined;
         await regAddDword("AutoDetect", "0");
@@ -202,6 +210,7 @@ export class WindowsSystemProxyManager {
       throw error;
     }
     this.pendingPacNotificationUrl = undefined;
+    this.publishedPacContent = pac;
     await this.finishPacEndpointRotation(pacEndpoint, pacUrl, true);
     const proxyListMessage = proxyDomains.length > 0 ? ` with ${proxyDomains.length} proxy-list domains` : "";
     const directListMessage = directDomains.length > 0 ? ` and ${directDomains.length} direct-list domains` : "";
@@ -307,6 +316,7 @@ export class WindowsSystemProxyManager {
     }
     const previousServer = forceNewEndpoint ? this.pacServer : undefined;
     const endpointPacContent = forceNewEndpoint ? pac : undefined;
+    const serverHolder: { value?: Server } = {};
     const server = this.pacServerFactory((request, response) => {
       let requestUrl: URL;
       try {
@@ -328,7 +338,9 @@ export class WindowsSystemProxyManager {
       // safer than letting that client fall back to DIRECT on a 404.
       const requestedPac = requestedVersion
         ? this.pacVersions.get(requestedVersion) ?? this.pacContent
-        : endpointPacContent ?? this.pacContent;
+        : serverHolder.value !== undefined && this.currentPacFallbackServers.has(serverHolder.value)
+          ? this.publishedPacContent || this.pacContent
+          : endpointPacContent ?? this.pacContent;
       response.writeHead(200, {
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "Content-Type": "application/x-ns-proxy-autoconfig; charset=utf-8",
@@ -336,6 +348,7 @@ export class WindowsSystemProxyManager {
       });
       response.end(requestedPac);
     });
+    serverHolder.value = server;
     server.on("clientError", (_error, socket) => {
       socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
     });
@@ -397,10 +410,9 @@ export class WindowsSystemProxyManager {
     const previousServer = endpoint.previousServer;
     if (succeeded) {
       if (previousServer && previousServer !== endpoint.server) {
-        this.retainedPacServers.delete(previousServer);
-        await closeServer(previousServer);
+        this.retainedPacServers.add(previousServer);
       }
-      await this.closeRetainedPacServers(endpoint.server);
+      await this.publishRetainedPacServers(endpoint.server);
       return;
     }
 
@@ -449,7 +461,8 @@ export class WindowsSystemProxyManager {
     this.registeredPacUrl = pendingUrl;
     this.pendingPacNotificationUrl = undefined;
     this.proxyStateDirty = false;
-    await this.closeRetainedPacServers(server);
+    this.publishedPacContent = this.pacContent;
+    await this.publishRetainedPacServers(server);
     return true;
   }
 
@@ -474,22 +487,32 @@ export class WindowsSystemProxyManager {
     this.pacServer = undefined;
     const servers = new Set(this.retainedPacServers);
     this.retainedPacServers.clear();
+    this.currentPacFallbackServers.clear();
     if (server) {
       servers.add(server);
     }
     await Promise.all([...servers].map(closeServer));
     this.pacContent = "";
+    this.publishedPacContent = "";
     this.pacVersions.clear();
     this.registeredPacUrl = undefined;
     this.pendingPacNotificationUrl = undefined;
   }
 
-  private async closeRetainedPacServers(activeServer: Server): Promise<void> {
-    const servers = [...this.retainedPacServers].filter((server) => server !== activeServer);
-    for (const server of servers) {
-      this.retainedPacServers.delete(server);
+  private async publishRetainedPacServers(activeServer: Server): Promise<void> {
+    this.retainedPacServers.delete(activeServer);
+    this.currentPacFallbackServers.delete(activeServer);
+    for (const server of this.retainedPacServers) {
+      this.currentPacFallbackServers.add(server);
     }
-    await Promise.all(servers.map(closeServer));
+
+    const retained = [...this.retainedPacServers];
+    const expired = retained.slice(0, Math.max(0, retained.length - MAX_RETAINED_PAC_ENDPOINTS));
+    for (const server of expired) {
+      this.retainedPacServers.delete(server);
+      this.currentPacFallbackServers.delete(server);
+    }
+    await Promise.all(expired.map(closeServer));
   }
 }
 
@@ -503,37 +526,57 @@ export function buildProxyPac(
   const proxy = buildPacProxyReturn(socksHost, socksPort, proxyProtocol);
   const validRules = rules.filter((rule) => rule.enabled && validateRoutingRuleValue(rule.type, rule.value).ok);
   const domainRules = validRules.filter((rule) => rule.type === "domain").map((rule) => normalizeDomainRule(rule.value));
-  const ipRules = validRules.filter((rule) => rule.type === "ip").map((rule) => rule.value.trim());
   const directListDomains = normalizeProxyDomains(options.directDomains).map(normalizeSuffixDomain);
   const proxyListDomains = normalizeProxyDomains(options.proxyDomains).map(normalizeSuffixDomain);
   const exactDomainRules = domainRules.filter((rule) => !rule.startsWith("*.")).map((rule) => rule);
   const wildcardDomainRules = domainRules.filter((rule) => rule.startsWith("*.")).map((rule) => rule.slice(2));
-  const parsedIpRules = ipRules.flatMap((rule) => {
-    const range = parseCidrRange(rule);
-    return range ? [{ range, rule }] : [];
+  const parsedIpRules = validRules.flatMap((rule) => {
+    if (rule.type !== "ip") {
+      return [];
+    }
+    const value = rule.value.trim();
+    const range = parseCidrRange(value);
+    if (!range) {
+      return [];
+    }
+    return [{
+      range,
+      rule: value
+    }];
   });
+  // Every exact rule gets a zero-DNS literal fast path. Hostname matching still
+  // includes learned process IPs as a generic fallback for applications using
+  // DoH or a resolver that never populates the Windows DNS cache. The generated
+  // PAC memoizes that lookup per hostname, so repeated media requests do not
+  // synchronously resolve the same CDN host on every proxy decision.
+  const dnsIpRules = parsedIpRules;
   const exactIpRules = parsedIpRules
     .filter(({ range }) => range.prefixLength === (range.version === 4 ? 32 : 128))
     .map(({ range }) => range.version === 4 ? ipv4BigIntToDotted(range.network) : ipv6BigIntToString(range.network));
-  const ipChecks = parsedIpRules.flatMap(({ rule }) => buildIpChecks(rule));
-  const needsIpv4Dns = parsedIpRules.some(({ range }) => range.version === 4);
-  const needsExtendedDns = parsedIpRules.length > 0;
+  const resolvedExactIpRules = dnsIpRules
+    .filter(({ range }) => range.prefixLength === (range.version === 4 ? 32 : 128))
+    .map(({ range }) => range.version === 4 ? ipv4BigIntToDotted(range.network) : ipv6BigIntToString(range.network));
+  const ipChecks = dnsIpRules.flatMap(({ rule }) => buildIpChecks(rule));
+  const mode = options.mode ?? "selected-rules";
+  const needsIpv4Dns = mode !== "proxy-all" && dnsIpRules.some(({ range }) => range.version === 4);
+  const needsExtendedDns = mode !== "proxy-all" && dnsIpRules.length > 0;
   const domainCheck = [
     "hasOwn(proxyExactDomains, hostNoBrackets)",
     "matchesSubdomain(hostNoBrackets, proxyWildcardDomains)",
     "matchesDomainOrParent(hostNoBrackets, proxyListDomains)"
   ].join(" || ");
-  const exactIpCheck = exactIpRules.length > 0
-    ? "hasOwn(proxyExactIps, hostNoBrackets) || hasOwn(proxyExactIps, resolvedHost) || resolvedHasOwn(resolvedHosts, proxyExactIps)"
+  const literalIpCheck = exactIpRules.length > 0 ? "hasOwn(proxyExactIps, hostNoBrackets)" : "";
+  const exactIpCheck = resolvedExactIpRules.length > 0
+    ? "hasOwn(proxyResolvedExactIps, resolvedHost) || resolvedHasOwn(resolvedHosts, proxyResolvedExactIps)"
     : "";
-  const checks = [domainCheck, exactIpCheck, ...ipChecks].filter(Boolean);
-
-  const mode = options.mode ?? "selected-rules";
-  const proxyRule = mode === "proxy-all"
+  const resolvedIpCheck = [exactIpCheck, ...ipChecks].filter(Boolean).join(" || ");
+  const preDnsCheck = [domainCheck, literalIpCheck].filter(Boolean).join(" || ");
+  const preDnsProxyRule = mode === "proxy-all"
     ? `  return ${JSON.stringify(proxy)};`
-    : checks.length > 0
-      ? `  if (${checks.join(" || ")}) { return ${JSON.stringify(proxy)}; }`
-      : "  if (false) { return \"DIRECT\"; }";
+    : `  if (${preDnsCheck}) { return ${JSON.stringify(proxy)}; }`;
+  const postDnsProxyRule = mode !== "proxy-all" && resolvedIpCheck
+    ? `  if (${resolvedIpCheck}) { return ${JSON.stringify(proxy)}; }`
+    : undefined;
 
   return [
     "// Shadow SSH routing PAC. Generated by the desktop client.",
@@ -542,14 +585,22 @@ export function buildProxyPac(
     `var proxyExactDomains = ${domainLookupLiteral(exactDomainRules)};`,
     `var proxyWildcardDomains = ${domainLookupLiteral(wildcardDomainRules)};`,
     `var proxyExactIps = ${domainLookupLiteral(exactIpRules)};`,
+    `var proxyResolvedExactIps = ${domainLookupLiteral(resolvedExactIpRules)};`,
+    ...(needsExtendedDns
+      ? [
+          "var resolvedHostCache = {};",
+          "var resolvedHostCacheOrder = [];",
+          "var resolvedHostCacheLimit = 256;"
+        ]
+      : []),
     "function FindProxyForURL(url, host) {",
     "  host = String(host || \"\").toLowerCase();",
     "  var hostNoBrackets = host.replace(/^\\[/, \"\").replace(/\\]$/, \"\");",
     "  if (matchesDomainOrParent(hostNoBrackets, directDomains)) { return \"DIRECT\"; }",
-    needsIpv4Dns ? "  var resolvedHost = resolveIpv4(hostNoBrackets);" : "  var resolvedHost = hostNoBrackets;",
-    needsExtendedDns ? "  var resolvedHostEx = resolveAll(hostNoBrackets);" : "  var resolvedHostEx = \"\";",
-    needsExtendedDns ? "  var resolvedHosts = splitResolvedHosts(resolvedHostEx);" : "  var resolvedHosts = [];",
-    proxyRule,
+    preDnsProxyRule,
+    needsExtendedDns ? "  var resolvedHosts = resolveHosts(hostNoBrackets);" : "  var resolvedHosts = [];",
+    needsIpv4Dns ? "  var resolvedHost = firstIpv4OrHost(resolvedHosts, hostNoBrackets);" : "  var resolvedHost = hostNoBrackets;",
+    ...(postDnsProxyRule ? [postDnsProxyRule] : []),
     "  return \"DIRECT\";",
     "}",
     "function hasOwn(map, key) {",
@@ -574,23 +625,35 @@ export function buildProxyPac(
     "  }",
     "  return false;",
     "}",
-    ...(needsIpv4Dns
-      ? [
-          "function resolveIpv4(host) {",
-          "  try {",
-          "    var value = dnsResolve(host);",
-          "    return value ? String(value).toLowerCase() : host;",
-          "  } catch (e) { return host; }",
-          "}"
-        ]
-      : []),
     ...(needsExtendedDns
       ? [
-          "function resolveAll(host) {",
+          "function resolveHosts(host) {",
+          "  var cacheKey = \"$\" + host;",
+          "  if (hasOwn(resolvedHostCache, cacheKey)) { return resolvedHostCache[cacheKey]; }",
+          "  var entries = resolveHostsUncached(host);",
+          "  if (entries.length === 1 && entries[0] === host) { return entries; }",
+          "  if (resolvedHostCacheOrder.length >= resolvedHostCacheLimit) {",
+          "    var expiredKey = resolvedHostCacheOrder.shift();",
+          "    if (expiredKey) { delete resolvedHostCache[expiredKey]; }",
+          "  }",
+          "  resolvedHostCache[cacheKey] = entries;",
+          "  resolvedHostCacheOrder.push(cacheKey);",
+          "  return entries;",
+          "}",
+          "function resolveHostsUncached(host) {",
+          "  var values = \"\";",
           "  try {",
-          "    var value = typeof dnsResolveEx === \"function\" ? String(dnsResolveEx(host) || \"\").toLowerCase() : \"\";",
-          "    return value || host;",
-          "  } catch (e) { return host; }",
+          "    values = typeof dnsResolveEx === \"function\" ? String(dnsResolveEx(host) || \"\").toLowerCase() : \"\";",
+          "  } catch (e) { values = \"\"; }",
+          "  var entries = splitResolvedHosts(values);",
+          "  if (entries.length === 0) {",
+          "    try {",
+          "      var fallback = typeof dnsResolve === \"function\" ? dnsResolve(host) : \"\";",
+          "      if (fallback) { entries.push(String(fallback).toLowerCase()); }",
+          "    } catch (e) {}",
+          "  }",
+          "  if (entries.length === 0) { entries.push(host); }",
+          "  return entries;",
           "}",
           "function splitResolvedHosts(values) {",
           "  var rawEntries = String(values || \"\").split(/[;,\\s]+/);",
@@ -600,6 +663,16 @@ export function buildProxyPac(
           "  }",
           "  return entries;",
           "}",
+          ...(needsIpv4Dns
+            ? [
+                "function firstIpv4OrHost(entries, host) {",
+                "  for (var index = 0; index < entries.length; index += 1) {",
+                "    if (/^\\d{1,3}(?:\\.\\d{1,3}){3}$/.test(entries[index])) { return entries[index]; }",
+                "  }",
+                "  return host;",
+                "}"
+              ]
+            : []),
           "function resolvedHasOwn(entries, map) {",
           "  for (var index = 0; index < entries.length; index += 1) {",
           "    if (hasOwn(map, entries[index])) { return true; }",
@@ -757,13 +830,13 @@ function buildWindowsProxyServer(host: string, port: number, proxyProtocol: "mix
 
 function buildPacProxyReturn(host: string, port: number, proxyProtocol: "mixed" | "http" | "socks"): string {
   const endpoint = formatProxyEndpoint(host, port);
-  if (proxyProtocol === "http") {
-    return `PROXY ${endpoint}`;
-  }
   if (proxyProtocol === "socks") {
-    return `SOCKS5 ${endpoint}; SOCKS ${endpoint}`;
+    return `SOCKS5 ${endpoint}`;
   }
-  return `PROXY ${endpoint}; SOCKS5 ${endpoint}; SOCKS ${endpoint}`;
+  // The mixed listener accepts HTTP CONNECT itself. Retrying the same failed
+  // destination through SOCKS5 (and then unsupported SOCKS4) only multiplies a
+  // remote connect timeout without adding a real fallback path.
+  return `PROXY ${endpoint}`;
 }
 
 function assertLocalProxyEndpoint(host: string, port: number): void {

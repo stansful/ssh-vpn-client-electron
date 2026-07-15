@@ -25,6 +25,30 @@ export function parseIpAddress(input: string): ParsedIpAddress | undefined {
   return undefined;
 }
 
+export function canonicalizeIpAddress(input: string): string | undefined {
+  const trimmed = input.trim().toLowerCase();
+  const withoutMappedPrefix = trimmed.startsWith("::ffff:") ? trimmed.slice("::ffff:".length) : trimmed;
+  const parsed = parseIpAddress(withoutMappedPrefix);
+  if (!parsed) {
+    return undefined;
+  }
+  if (parsed.version === 4) {
+    return [24, 16, 8, 0]
+      .map((shift) => Number((parsed.value >> BigInt(shift)) & 0xffn))
+      .join(".");
+  }
+  return formatIpv6(parsed.value);
+}
+
+export function ipAddressKey(input: string): string | undefined {
+  const canonical = canonicalizeIpAddress(input);
+  if (!canonical) {
+    return undefined;
+  }
+  const parsed = parseIpAddress(canonical);
+  return parsed ? `${parsed.version}:${parsed.value.toString(16)}` : undefined;
+}
+
 export function parseCidrRange(input: string): ParsedCidrRange | undefined {
   const [ipRaw, prefixRaw] = input.trim().split("/");
   if (!ipRaw) {
@@ -132,6 +156,35 @@ function parseIpv6Groups(input: string): number[] | undefined {
     parsed.push(Number.parseInt(group, 16));
   }
   return parsed;
+}
+
+function formatIpv6(value: bigint): string {
+  const groups = Array.from({ length: IPV6_GROUPS }, (_unused, index) =>
+    Number((value >> BigInt((IPV6_GROUPS - 1 - index) * 16)) & 0xffffn).toString(16)
+  );
+  let bestStart = -1;
+  let bestLength = 0;
+  for (let index = 0; index < groups.length;) {
+    if (groups[index] !== "0") {
+      index += 1;
+      continue;
+    }
+    let end = index + 1;
+    while (end < groups.length && groups[end] === "0") {
+      end += 1;
+    }
+    if (end - index > bestLength && end - index >= 2) {
+      bestStart = index;
+      bestLength = end - index;
+    }
+    index = end;
+  }
+  if (bestStart < 0) {
+    return groups.join(":");
+  }
+  const left = groups.slice(0, bestStart).join(":");
+  const right = groups.slice(bestStart + bestLength).join(":");
+  return `${left}::${right}`;
 }
 
 function prefixToMask(bits: number, prefixLength: number): bigint {

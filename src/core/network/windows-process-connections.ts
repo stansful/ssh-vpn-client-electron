@@ -1,9 +1,52 @@
-import { execFile } from "node:child_process";
-import net from "node:net";
-import { promisify } from "node:util";
+import {
+  canonicalizeIpAddress,
+  ipMatchesCidr,
+  parseCidrRange,
+  parseIpAddress,
+  type ParsedCidrRange
+} from "../routing/ip-address.js";
+import { runWindowsPowerShellScript } from "./windows-powershell.js";
 
-const execFileAsync = promisify(execFile);
 const MAX_WINDOWS_PROCESS_CONNECTION_OUTPUT_BYTES = 16 * 1024 * 1024;
+const AUTO_LEARNABLE_IPV6_RANGE = requireCidrRange("2000::/3");
+const PROCESS_ROUTE_FALLBACK_EXCLUDED_RANGES = [
+  "0.0.0.0/32",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "::/128",
+  "::1/128",
+  "fe80::/10"
+].map(requireCidrRange);
+const AUTO_LEARN_EXCLUDED_RANGES = [
+  // IPv4 special-purpose, non-unicast, and non-public ranges. Keep this list
+  // local to process discovery: manually configured IP/CIDR rules may still
+  // intentionally target LAN, CGNAT, or other private destinations.
+  "0.0.0.0/8",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.0.0.0/24",
+  "192.0.2.0/24",
+  "192.31.196.0/24",
+  "192.52.193.0/24",
+  "192.88.99.0/24",
+  "192.168.0.0/16",
+  "192.175.48.0/24",
+  "198.18.0.0/15",
+  "198.51.100.0/24",
+  "203.0.113.0/24",
+  "224.0.0.0/4",
+  "240.0.0.0/4",
+  // Special-purpose ranges inside IPv6's global-unicast space. Everything
+  // outside 2000::/3 is rejected separately below.
+  "2001::/23",
+  "2001:db8::/32",
+  "2002::/16",
+  "2620:4f:8000::/48",
+  "3fff::/20"
+].map(requireCidrRange);
 
 export interface WindowsProcessConnection {
   processName: string;
@@ -29,10 +72,9 @@ export async function listWindowsProcessConnections(processNames?: Iterable<stri
     return [];
   }
 
-  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    timeout: 7000,
-    maxBuffer: MAX_WINDOWS_PROCESS_CONNECTION_OUTPUT_BYTES,
-    windowsHide: true
+  const stdout = await runWindowsPowerShellScript(script, {
+    timeoutMs: 7000,
+    maxBufferBytes: MAX_WINDOWS_PROCESS_CONNECTION_OUTPUT_BYTES
   });
   return parsePowerShellConnections(stdout);
 }
@@ -45,21 +87,33 @@ export function buildWindowsProcessConnectionsPowerShell(processNames?: Iterable
     return undefined;
   }
 
-  // Keep the pre-optimization Windows snapshot path for compatibility. Some
-  // PowerShell 5.1/CIM combinations returned an empty result when the owning
-  // PID list was pre-filtered. Filtering the completed snapshot in Node is a
-  // little more work, but it is the behavior known to work across Windows 10
-  // and 11 builds.
+  const targetSetup = targets === undefined
+    ? ["$targets = $null"]
+    : [
+        `$targetJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(JSON.stringify(targets), "utf8").toString("base64")}'))`,
+        "$targets = @{}",
+        "@(ConvertFrom-Json -InputObject $targetJson) | ForEach-Object { $targets[[string]$_] = $true }"
+      ];
+
+  // Keep the Windows 10/11-compatible full TCP snapshot. Some PowerShell
+  // 5.1/CIM combinations returned an empty result when Get-NetTCPConnection
+  // itself was pre-filtered by owning PID. We filter only the objects emitted
+  // for JSON serialization, which also keeps IPC output proportional to the
+  // selected process set.
   return [
     "$ErrorActionPreference = 'SilentlyContinue'",
     "$p = @{}",
     "Get-Process | ForEach-Object { $p[[int]$_.Id] = ($_.ProcessName + '.exe') }",
+    ...targetSetup,
     "Get-NetTCPConnection -State Established,SynSent | ForEach-Object {",
-    "  [PSCustomObject]@{",
-    "    processName = $p[[int]$_.OwningProcess]",
-    "    remoteAddress = [string]$_.RemoteAddress",
-    "    remotePort = [int]$_.RemotePort",
-    "    state = [string]$_.State",
+    "  $processName = $p[[int]$_.OwningProcess]",
+    "  if ($null -eq $targets -or $targets.ContainsKey([string]$processName)) {",
+    "    [PSCustomObject]@{",
+    "      processName = $processName",
+    "      remoteAddress = [string]$_.RemoteAddress",
+    "      remotePort = [int]$_.RemotePort",
+    "      state = [string]$_.State",
+    "    }",
     "  }",
     "} | ConvertTo-Json -Compress"
   ].join("\n");
@@ -92,23 +146,32 @@ export function parsePowerShellConnections(stdout: string): WindowsProcessConnec
   });
 }
 
+export function isAutoLearnableRemoteAddress(address: string): boolean {
+  const canonical = canonicalizeIpAddress(address);
+  const parsed = canonical ? parseIpAddress(canonical) : undefined;
+  if (!parsed) {
+    return false;
+  }
+  if (parsed.version === 6 && !ipMatchesCidr(parsed, AUTO_LEARNABLE_IPV6_RANGE)) {
+    return false;
+  }
+  return !AUTO_LEARN_EXCLUDED_RANGES.some((range) => ipMatchesCidr(parsed, range));
+}
+
 export function isRoutableRemoteAddress(address: string): boolean {
-  if (!address || address === "0.0.0.0" || address === "::") {
-    return false;
-  }
-  if (address.startsWith("127.") || address === "::1") {
-    return false;
-  }
-  if (address.startsWith("169.254.") || address.toLowerCase().startsWith("fe80:")) {
-    return false;
-  }
-  return net.isIP(address) !== 0;
+  const canonical = canonicalizeIpAddress(address);
+  const parsed = canonical ? parseIpAddress(canonical) : undefined;
+  return parsed !== undefined && !PROCESS_ROUTE_FALLBACK_EXCLUDED_RANGES.some((range) => ipMatchesCidr(parsed, range));
 }
 
 function normalizeRemoteAddress(address: string): string {
-  const trimmed = address.trim().toLowerCase();
-  if (trimmed.startsWith("::ffff:")) {
-    return trimmed.slice("::ffff:".length);
+  return canonicalizeIpAddress(address) ?? "";
+}
+
+function requireCidrRange(value: string): ParsedCidrRange {
+  const range = parseCidrRange(value);
+  if (!range) {
+    throw new Error(`Invalid internal CIDR range: ${value}`);
   }
-  return trimmed;
+  return range;
 }

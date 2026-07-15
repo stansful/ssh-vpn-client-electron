@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildProcessRouteSignature,
   buildSelectedRulesWithProcessIps,
   describeUnsupportedSelectedRouting,
+  recordBoundedProcessRouteDomain,
   recordBoundedProcessRouteIp
 } from "../src/service/live-ssh-service.js";
 import type { ConnectRequest, RoutingRule, SshConfig } from "../src/shared/types.js";
@@ -67,6 +69,26 @@ describe("live service routing support checks", () => {
     expect(augmented.filter((rule) => rule.type === "ip").map((rule) => rule.value)).toEqual(["149.154.167.50"]);
   });
 
+  it("adds exact and wildcard process domains without duplicating user rules", () => {
+    const rules: RoutingRule[] = [
+      { id: "domain", type: "domain", value: "discord.com", enabled: true, createdAt: "", updatedAt: "" },
+      { id: "proc", type: "process.name", value: "discord.exe", enabled: true, createdAt: "", updatedAt: "" }
+    ];
+
+    const augmented = buildSelectedRulesWithProcessIps(
+      rules,
+      new Set(),
+      new Set(["discord.com", "*.discord.com", "gateway.discord.gg", "not-a-domain"])
+    );
+
+    expect(augmented.filter((rule) => rule.type === "domain" && rule.value === "discord.com")).toHaveLength(1);
+    expect(augmented).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "process-domain:*.discord.com", type: "domain", value: "*.discord.com" }),
+      expect.objectContaining({ id: "process-domain:gateway.discord.gg", type: "domain", value: "gateway.discord.gg" })
+    ]));
+    expect(augmented.some((rule) => rule.value === "not-a-domain")).toBe(false);
+  });
+
   it("bounds learned process destinations and retains recently refreshed IPs", () => {
     const entries = new Map<string, number>();
     recordBoundedProcessRouteIp(entries, "1.1.1.1", 1, 2);
@@ -78,6 +100,22 @@ describe("live service routing support checks", () => {
       ["1.1.1.1", 3],
       ["3.3.3.3", 4]
     ]);
+  });
+
+  it("bounds stable learned domains and includes them in the applied signature", () => {
+    const entries = new Map<string, number>();
+    recordBoundedProcessRouteDomain(entries, "API.Example.COM.", 1, 2);
+    recordBoundedProcessRouteDomain(entries, "gateway.example.com", 2, 2);
+    recordBoundedProcessRouteDomain(entries, "api.example.com", 3, 2);
+    recordBoundedProcessRouteDomain(entries, "cdn.example.com", 4, 2);
+
+    expect([...entries]).toEqual([
+      ["api.example.com", 3],
+      ["cdn.example.com", 4]
+    ]);
+    expect(buildProcessRouteSignature(["203.0.113.8"], entries.keys())).toBe(
+      "ips:203.0.113.8|domains:api.example.com,cdn.example.com"
+    );
   });
 });
 

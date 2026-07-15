@@ -262,6 +262,298 @@ describe("live SSH service lifecycle", () => {
     }
   });
 
+  it("publishes a literal process IP before DNS enrichment and then adds the hostname route", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const client = new FakeSshClient();
+    vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+    vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31087 });
+    vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const address = "8.8.4.4";
+    const domain = "media.generic-client.example";
+    const dnsEnrichment = deferred<Array<{ address: string; domain: string; ttlSeconds: number }>>();
+    let dnsResolved = false;
+    const processDnsEntriesProvider = vi.fn(() => dnsEnrichment.promise);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider: vi.fn(async () => [{
+        processName: "generic-client.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }]),
+      processDnsEntriesProvider
+    });
+    const request: ConnectRequest = {
+      ...connectRequest("literal-ip-before-dns"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "generic-client",
+        type: "process.name",
+        value: "generic-client.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const connecting = service.connect(request);
+
+    try {
+      await vi.waitFor(() => expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1));
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+      const literalIpPublish = vi.mocked(systemProxy.apply).mock.calls[0][0];
+      expect(literalIpPublish.rules).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `process-ip:${address}`, type: "ip", value: address, enabled: true })
+      ]));
+      expect(literalIpPublish.rules).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `process-domain:${domain}` })
+      ]));
+
+      dnsResolved = true;
+      dnsEnrichment.resolve([{ address, domain, ttlSeconds: 60 }]);
+      await connecting;
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(systemProxy.apply).mock.calls[1][0].rules).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `process-domain:${domain}`, type: "domain", value: domain, enabled: true })
+      ]));
+    } finally {
+      if (!dnsResolved) {
+        dnsEnrichment.resolve([]);
+        await connecting;
+      }
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("does not publish an interim process IP when explicit direct domains are configured", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "8.8.8.8";
+    const dnsEnrichment = deferred<Array<{ address: string; domain: string; ttlSeconds: number }>>();
+    let dnsResolved = false;
+    const processDnsEntriesProvider = vi.fn(() => dnsEnrichment.promise);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager,
+      processConnectionsProvider: vi.fn(async () => [{
+        processName: "generic-direct-client.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }]),
+      processDnsEntriesProvider
+    });
+    const publishLiteralIpSnapshot = vi.fn(async () => undefined);
+    const request: ConnectRequest = {
+      ...connectRequest("direct-domain-no-interim-ip"),
+      routingMode: "selected-rules",
+      routingDirectDomains: [".direct.example"],
+      routingRules: [{
+        id: "generic-direct-client",
+        type: "process.name",
+        value: "generic-direct-client.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const learning = (service as unknown as {
+      learnProcessRoutingIps(
+        request: ConnectRequest,
+        generation: undefined,
+        publish: (signature: string) => Promise<void>
+      ): Promise<boolean>;
+    }).learnProcessRoutingIps(request, undefined, publishLiteralIpSnapshot);
+
+    try {
+      await vi.waitFor(() => expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1));
+      expect(publishLiteralIpSnapshot).not.toHaveBeenCalled();
+      dnsResolved = true;
+      dnsEnrichment.resolve([{ address, domain: "media.direct.example", ttlSeconds: 60 }]);
+      await learning;
+    } finally {
+      if (!dnsResolved) {
+        dnsEnrichment.resolve([]);
+        await learning;
+      }
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("hot-adds a process rule and learns its next connection without reconnecting SSH", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    vi.useFakeTimers();
+    const client = new FakeSshClient();
+    vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+    vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31089 });
+    vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{
+        processName: "Chrome.exe",
+        remoteAddress: "142.250.74.110",
+        remotePort: 443,
+        state: "Established"
+      }]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processRoutingRefreshIntervalMs: () => 30_000
+    });
+    const initialRequest: ConnectRequest = {
+      ...connectRequest("hot-add-process"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "bootstrap-domain",
+        type: "domain",
+        value: "bootstrap.example",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const chromeRule = {
+      id: "chrome",
+      type: "process.name" as const,
+      value: "chrome.exe",
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    };
+
+    try {
+      await service.connect(initialRequest);
+      expect(SshLiveClient.connect).toHaveBeenCalledTimes(1);
+      expect(processConnectionsProvider).not.toHaveBeenCalled();
+
+      await service.updateRouting({
+        routingMode: "selected-rules",
+        routingRules: [...initialRequest.routingRules, chromeRule],
+        routingProxyDomains: [],
+        routingDirectDomains: [],
+        checkEndpoint: initialRequest.checkEndpoint
+      });
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      expect([...processConnectionsProvider.mock.calls[0][0]]).toEqual(["chrome.exe"]);
+      expect(vi.mocked(systemProxy.apply).mock.calls[1][0]).toMatchObject({
+        forcePacEndpointRotation: true,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ type: "process.name", value: "chrome.exe", enabled: true })
+        ])
+      });
+      expect(vi.mocked(systemProxy.apply).mock.calls[1][0].rules).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "ip", value: "142.250.74.110" })
+      ]));
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(3);
+      expect(vi.mocked(systemProxy.apply).mock.calls[2][0]).toMatchObject({
+        forcePacEndpointRotation: true,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ type: "process.name", value: "chrome.exe", enabled: true }),
+          expect.objectContaining({ type: "ip", value: "142.250.74.110", enabled: true })
+        ])
+      });
+      expect(SshLiveClient.connect).toHaveBeenCalledTimes(1);
+      expect(client.disconnect).not.toHaveBeenCalled();
+      expect(service.getStatus()).toMatchObject({ state: "Connected", activeConfigId: "hot-add-process" });
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        vi.useRealTimers();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("continues the bounded discovery burst after finding the first process endpoint", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    vi.useFakeTimers();
+    const client = new FakeSshClient();
+    vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+    vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31088 });
+    vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const processConnectionsProvider = vi.fn(async () => [{
+      processName: "multi-endpoint.exe",
+      remoteAddress: "203.0.113.10",
+      remotePort: 443,
+      state: "Established"
+    }]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processRoutingRefreshIntervalMs: () => 30_000
+    });
+    const request: ConnectRequest = {
+      ...connectRequest("process-discovery-after-first"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "multi-endpoint",
+        type: "process.name",
+        value: "multi-endpoint.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+
+    try {
+      await service.connect(request);
+      expect(processConnectionsProvider).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(4_000);
+      await vi.advanceTimersByTimeAsync(8_000);
+
+      expect(processConnectionsProvider).toHaveBeenCalledTimes(5);
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        vi.useRealTimers();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
   it("drops learned IPs immediately when the selected process target changes", async () => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform");
     Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
@@ -296,6 +588,978 @@ describe("live SSH service lifecycle", () => {
       try {
         await service.dispose();
       } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("publishes an additive exact session lease immediately and keeps it after self-observation", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const address = "8.8.4.4";
+    const domain = "gateway.custom-app.example";
+    const connection = [{
+      processName: "custom-app.exe",
+      remoteAddress: address,
+      remotePort: 443,
+      state: "Established"
+    }];
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValue([]);
+    const processDnsEntriesProvider = vi.fn(async () => [
+      { address, domain, ttlSeconds: 30 },
+      { address, domain, ttlSeconds: 60 }
+    ]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("session-domain-lease"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "custom-app",
+        type: "process.name",
+        value: "custom-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+
+      now.mockReturnValue(1_001_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+
+      now.mockReturnValue(1_601_001);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(1_602_001);
+      await expect(internals.learnProcessRoutingIps({
+        ...request,
+        routingDirectDomains: [".custom-app.example"]
+      })).resolves.toBe(true);
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect(internals.processRoutingSessionLeases.size).toBe(0);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("keeps a PAC route when the only high-confidence process socket disappears before the second scan", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "8.8.8.8";
+    const domain = "api.short-lived-app.example";
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce([{
+        processName: "short-lived-app.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }])
+      .mockResolvedValueOnce([]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager,
+      processConnectionsProvider,
+      processDnsEntriesProvider: vi.fn(async () => [{ address, domain, ttlSeconds: 60 }])
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("short-lived-process-route"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "short-lived-app",
+        type: "process.name",
+        value: "short-lived-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(5_000_000);
+
+    try {
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+
+      now.mockReturnValue(5_001_000);
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("keeps additive IP and TTL routes when the session-lease bootstrap probe becomes ambiguous", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "8.8.8.8";
+    const firstDomain = "api.ambiguous-app.example";
+    const secondDomain = "cdn.ambiguous-app.example";
+    const connection = [{
+      processName: "ambiguous-app.exe",
+      remoteAddress: address,
+      remotePort: 443,
+      state: "Established"
+    }];
+    const processDnsEntriesProvider = vi.fn()
+      .mockResolvedValueOnce([{ address, domain: firstDomain, ttlSeconds: 60 }])
+      .mockResolvedValueOnce([
+        { address, domain: firstDomain, ttlSeconds: 60 },
+        { address, domain: secondDomain, ttlSeconds: 60 }
+      ]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager,
+      processConnectionsProvider: vi.fn(async () => connection),
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("ambiguous-session-domain"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "ambiguous-app",
+        type: "process.name",
+        value: "ambiguous-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(2_000_000);
+
+    try {
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([firstDomain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+
+      now.mockReturnValue(2_010_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([firstDomain, secondDomain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("restores IP fallback when a leased-address DNS probe fails or changes tuple", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "4.2.2.2";
+    const leasedDomain = "api.probed-app.example";
+    const addedDomain = "cdn.probed-app.example";
+    const processDnsEntriesProvider = vi.fn()
+      .mockResolvedValueOnce([{ address, domain: leasedDomain, ttlSeconds: 120 }])
+      .mockRejectedValueOnce(new Error("DNS cache unavailable"))
+      .mockResolvedValueOnce([
+        { address, domain: leasedDomain, ttlSeconds: 120 },
+        { address, domain: addedDomain, ttlSeconds: 120 }
+      ]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager,
+      processConnectionsProvider: vi.fn(async () => [{
+        processName: "probed-app.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }]),
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("leased-address-probe"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "probed-app",
+        type: "process.name",
+        value: "probed-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(3_000_000);
+
+    try {
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+
+      now.mockReturnValue(3_001_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain]));
+
+      now.mockReturnValue(3_011_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+
+      now.mockReturnValue(3_021_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain, addedDomain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("uses ordinary fallback for a public address shared by selected unprofiled processes", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "1.1.1.1";
+    const domain = "shared.selected-apps.example";
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager,
+      processConnectionsProvider: vi.fn(async () => [
+        { processName: "first-app.exe", remoteAddress: address, remotePort: 443, state: "Established" },
+        { processName: "second-app.exe", remoteAddress: address, remotePort: 443, state: "Established" }
+      ]),
+      processDnsEntriesProvider: vi.fn(async () => [{ address, domain, ttlSeconds: 60 }])
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("shared-process-address"),
+      routingMode: "selected-rules",
+      routingRules: ["first-app.exe", "second-app.exe"].map((value) => ({
+        id: value,
+        type: "process.name" as const,
+        value,
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }))
+    };
+
+    try {
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(0);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("does not lease or learn a domain covered by the explicit direct list", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "9.9.9.9";
+    const domain = "api.direct-app.example";
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager,
+      processConnectionsProvider: vi.fn(async () => [{
+        processName: "direct-app.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }]),
+      processDnsEntriesProvider: vi.fn(async () => [{ address, domain, ttlSeconds: 60 }])
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("direct-conflict"),
+      routingMode: "selected-rules",
+      routingDirectDomains: [".direct-app.example"],
+      routingRules: [{
+        id: "direct-app",
+        type: "process.name",
+        value: "direct-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+
+    try {
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect(internals.processRoutingSessionLeases.size).toBe(0);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("caps immediate session leases at 256 while keeping additive IP and TTL fallback", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const initialAddresses = Array.from({ length: 257 }, (_unused, index) =>
+      index < 254 ? `11.0.0.${index + 1}` : `11.0.1.${index - 253}`
+    );
+    const overflowAddress = "11.0.1.4";
+    let connections = initialAddresses.map((remoteAddress) => ({
+      processName: "many-endpoints.exe",
+      remoteAddress,
+      remotePort: 443,
+      state: "Established"
+    }));
+    const processDnsEntriesProvider = vi.fn(async (addresses: Iterable<string>) => [...addresses].map((address) => ({
+      address,
+      domain: `endpoint-${address.replace(/\./gu, "-")}.many-endpoints.example`,
+      ttlSeconds: 60
+    })));
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager,
+      processConnectionsProvider: vi.fn(async () => connections),
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("bounded-session-domains"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "many-endpoints",
+        type: "process.name",
+        value: "many-endpoints.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(4_000_000);
+
+    try {
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.processRoutingSessionLeases.size).toBe(256);
+      expect(internals.currentProcessRoutingIps().size).toBe(257);
+      expect(internals.currentProcessRoutingDomains().size).toBe(257);
+
+      now.mockReturnValue(4_001_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(internals.processRoutingSessionLeases.size).toBe(256);
+      expect(internals.currentProcessRoutingIps().size).toBe(257);
+      expect(internals.currentProcessRoutingDomains().size).toBe(257);
+
+      connections = [...connections, {
+        processName: "many-endpoints.exe",
+        remoteAddress: overflowAddress,
+        remotePort: 443,
+        state: "Established"
+      }];
+      now.mockReturnValue(4_002_000);
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.processRoutingSessionLeases.size).toBe(256);
+      expect(internals.currentProcessRoutingIps().has(overflowAddress)).toBe(true);
+      expect(internals.currentProcessRoutingDomains().has(
+        "endpoint-11-0-1-4.many-endpoints.example"
+      )).toBe(true);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("learns stable DNS hostnames for arbitrary multi-endpoint processes", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const connection = [{
+        processName: "custom-app.exe",
+        remoteAddress: "203.0.113.44",
+        remotePort: 443,
+        state: "Established"
+      }];
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValue([]);
+    let dnsCalls = 0;
+    const processDnsEntriesProvider = vi.fn(async (addresses: Iterable<string>) => {
+      void addresses;
+      dnsCalls += 1;
+      return dnsCalls === 1
+        ? []
+        : [{
+            address: "203.0.113.44",
+            domain: "gateway.custom.example",
+            ttlSeconds: 120
+          }];
+    });
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("dns-process-routing"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "custom-app",
+        type: "process.name",
+        value: "custom-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["203.0.113.44"]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect([...(processDnsEntriesProvider.mock.calls[0]?.[0] ?? [])]).toEqual(["203.0.113.44"]);
+
+      now.mockReturnValue(1_009_000);
+      await internals.learnProcessRoutingIps(request);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(1_010_000);
+      await internals.learnProcessRoutingIps(request);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(2);
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set(["gateway.custom.example"]));
+
+      now.mockReturnValue(1_131_000);
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("refreshes a generic exact DNS hostname at its TTL without route churn", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const address = "203.0.113.45";
+    const domain = "edge.custom.example";
+    const processConnectionsProvider = vi.fn(async () => [{
+      processName: "custom-app.exe",
+      remoteAddress: address,
+      remotePort: 443,
+      state: "Established"
+    }]);
+    const dnsTtls = [30, 60, 60];
+    const processDnsEntriesProvider = vi.fn(async () => [{
+      address,
+      domain,
+      ttlSeconds: dnsTtls.shift() ?? 60
+    }]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("generic-dns-ttl-refresh"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "custom-app",
+        type: "process.name",
+        value: "custom-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+
+      now.mockReturnValue(1_030_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+
+      now.mockReturnValue(1_090_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(3);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("expires stale process routes when the next connection snapshot rejects", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const address = "203.0.113.46";
+    const domain = "expired.custom.example";
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce([{
+        processName: "custom-app.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }])
+      .mockRejectedValueOnce(new Error("process snapshot unavailable"));
+    const processDnsEntriesProvider = vi.fn(async () => [{
+      address,
+      domain,
+      ttlSeconds: 60
+    }]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("process-snapshot-expiry"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "custom-app",
+        type: "process.name",
+        value: "custom-app.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+
+      now.mockReturnValue(1_300_001);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("seeds Discord host families before connections and avoids a shared Cloudflare IP rule", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const processConnectionsProvider = vi.fn(async () => [
+      {
+        processName: "Discord.exe",
+        remoteAddress: "162.159.138.232",
+        remotePort: 443,
+        state: "Established"
+      },
+      {
+        processName: "Discord.exe",
+        remoteAddress: "198.51.100.77",
+        remotePort: 443,
+        state: "Established"
+      }
+    ]);
+    const processDnsEntriesProvider = vi.fn()
+      .mockResolvedValueOnce([
+        {
+          address: "162.159.138.232",
+          domain: "gateway.discord.gg",
+          ttlSeconds: 60
+        },
+        ...Array.from({ length: 520 }, (_unused, index) => ({
+          address: "162.159.138.232",
+          domain: `shared-alias-${index}.example.com`,
+          ttlSeconds: 60
+        }))
+      ])
+      .mockResolvedValueOnce([{
+        address: "162.159.138.232",
+        domain: "unrelated.cloudflare.example",
+        ttlSeconds: 60
+      }]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("discord-process-routing"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "discord",
+        type: "process.name",
+        value: "discord.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["198.51.100.77"]));
+      const domains = internals.currentProcessRoutingDomains();
+      expect([...domains]).toEqual(expect.arrayContaining([
+        "discord.com",
+        "*.discord.com",
+        "*.discord.gg",
+        "*.discord.media"
+      ]));
+      expect(domains.has("gateway.discord.gg")).toBe(false);
+      expect([...domains].some((domain) => domain.startsWith("shared-alias-"))).toBe(false);
+      expect(domains.size).toBe(10);
+
+      now.mockReturnValue(1_060_001);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(2);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["198.51.100.77"]));
+      expect(internals.currentProcessRoutingDomains().has("unrelated.cloudflare.example")).toBe(false);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("suppresses a formerly shared IP once only the profiled process still owns it", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const sharedAddress = "162.159.138.232";
+    const discordConnection = {
+      processName: "Discord.exe",
+      remoteAddress: sharedAddress,
+      remotePort: 443,
+      state: "Established"
+    };
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce([
+        discordConnection,
+        {
+          processName: "custom-app.exe",
+          remoteAddress: sharedAddress,
+          remotePort: 443,
+          state: "Established"
+        }
+      ])
+      .mockResolvedValueOnce([discordConnection]);
+    const processDnsEntriesProvider = vi.fn(async () => [{
+      address: sharedAddress,
+      domain: "gateway.discord.gg",
+      ttlSeconds: 60
+    }]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("mixed-to-profiled-process-routing"),
+      routingMode: "selected-rules",
+      routingRules: [
+        {
+          id: "discord",
+          type: "process.name",
+          value: "discord.exe",
+          enabled: true,
+          createdAt: "",
+          updatedAt: ""
+        },
+        {
+          id: "custom-app",
+          type: "process.name",
+          value: "custom-app.exe",
+          enabled: true,
+          createdAt: "",
+          updatedAt: ""
+        }
+      ]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(1_001_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("retains a shared profiled and generic process IP across an empty snapshot until TTL", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const systemProxy = {
+      apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const sharedAddress = "162.159.138.232";
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce([
+        {
+          processName: "Discord.exe",
+          remoteAddress: sharedAddress,
+          remotePort: 443,
+          state: "Established"
+        },
+        {
+          processName: "custom-app.exe",
+          remoteAddress: sharedAddress,
+          remotePort: 443,
+          state: "Established"
+        }
+      ])
+      .mockResolvedValue([]);
+    const processDnsEntriesProvider = vi.fn(async () => [{
+      address: sharedAddress,
+      domain: "gateway.discord.gg",
+      ttlSeconds: 60
+    }]);
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy,
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+    };
+    const request: ConnectRequest = {
+      ...connectRequest("mixed-process-routing"),
+      routingMode: "selected-rules",
+      routingRules: [
+        {
+          id: "discord",
+          type: "process.name",
+          value: "discord.exe",
+          enabled: true,
+          createdAt: "",
+          updatedAt: ""
+        },
+        {
+          id: "custom-app",
+          type: "process.name",
+          value: "custom-app.exe",
+          enabled: true,
+          createdAt: "",
+          updatedAt: ""
+        }
+      ]
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(1_001_000);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(1_300_001);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
         if (platform) {
           Object.defineProperty(process, "platform", platform);
         }

@@ -268,10 +268,13 @@ throttle tunnel throughput. Only low-priority UI and process-routing discovery w
   discarded; the behavior can be disabled in Settings);
 - hidden/minimized renderers receive no streaming terminal or diagnostic IPC and resynchronize from a bounded snapshot
   when shown again;
-- when no matching process connection is visible yet, process-name routing performs a short 1/2/4/8-second discovery
-  burst after connect or rule changes; an already discovered process skips that extra work. While process rules are
-  enabled, the compatibility snapshot then refreshes every 10 seconds on AC or battery, matching the pre-optimization
-  behavior required by Windows process routing;
+- process-name routing completes a bounded 1/2/4/8-second discovery burst after connect or rule changes so
+  multi-endpoint API/CDN/WebSocket applications are not frozen at their first socket. It enriches public destination
+  IPs with exact A/AAAA and reverse-CNAME hostnames from the local Windows DNS cache (without a network lookup).
+  A sole public process/IP/hostname tuple immediately adds an exact session route (at most 256) without suppressing
+  its working IP and TTL hostname fallbacks; ambiguous/shared destinations retain the same bounded fallbacks (at most
+  2,048 IPs and 512 hostnames).
+  The compatibility snapshot then refreshes every 10 seconds on AC or battery;
 - SSH keepalive and time-based rekey share one deadline timer, while byte-based rekey is checked on active traffic and
   causes no idle polling;
 - accepted SSH upload frames are pipelined through a bounded 4 MiB socket buffer instead of waiting for one
@@ -281,6 +284,9 @@ throttle tunnel throughput. Only low-priority UI and process-routing discovery w
   are rendered in explicit pages; live diagnostics are capped at 1 MiB in aggregate and 64 KiB per message;
 - routing lookups and DNS/process caches use bounded indexes instead of repeated full scans, while stalled proxy queues,
   persisted stores, and profile/domain collections have explicit memory and disk safety limits;
+- Windows process snapshots still use the compatible full TCP-table query, but serialize only selected-process rows;
+  large PowerShell payloads are streamed through stdin, and PAC IP matching performs one extended DNS resolution with
+  a legacy fallback instead of resolving every unmatched hostname twice;
 - update metadata and binary downloads bypass the renderer/web cache, avoiding duplicate cached copies on disk.
 
 The renderer keeps Electron background throttling enabled, omits unused WebGL, and avoids continuous hidden animation
@@ -354,15 +360,26 @@ Disconnect/app quit:
   endpoint, and sets `AutoConfigURL` for enabled domain, exact IP, and IPv4 CIDR rules. The PAC resolves hostnames
   before CIDR checks so IP rules can match destinations reached by domain name.
 - Process-name rules: Windows PAC/system proxy has no process context, so the portable backend watches Windows TCP
-  connections for enabled process names and adds the matched remote IPs to the active PAC as temporary IP rules.
-  Domain/IP rules and learned process IPs are proxied; other destinations remain `DIRECT`. Already-open target app
+  connections for enabled process names, adds matched public remote IPs as temporary rules, and converts local DNS-cache
+  matches into exact-domain rules. An unambiguous tuple is retained for the connected session while its immediately
+  working IP and TTL-domain fallbacks remain active, so short-lived sockets cannot leave the PAC without a route.
+  Shared IPs, multiple aliases, private/special-use addresses, and direct-list conflicts stay on conservative bounded
+  fallbacks.
+  Reviewed bootstrap host families are included for applications such as Discord whose critical API/CDN/WebSocket
+  sockets otherwise disappear behind the loopback proxy. Other destinations remain `DIRECT`; already-open target
   sockets may need reconnect, and strict per-process enforcement still requires WFP/TUN.
 
-UDP is production TCP-only: unsupported UDP traffic is not proxied.
+This process mode is best-effort TCP/system-proxy routing: PAC destination rules are global once learned, and an
+application may place network sockets in a helper executable with a different name. Raw sockets, custom proxy/DNS
+stacks, QUIC, and clients that ignore the Windows user proxy can bypass this path; add the network-owning helper name
+or explicit domain rules when needed.
+
+UDP is production TCP-only: unsupported UDP traffic is not proxied. This means application UI/API/WebSocket traffic
+can use process routing, while UDP-only voice/video paths (including Discord voice) remain outside the SSH tunnel.
 
 Kernel-level WFP/TUN packet redirection is not bundled. The supported production interception path in this repository
 is TCP over HTTP/SOCKS system proxy/PAC plus live SSH `direct-tcpip`; process-name selected rules use the dynamic
-process-IP PAC behavior described above.
+process destination PAC behavior described above.
 
 Live SSH orchestration in the Electron main service path includes KEX, NEWKEYS, encrypted packets, host-key fingerprint
 verification, password/private-key auth, keepalive, reconnect, direct-tcpip checks, HTTP/SOCKS direct-tcpip forwarding, and

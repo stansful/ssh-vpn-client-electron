@@ -19,7 +19,11 @@ export interface Socks5ProxyOptions {
   maxTotalQueuedSocketBytes?: number;
   maxConnections?: number;
   maxPendingChannelOpens?: number;
-  connectChannel(target: DirectTcpIpTarget, originator: { address: string; port: number }): Promise<DirectTcpIpChannel>;
+  connectChannel(
+    target: DirectTcpIpTarget,
+    originator: { address: string; port: number },
+    signal?: AbortSignal
+  ): Promise<DirectTcpIpChannel>;
 }
 
 export interface Socks5ProxyEvent {
@@ -124,6 +128,7 @@ export class Socks5Proxy {
     this.sockets.add(socket);
     configureLowLatencySocket(socket, { keepAlive: false });
     let request: ProxyConnectRequest | undefined;
+    let proxyReplySent = false;
     const handshakeTimeoutMs = this.options.handshakeTimeoutMs ?? 30_000;
     const handshakeDeadline = handshakeTimeoutMs > 0
       ? setTimeout(() => {
@@ -156,10 +161,23 @@ export class Socks5Proxy {
         message: `${formatProtocol(request.protocol)} ${request.target.host}:${request.target.port} from ${originator.address}:${originator.port}.`
       } satisfies Socks5ProxyEvent);
 
+      const channelOpenController = new AbortController();
       const onCloseWhileOpening = (): void => {
         this.sockets.delete(socket);
+        channelOpenController.abort();
+      };
+      const onEndWhileOpening = (): void => {
+        onCloseWhileOpening();
+        // The server uses allowHalfOpen so a peer FIN does not automatically
+        // produce `close`. During channel opening there is no useful tunnel to
+        // half-close yet; finish the local side instead of retaining an orphan
+        // pending lease until the remote-open timeout.
+        if (!socket.destroyed) {
+          socket.destroy();
+        }
       };
       socket.once("close", onCloseWhileOpening);
+      socket.once("end", onEndWhileOpening);
       const releasePendingOpen = this.acquirePendingChannelOpen();
       if (!releasePendingOpen) {
         const limit = this.options.maxPendingChannelOpens ?? this.options.maxConnections ?? 512;
@@ -170,17 +188,19 @@ export class Socks5Proxy {
       }
       let channel: DirectTcpIpChannel;
       try {
-        channel = await this.options.connectChannel(request.target, originator);
+        channel = await this.options.connectChannel(request.target, originator, channelOpenController.signal);
       } finally {
         releasePendingOpen();
       }
-      if (socket.destroyed) {
+      if (socket.destroyed || socket.readableEnded) {
         socket.off("close", onCloseWhileOpening);
+        socket.off("end", onEndWhileOpening);
         socket.off("error", onHandshakeSocketError);
         await channel.close();
         return;
       }
       socket.off("close", onCloseWhileOpening);
+      socket.off("end", onEndWhileOpening);
       this.events.emit("event", {
         type: "tunnel-opened",
         message: `${formatProtocol(request.protocol)} tunnel opened for ${request.target.host}:${request.target.port}.`
@@ -245,8 +265,10 @@ export class Socks5Proxy {
 
       if (request.protocol === "socks5") {
         socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        proxyReplySent = true;
       } else if (request.protocol === "http-connect") {
         socket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow SSH\r\n\r\n", "utf8");
+        proxyReplySent = true;
       }
 
       const httpBodyGate = request.httpForwardBody ? new HttpForwardBodyGate(request.httpForwardBody) : undefined;
@@ -323,9 +345,18 @@ export class Socks5Proxy {
       }
       socket.off("error", onHandshakeSocketError);
       this.sockets.delete(socket);
-      const responseAlreadySent = error instanceof ProxyHandshakeError && error.responseAlreadySent;
+      // Browsers and media clients routinely abandon speculative connections.
+      // Once the local socket is already gone, cancelling its pending SSH open
+      // is normal cleanup rather than a tunnel failure worth surfacing.
+      if ((socket.destroyed || socket.readableEnded) && error instanceof Error && error.name === "AbortError") {
+        return;
+      }
+      const responseAlreadySent = proxyReplySent || (error instanceof ProxyHandshakeError && error.responseAlreadySent);
       if (!responseAlreadySent) {
-        writeProxyFailure(socket, isHttpHandshakeError(error) ? "http" : "socks5");
+        const failureProtocol = request
+          ? request.protocol === "socks5" ? "socks5" : "http"
+          : isHttpHandshakeError(error) ? "http" : "socks5";
+        writeProxyFailure(socket, failureProtocol);
       }
       if (!socket.destroyed) {
         // Flush the small protocol error response before tearing down the

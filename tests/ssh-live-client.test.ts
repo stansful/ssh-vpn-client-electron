@@ -265,7 +265,7 @@ describe("SSH live client rekey coordination", () => {
 
   it("abandons a timed-out channel open and closes a late server confirmation", async () => {
     const transport = new FakeTransport();
-    const client = createTestClient(transport, 5);
+    const client = createTestClient(transport, 60_000, { directTcpIpOpenTimeoutMs: 5 });
     const internals = client as unknown as LiveClientInternals;
     internals.runtimeDispatchEnabled = true;
     forceAuthenticated(internals.session);
@@ -292,6 +292,124 @@ describe("SSH live client rekey coordination", () => {
     const reader = new SshBinaryReader(close!);
     expect(reader.byte()).toBe(SSH_MSG_CHANNEL_CLOSE);
     expect(reader.uint32()).toBe(71);
+  });
+
+  it("cancels a still-queued channel-open payload when its response deadline expires", async () => {
+    const transport = new FakeTransport();
+    let queuedSignal: AbortSignal | undefined;
+    transport.onSendOwned = (_payload, signal) => {
+      queuedSignal = signal;
+      return new Promise<void>((_resolve, reject) => {
+        const onAbort = (): void => {
+          const error = new Error("queued open cancelled");
+          error.name = "AbortError";
+          reject(error);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    };
+    const client = createTestClient(transport, 60_000, { directTcpIpOpenTimeoutMs: 5 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+
+    await expect(client.openDirectTcpIpChannel(
+      { host: "slow.example.com", port: 443 },
+      { address: "127.0.0.1", port: 50000 }
+    )).rejects.toThrow("Timed out waiting for SSH channel");
+
+    expect(queuedSignal?.aborted).toBe(true);
+    expect(transport.payloads).toEqual([]);
+    expect(internals.session.getChannel(0)).toBeUndefined();
+  });
+
+  it("does not enqueue a direct-tcpip open cancelled in the async gate continuation", async () => {
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { directTcpIpOpenTimeoutMs: 30_000 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const controller = new AbortController();
+
+    const opening = client.openDirectTcpIpChannel(
+      { host: "unused.example.com", port: 443 },
+      { address: "127.0.0.1", port: 50001 },
+      controller.signal
+    );
+    controller.abort();
+
+    await expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    expect(transport.payloads).toEqual([]);
+    expect(internals.session.getChannel(0)).toBeUndefined();
+  });
+
+  it("cancels an orphaned direct-tcpip open as soon as its local proxy client disconnects", async () => {
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { directTcpIpOpenTimeoutMs: 30_000 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const controller = new AbortController();
+
+    const opening = client.openDirectTcpIpChannel(
+      { host: "unused.example.com", port: 443 },
+      { address: "127.0.0.1", port: 50001 },
+      controller.signal
+    );
+    const rejection = expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    await nextTurn();
+    expect(internals.session.getChannel(0)).toBeDefined();
+
+    controller.abort();
+    await rejection;
+    expect(internals.session.getChannel(0)).toBeUndefined();
+
+    transport.emitPayload(
+      new SshBinaryWriter()
+        .byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION)
+        .uint32(0)
+        .uint32(72)
+        .uint32(1024)
+        .uint32(32768)
+        .toBuffer()
+    );
+    await nextTurn();
+    const close = transport.payloads.find((payload) => {
+      if (payload[0] !== SSH_MSG_CHANNEL_CLOSE) {
+        return false;
+      }
+      const reader = new SshBinaryReader(payload);
+      reader.byte();
+      return reader.uint32() === 72;
+    });
+    expect(close).toBeDefined();
+  });
+
+  it("does not allocate a direct-tcpip channel cancelled while a rekey gate is active", async () => {
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { directTcpIpOpenTimeoutMs: 30_000 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const finishRekey = deferred<void>();
+    internals.performKex = () => finishRekey.promise;
+    const rekey = client.rekey();
+    const controller = new AbortController();
+
+    const opening = client.openDirectTcpIpChannel(
+      { host: "unused.example.com", port: 443 },
+      { address: "127.0.0.1", port: 50002 },
+      controller.signal
+    );
+    const rejection = expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    await nextTurn();
+    controller.abort();
+    finishRekey.resolve(undefined);
+
+    await rekey;
+    await rejection;
+    expect(internals.session.getChannel(0)).toBeUndefined();
+    expect(transport.payloads).toEqual([]);
   });
 
   it("destroys the transport and rejects pending work on a peer disconnect", async () => {
@@ -335,6 +453,7 @@ class FakeTransport {
   readonly payloads: Buffer[] = [];
   destroyed = false;
   onSend: ((payload: Buffer) => void) | undefined;
+  onSendOwned: ((payload: Buffer, signal?: AbortSignal) => Promise<void>) | undefined;
   private listener: ((event: SshPacketTransportEvent) => void) | undefined;
 
   onEvent(listener: (event: SshPacketTransportEvent) => void): () => void {
@@ -351,7 +470,11 @@ class FakeTransport {
     this.onSend?.(payload);
   }
 
-  async sendOwned(payload: Buffer): Promise<void> {
+  async sendOwned(payload: Buffer, signal?: AbortSignal): Promise<void> {
+    if (this.onSendOwned) {
+      await this.onSendOwned(payload, signal);
+      return;
+    }
     this.payloads.push(payload);
     this.onSend?.(payload);
   }

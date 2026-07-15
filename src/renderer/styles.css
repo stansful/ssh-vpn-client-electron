@@ -916,8 +916,7 @@ textarea {
   place-items: center;
   padding: 24px;
   background: rgb(12 14 18 / 48%);
-  backdrop-filter: blur(8px);
-  animation: fade-in 140ms ease both;
+  animation: fade-in 140ms ease;
 }
 
 .modal-card {
@@ -930,7 +929,7 @@ textarea {
   border-radius: 8px;
   background: var(--surface);
   box-shadow: var(--shadow-md);
-  animation: modal-in 180ms ease both;
+  animation: modal-in 180ms ease;
 }
 
 .modal-header,
@@ -1407,11 +1406,9 @@ html[data-document-hidden] .spin {
 @keyframes modal-in {
   from {
     opacity: 0;
-    transform: translateY(8px) scale(0.98);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
   }
 }
 

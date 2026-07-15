@@ -4,7 +4,14 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import { MemoryDirectTcpIpChannel } from "../src/core/network/memory-direct-channel.js";
 import { LocalTcpProxy, type DirectTcpIpChannel } from "../src/core/network/local-tcp-proxy.js";
-import { Socks5Proxy, formatProxyTunnelError, readProxyConnectRequest, readSocksConnectRequest } from "../src/core/network/socks5-proxy.js";
+import {
+  Socks5Proxy,
+  formatProxyTunnelError,
+  readProxyConnectRequest,
+  readSocksConnectRequest,
+  type Socks5ProxyEvent,
+  type Socks5ProxyOptions
+} from "../src/core/network/socks5-proxy.js";
 import { buildProxyPac } from "../src/core/network/windows-system-proxy.js";
 import { normalizeProxyDomain, parseDomainProxyList } from "../src/core/routing/domain-proxy-list.js";
 import {
@@ -82,6 +89,52 @@ describe("SOCKS5 proxy", () => {
 
     expect(Buffer.concat(fake.writes).toString("latin1")).toContain("HTTP/1.1 502 Bad Gateway");
     expect(connectChannel).not.toHaveBeenCalled();
+  });
+
+  it("returns HTTP 502 when opening a parsed CONNECT target fails", async () => {
+    const connectChannel = vi.fn<Socks5ProxyOptions["connectChannel"]>(async () => {
+      throw new Error("Connection refused");
+    });
+    const proxy = new Socks5Proxy({ listenPort: 0, connectChannel });
+    const socket = new FlowingFakeSocket() as unknown as Socket;
+    const handling = (proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(socket);
+    const fake = socket as unknown as FlowingFakeSocket;
+
+    fake.pushInput(Buffer.from("CONNECT gateway.discord.gg:443 HTTP/1.1\r\nHost: gateway.discord.gg:443\r\n\r\n", "latin1"));
+    await handling;
+
+    const channelOpenSignal = connectChannel.mock.calls[0]?.[2];
+    expect(channelOpenSignal).toBeInstanceOf(AbortSignal);
+    expect(channelOpenSignal?.aborted).toBe(false);
+    expect(connectChannel).toHaveBeenCalledWith(
+      { host: "gateway.discord.gg", port: 443 },
+      { address: "127.0.0.1", port: 54321 },
+      channelOpenSignal
+    );
+    const response = Buffer.concat(fake.writes);
+    expect(response.toString("latin1")).toBe(
+      "HTTP/1.1 502 Bad Gateway\r\nProxy-Agent: Shadow SSH\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    expect(response.subarray(0, 2)).not.toEqual(Buffer.from([0x05, 0x01]));
+  });
+
+  it("does not append a plaintext 502 after a CONNECT success reply", async () => {
+    const channel = new MemoryDirectTcpIpChannel();
+    vi.spyOn(channel, "write").mockRejectedValueOnce(new Error("initial channel write failed"));
+    const proxy = new Socks5Proxy({ listenPort: 0, connectChannel: async () => channel });
+    const socket = new FlowingFakeSocket() as unknown as Socket;
+    const handling = (proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(socket);
+    const fake = socket as unknown as FlowingFakeSocket;
+
+    fake.pushInput(Buffer.from(
+      "CONNECT gateway.discord.gg:443 HTTP/1.1\r\nHost: gateway.discord.gg:443\r\n\r\nTLS-CLIENT-HELLO",
+      "latin1"
+    ));
+    await handling;
+
+    expect(Buffer.concat(fake.writes).toString("latin1")).toBe(
+      "HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow SSH\r\n\r\n"
+    );
   });
 
   it("rejects an oversized HTTP header even when its terminator is in the same chunk", async () => {
@@ -399,10 +452,12 @@ describe("SOCKS5 proxy", () => {
     const channelOpening = deferred<void>();
     const releaseChannel = deferred<void>();
     const channelClosed = deferred<void>();
+    let channelOpenSignal: AbortSignal | undefined;
     channel.onClose(() => channelClosed.resolve(undefined));
     const proxy = new Socks5Proxy({
       listenPort: 0,
-      connectChannel: async () => {
+      connectChannel: async (_target, _originator, signal) => {
+        channelOpenSignal = signal;
         channelOpening.resolve(undefined);
         await releaseChannel.promise;
         return channel;
@@ -414,11 +469,48 @@ describe("SOCKS5 proxy", () => {
 
     fake.pushInput(Buffer.from("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n", "latin1"));
     await channelOpening.promise;
-    fake.destroy();
+    expect(channelOpenSignal?.aborted).toBe(false);
+    fake.closeInput();
+    expect(channelOpenSignal?.aborted).toBe(true);
     releaseChannel.resolve(undefined);
 
     await handling;
     await channelClosed.promise;
+  });
+
+  it("treats an abandoned pending channel open as normal local cleanup", async () => {
+    const channelOpening = deferred<void>();
+    const events: Socks5ProxyEvent[] = [];
+    const proxy = new Socks5Proxy({
+      listenPort: 0,
+      connectChannel: (_target, _originator, signal) => {
+        channelOpening.resolve(undefined);
+        return new Promise<DirectTcpIpChannel>((_resolve, reject) => {
+          const onAbort = (): void => {
+            const error = new Error("cancelled by local client");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (signal?.aborted) {
+            onAbort();
+          } else {
+            signal?.addEventListener("abort", onAbort, { once: true });
+          }
+        });
+      }
+    });
+    proxy.onEvent((event) => events.push(event));
+    const socket = new FlowingFakeSocket() as unknown as Socket;
+    const handling = (proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(socket);
+    const fake = socket as unknown as FlowingFakeSocket;
+
+    fake.pushInput(Buffer.from("CONNECT media.example:443 HTTP/1.1\r\nHost: media.example:443\r\n\r\n", "latin1"));
+    await channelOpening.promise;
+    fake.endInput();
+    await handling;
+
+    expect(fake.destroyed).toBe(true);
+    expect(events.some((event) => event.type === "error")).toBe(false);
   });
 
   it("retains SOCKS pending-open leases after local socket churn and closes late channels", async () => {
@@ -523,19 +615,19 @@ describe("Windows PAC generation", () => {
 
     expect(pac).toContain("Shadow SSH routing PAC");
     expect(pac).toContain("PROXY 127.0.0.1:1080");
-    expect(pac).toContain("SOCKS5 127.0.0.1:1080");
+    expect(pac).not.toContain("SOCKS5 127.0.0.1:1080");
     expect(pac).toContain('var proxyWildcardDomains = {"example.com":1};');
     expect(pac).toContain("dnsResolve(host)");
     expect(pac).toContain('isInNet(resolvedHost, "10.10.0.0", "255.255.0.0")');
     expect(pac).toContain('var proxyExactIps = {"192.0.2.10":1};');
-    expect(pac).toContain("resolvedHasOwn(resolvedHosts, proxyExactIps)");
+    expect(pac).toContain("resolvedHasOwn(resolvedHosts, proxyResolvedExactIps)");
     expect(pac).not.toContain("resolvedHostEx.indexOf");
     expect(pac).not.toContain("disabled.test");
   });
 
-  it("matches an exact learned IPv4 address across every DNS result", () => {
+  it("preserves DNS matching for a user-authored exact IPv4 rule", () => {
     const pac = buildProxyPac(
-      [{ id: "process-ip", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" }],
+      [{ id: "user-exact-ip", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" }],
       "127.0.0.1",
       1080
     );
@@ -543,15 +635,132 @@ describe("Windows PAC generation", () => {
       result?: string;
       dnsResolve: () => string;
       dnsResolveEx: () => string;
+      dnsResolveCalls: number;
+      dnsResolveExCalls: number;
     } = {
-      dnsResolve: () => "203.0.113.1",
-      dnsResolveEx: () => "203.0.113.1;203.0.113.2"
+      dnsResolveCalls: 0,
+      dnsResolveExCalls: 0,
+      dnsResolve: () => {
+        context.dnsResolveCalls += 1;
+        return "203.0.113.1";
+      },
+      dnsResolveEx: () => {
+        context.dnsResolveExCalls += 1;
+        return "203.0.113.1;203.0.113.2";
+      }
     };
 
     runInNewContext(`${pac}\nresult = FindProxyForURL("https://cdn.example/", "cdn.example");`, context);
 
     expect(pac).toContain("dnsResolveEx(host)");
     expect(context.result).toContain("PROXY 127.0.0.1:1080");
+    expect(context.dnsResolveExCalls).toBe(1);
+    expect(context.dnsResolveCalls).toBe(0);
+  });
+
+  it("matches a dynamic process IP literally and caches its generic hostname fallback", () => {
+    const pac = buildProxyPac(
+      [{ id: "process-ip:203.0.113.2", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080
+    );
+    let dnsCalls = 0;
+    const context: {
+      literalResult?: string;
+      hostnameResult?: string;
+      hostnameResultAgain?: string;
+      dnsResolve: () => string;
+      dnsResolveEx: () => string;
+    } = {
+      dnsResolve: () => {
+        dnsCalls += 1;
+        return "203.0.113.2";
+      },
+      dnsResolveEx: () => {
+        dnsCalls += 1;
+        return "203.0.113.2";
+      }
+    };
+
+    runInNewContext(
+      `${pac}\nliteralResult = FindProxyForURL("https://203.0.113.2/", "203.0.113.2");\n` +
+        "hostnameResult = FindProxyForURL(\"https://cdn.example/\", \"cdn.example\");\n" +
+        "hostnameResultAgain = FindProxyForURL(\"https://cdn.example/second\", \"cdn.example\");",
+      context
+    );
+
+    expect(pac).toContain('var proxyExactIps = {"203.0.113.2":1};');
+    expect(pac).toContain("hasOwn(proxyExactIps, hostNoBrackets)");
+    expect(pac).toContain("resolvedHostCache");
+    expect(pac).toContain("dnsResolveEx(host)");
+    expect(context.literalResult).toBe("PROXY 127.0.0.1:1080");
+    expect(context.hostnameResult).toBe("PROXY 127.0.0.1:1080");
+    expect(context.hostnameResultAgain).toBe("PROXY 127.0.0.1:1080");
+    expect(dnsCalls).toBe(1);
+  });
+
+  it("retries a transient unresolved PAC lookup instead of caching DIRECT", () => {
+    const pac = buildProxyPac(
+      [{ id: "process-ip:203.0.113.2", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080
+    );
+    let extendedCalls = 0;
+    let fallbackCalls = 0;
+    const context: {
+      firstResult?: string;
+      secondResult?: string;
+      dnsResolve: () => string;
+      dnsResolveEx: () => string;
+    } = {
+      dnsResolve: () => {
+        fallbackCalls += 1;
+        return "";
+      },
+      dnsResolveEx: () => {
+        extendedCalls += 1;
+        return extendedCalls === 1 ? "" : "203.0.113.2";
+      }
+    };
+
+    runInNewContext(
+      `${pac}\nfirstResult = FindProxyForURL("https://recover.example/", "recover.example");\n` +
+        "secondResult = FindProxyForURL(\"https://recover.example/retry\", \"recover.example\");",
+      context
+    );
+
+    expect(context.firstResult).toBe("DIRECT");
+    expect(context.secondResult).toBe("PROXY 127.0.0.1:1080");
+    expect(extendedCalls).toBe(2);
+    expect(fallbackCalls).toBe(1);
+  });
+
+  it("keeps the learned process hostname fallback alongside a user CIDR", () => {
+    const pac = buildProxyPac(
+      [
+        { id: "process-ip:203.0.113.2", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" },
+        { id: "user-cidr", type: "ip", value: "198.51.100.0/24", enabled: true, createdAt: "", updatedAt: "" }
+      ],
+      "127.0.0.1",
+      1080
+    );
+    const context: {
+      result?: string;
+      dnsResolve: () => string;
+      dnsResolveEx: () => string;
+      isInNet: () => boolean;
+      isInNetEx: () => boolean;
+    } = {
+      dnsResolve: () => "203.0.113.2",
+      dnsResolveEx: () => "203.0.113.2",
+      isInNet: () => false,
+      isInNetEx: () => false
+    };
+
+    runInNewContext(`${pac}\nresult = FindProxyForURL("https://cdn.example/", "cdn.example");`, context);
+
+    expect(pac).toContain('var proxyResolvedExactIps = {"203.0.113.2":1};');
+    expect(context.result).toBe("PROXY 127.0.0.1:1080");
   });
 
   it("matches an IPv4 CIDR across every extended DNS result", () => {
@@ -577,6 +786,26 @@ describe("Windows PAC generation", () => {
 
     expect(pac).toContain('resolvedIsInNetEx(resolvedHosts, "203.0.113.0/24")');
     expect(context.result).toContain("PROXY 127.0.0.1:1080");
+  });
+
+  it("falls back to one legacy DNS lookup when extended PAC DNS is unavailable", () => {
+    const pac = buildProxyPac(
+      [{ id: "user-exact-ip", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080
+    );
+    let dnsCalls = 0;
+    const context: { result?: string; dnsResolve: () => string } = {
+      dnsResolve: () => {
+        dnsCalls += 1;
+        return "203.0.113.2";
+      }
+    };
+
+    runInNewContext(`${pac}\nresult = FindProxyForURL("https://legacy.example/", "legacy.example");`, context);
+
+    expect(context.result).toContain("PROXY 127.0.0.1:1080");
+    expect(dnsCalls).toBe(1);
   });
 
   it("omits invalid enabled routing rules from generated PAC content", () => {
@@ -622,6 +851,18 @@ describe("Windows PAC generation", () => {
     expect(pac).not.toContain("SOCKS5 127.0.0.1:19080");
   });
 
+  it("uses one SOCKS5 route without retrying SOCKS4 on the same endpoint", () => {
+    const pac = buildProxyPac(
+      [{ id: "1", type: "domain", value: "example.com", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080,
+      "socks"
+    );
+
+    expect(evaluatePac(pac, "example.com")).toBe("SOCKS5 127.0.0.1:1080");
+    expect(pac).not.toContain("; SOCKS");
+  });
+
   it("adds proxy-list checks to selected-rules routing", () => {
     const pac = buildProxyPac([], "127.0.0.1", 1080, "mixed", {
       mode: "selected-rules",
@@ -630,7 +871,7 @@ describe("Windows PAC generation", () => {
 
     expect(pac).toContain('var proxyListDomains = {"ru":1,"gosuslugi.ru":1};');
     expect(pac).toContain("matchesDomainOrParent(hostNoBrackets, proxyListDomains)");
-    expect(pac).toContain('return "PROXY 127.0.0.1:1080; SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080";');
+    expect(pac).toContain('return "PROXY 127.0.0.1:1080";');
     expect(evaluatePac(pac, "api.gosuslugi.ru")).toContain("PROXY 127.0.0.1:1080");
   });
 
@@ -645,7 +886,7 @@ describe("Windows PAC generation", () => {
       pac.indexOf("matchesDomainOrParent(hostNoBrackets, proxyListDomains)")
     );
     expect(pac).toContain('return "DIRECT";');
-    expect(pac).toContain('return "PROXY 127.0.0.1:1080; SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080";');
+    expect(pac).toContain('return "PROXY 127.0.0.1:1080";');
     expect(evaluatePac(pac, "direct.example.com")).toBe("DIRECT");
     expect(evaluatePac(pac, "www.example.com")).toContain("PROXY 127.0.0.1:1080");
   });
@@ -657,7 +898,7 @@ describe("Windows PAC generation", () => {
     });
 
     expect(pac).toContain('return "DIRECT";');
-    expect(pac).toContain('return "PROXY 127.0.0.1:1080; SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080";');
+    expect(pac).toContain('return "PROXY 127.0.0.1:1080";');
     expect(evaluatePac(pac, "service.ru")).toBe("DIRECT");
     expect(evaluatePac(pac, "example.com")).toContain("PROXY 127.0.0.1:1080");
   });
@@ -673,6 +914,37 @@ describe("Windows PAC generation", () => {
     expect(pac).not.toContain("dnsResolveEx(");
     expect(evaluatePac(pac, "api.example.com")).toContain("PROXY 127.0.0.1:1080");
     expect(evaluatePac(pac, "example.com")).toBe("DIRECT");
+  });
+
+  it("returns a matching process domain before evaluating unrelated IP rules", () => {
+    const pac = buildProxyPac(
+      [
+        { id: "discord", type: "domain", value: "*.discord.gg", enabled: true, createdAt: "", updatedAt: "" },
+        { id: "process-ip:203.0.113.8", type: "ip", value: "203.0.113.8", enabled: true, createdAt: "", updatedAt: "" }
+      ],
+      "127.0.0.1",
+      1080
+    );
+    let dnsCalls = 0;
+    const context: {
+      result?: string;
+      dnsResolve: () => string;
+      dnsResolveEx: () => string;
+    } = {
+      dnsResolve: () => {
+        dnsCalls += 1;
+        return "203.0.113.1";
+      },
+      dnsResolveEx: () => {
+        dnsCalls += 1;
+        return "203.0.113.1";
+      }
+    };
+
+    runInNewContext(`${pac}\nresult = FindProxyForURL("https://gateway.discord.gg/", "gateway.discord.gg");`, context);
+
+    expect(context.result).toContain("PROXY 127.0.0.1:1080");
+    expect(dnsCalls).toBe(0);
   });
 
   it("matches equivalent IPv6 spellings for an exact /128 rule", () => {
@@ -821,6 +1093,7 @@ class FlowingFakeSocket extends EventEmitter {
   destroyed = false;
   writable = true;
   writableEnded = false;
+  readableEnded = false;
   remoteAddress = "127.0.0.1";
   remotePort = 54321;
 
@@ -894,6 +1167,14 @@ class FlowingFakeSocket extends EventEmitter {
     this.destroyed = true;
     this.writable = false;
     this.emit("close");
+  }
+
+  endInput(): void {
+    if (this.destroyed || this.readableEnded) {
+      return;
+    }
+    this.readableEnded = true;
+    this.emit("end");
   }
 
   private flushPendingData(): void {

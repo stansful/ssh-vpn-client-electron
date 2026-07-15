@@ -6,16 +6,31 @@ import { spawn } from "node:child_process";
 import { checkSocks5Connect, parseEndpoint } from "../core/network/socks5-check.js";
 import { RoutingMatcher } from "../core/routing/routing-matcher.js";
 import {
+  isAutoLearnableRemoteAddress,
   listWindowsProcessConnections,
   normalizeWindowsProcessName,
   type WindowsProcessConnection
 } from "../core/network/windows-process-connections.js";
+import { listWindowsDnsCacheEntries, type WindowsDnsCacheEntry } from "../core/network/windows-dns-cache.js";
+import {
+  isDomainCoveredByDirectDomainSuffixes,
+  isDomainCoveredByRoutePatterns,
+  MAX_PROCESS_ROUTE_SESSION_LEASES,
+  normalizeProcessRouteDirectDomains,
+  processRouteDomainHints,
+  type ProcessRouteSessionEvidence
+} from "../core/routing/process-route-domains.js";
 import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
 import { buildXrayConfig } from "../core/proxy/xray-config.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { DiagnosticsEntry, ProxyConnectRequest, RoutingRule, RoutingUpdateRequest, RuntimeStatus, TunnelCheckResult } from "../shared/types.js";
 import { normalizeRuleValue, validateRoutingRuleValue } from "../shared/validation.js";
-import { buildSelectedRulesWithProcessIps, recordBoundedProcessRouteIp } from "./live-ssh-service.js";
+import {
+  buildProcessRouteSignature,
+  buildSelectedRulesWithProcessIps,
+  recordBoundedProcessRouteDomain,
+  recordBoundedProcessRouteIp
+} from "./live-ssh-service.js";
 import { reserveDistinctLocalTcpPorts, terminateProcess, waitForProcessStartup, type XrayProcess } from "./xray/process-utils.js";
 
 export interface XrayServiceBridgeOptions {
@@ -25,11 +40,15 @@ export interface XrayServiceBridgeOptions {
   systemProxy?: WindowsSystemProxyManager;
   processRoutingRefreshIntervalMs?: () => number;
   processConnectionsProvider?: (processNames: Iterable<string>) => Promise<WindowsProcessConnection[]>;
+  processDnsEntriesProvider?: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
 const PROCESS_ROUTE_REFRESH_INTERVAL_MS = 10 * 1000;
 const PROCESS_ROUTE_DISCOVERY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
+const PROCESS_ROUTE_DNS_REFRESH_MS = 5 * 60 * 1000;
+const PROCESS_ROUTE_DNS_MIN_REFRESH_MS = 1_000;
+const PROCESS_ROUTE_DNS_RETRY_BASE_MS = 10_000;
 const MAX_XRAY_PROCESS_LOG_LINES = 80;
 const MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS = 64 * 1024;
 const MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS = 4096;
@@ -39,6 +58,7 @@ export class XrayServiceBridge {
   private readonly systemProxy: WindowsSystemProxyManager;
   private readonly processRoutingRefreshIntervalMs: () => number;
   private readonly processConnectionsProvider: (processNames: Iterable<string>) => Promise<WindowsProcessConnection[]>;
+  private readonly processDnsEntriesProvider: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
   private readonly runtimeDirectory: string;
   private readonly configPath: string;
   private readonly startupConfigCleanup: Promise<void>;
@@ -55,12 +75,19 @@ export class XrayServiceBridge {
   private processRoutingMonitor: NodeJS.Timeout | undefined;
   private processRoutingGeneration = 0;
   private processRoutingIps = new Map<string, number>();
+  private processRoutingHintDomains = new Set<string>();
+  private processRoutingDomains = new Map<string, number>();
+  private processRoutingDnsLookupAt = new Map<string, number>();
+  private processRoutingDnsLookupFailures = new Map<string, number>();
+  private processRoutingProfileCoveredAddresses = new Map<string, number>();
+  private processRoutingSessionLeases = new Map<string, ProcessRouteSessionEvidence>();
   private processRoutingLastSignature = "";
   private processRoutingAppliedSignature = "";
   private processRoutingTargetSignature = "";
   private processRoutingApplyPending = false;
   private processRoutingLastMatchedConnections = 0;
   private processRoutingWarningEmitted = false;
+  private processRoutingDnsWarningEmitted = false;
   private processRoutingDiscoveryStep = 0;
   private processLogLines = 0;
   private readonly processLogDrainers = new WeakMap<XrayProcess, () => void>();
@@ -73,6 +100,8 @@ export class XrayServiceBridge {
     this.systemProxy = options.systemProxy ?? new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
     this.processRoutingRefreshIntervalMs = options.processRoutingRefreshIntervalMs ?? (() => PROCESS_ROUTE_REFRESH_INTERVAL_MS);
     this.processConnectionsProvider = options.processConnectionsProvider ?? listWindowsProcessConnections;
+    this.processDnsEntriesProvider = options.processDnsEntriesProvider ??
+      (options.processConnectionsProvider ? async () => [] : listWindowsDnsCacheEntries);
     this.runtimeDirectory = options.runtimeDirectory;
     this.configPath = path.join(this.runtimeDirectory, "xray-config.json");
     this.startupConfigCleanup = rm(this.configPath, { force: true }).catch(() => undefined);
@@ -193,12 +222,19 @@ export class XrayServiceBridge {
     }
     this.processLogLines = 0;
     this.processRoutingIps.clear();
+    this.processRoutingHintDomains.clear();
+    this.processRoutingDomains.clear();
+    this.processRoutingDnsLookupAt.clear();
+    this.processRoutingDnsLookupFailures.clear();
+    this.processRoutingProfileCoveredAddresses.clear();
+    this.processRoutingSessionLeases.clear();
     this.processRoutingLastSignature = "";
     this.processRoutingAppliedSignature = "";
     this.processRoutingTargetSignature = "";
     this.processRoutingApplyPending = false;
     this.processRoutingLastMatchedConnections = 0;
     this.processRoutingWarningEmitted = false;
+    this.processRoutingDnsWarningEmitted = false;
     await this.stopRouting();
     if (!this.isCurrentLifecycle(generation)) {
       return;
@@ -487,11 +523,18 @@ export class XrayServiceBridge {
   private async stopRouting(): Promise<void> {
     this.stopProcessRoutingMonitor();
     this.processRoutingIps.clear();
+    this.processRoutingHintDomains.clear();
+    this.processRoutingDomains.clear();
+    this.processRoutingDnsLookupAt.clear();
+    this.processRoutingDnsLookupFailures.clear();
+    this.processRoutingProfileCoveredAddresses.clear();
+    this.processRoutingSessionLeases.clear();
     this.processRoutingLastSignature = "";
     this.processRoutingAppliedSignature = "";
     this.processRoutingTargetSignature = "";
     this.processRoutingApplyPending = false;
     this.processRoutingLastMatchedConnections = 0;
+    this.processRoutingDnsWarningEmitted = false;
     try {
       await this.systemProxy.restore();
     } catch (error) {
@@ -614,42 +657,92 @@ export class XrayServiceBridge {
     const httpEndpoint = this.httpEndpoint ?? socksEndpoint;
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
     const hasProcessRouting = supportsDynamicProcessRouting(request.routingMode, request.routingRules);
+    let literalIpSnapshotResult: SystemProxyApplyResult | undefined;
+    let literalIpSnapshotError: unknown;
+    let literalIpSnapshotFailed = false;
+    let literalIpSnapshotSignature: string | undefined;
     if (hasProcessRouting) {
-      await this.learnProcessRoutingIps(request.routingRules, generation);
+      await this.learnProcessRoutingIps(
+        request.routingRules,
+        request.routingDirectDomains,
+        generation,
+        async (signature) => {
+          literalIpSnapshotSignature = signature;
+          try {
+            literalIpSnapshotResult = await this.publishProcessRoutingSnapshot(
+              request,
+              socksEndpoint,
+              generation,
+              signature
+            );
+          } catch (error) {
+            literalIpSnapshotFailed = true;
+            literalIpSnapshotError = error;
+            this.processRoutingApplyPending = true;
+          }
+        }
+      );
       if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
         return;
       }
       this.appendDiagnostic(
         "warning",
-        "Selected process-name routing is using dynamic process-IP PAC rules. Non-matching traffic stays direct, but already-open target app sockets may need reconnect; strict per-process enforcement still requires WFP/TUN."
+        "Selected process-name routing is using dynamic process destination PAC rules. Reviewed host families stay stable while DNS-learned exact names use a bounded TTL; already-open sockets may still need reconnect, and strict per-process enforcement requires WFP/TUN."
       );
+      if (
+        literalIpSnapshotFailed &&
+        literalIpSnapshotSignature === this.processRoutingLastSignature
+      ) {
+        if (this.status.state === "Connected") {
+          this.startProcessRoutingMonitor(request, socksEndpoint);
+        }
+        throw literalIpSnapshotError;
+      }
     } else {
       this.processRoutingIps.clear();
+      this.processRoutingHintDomains.clear();
+      this.processRoutingDomains.clear();
+      this.processRoutingDnsLookupAt.clear();
+      this.processRoutingDnsLookupFailures.clear();
+      this.processRoutingProfileCoveredAddresses.clear();
+      this.processRoutingSessionLeases.clear();
       this.processRoutingLastSignature = "";
       this.processRoutingAppliedSignature = "";
       this.processRoutingTargetSignature = "";
       this.processRoutingApplyPending = false;
       this.processRoutingLastMatchedConnections = 0;
+      this.processRoutingDnsWarningEmitted = false;
     }
-    const effectiveRules = buildSelectedRulesWithProcessIps(request.routingRules, this.currentProcessRoutingIps());
     this.processRoutingApplyPending = hasProcessRouting;
     let result: SystemProxyApplyResult;
-    try {
-      result = await this.systemProxy.apply({
-        mode: request.routingMode,
-        rules: effectiveRules,
-        proxyDomains: request.routingProxyDomains,
-        directDomains: request.routingDirectDomains,
-        socksHost: httpEndpoint.host,
-        socksPort: httpEndpoint.port,
-        proxyProtocol: "http",
-        forcePacEndpointRotation: hasProcessRouting
-      });
-    } catch (error) {
-      if (hasProcessRouting && generation === this.processRoutingGeneration && this.status.state === "Connected") {
-        this.startProcessRoutingMonitor(request, socksEndpoint);
+    if (
+      hasProcessRouting &&
+      literalIpSnapshotResult &&
+      literalIpSnapshotSignature === this.processRoutingLastSignature
+    ) {
+      result = literalIpSnapshotResult;
+    } else {
+      try {
+        result = await this.systemProxy.apply({
+          mode: request.routingMode,
+          rules: buildSelectedRulesWithProcessIps(
+            request.routingRules,
+            this.currentProcessRoutingIps(),
+            this.currentProcessRoutingDomains()
+          ),
+          proxyDomains: request.routingProxyDomains,
+          directDomains: request.routingDirectDomains,
+          socksHost: httpEndpoint.host,
+          socksPort: httpEndpoint.port,
+          proxyProtocol: "http",
+          forcePacEndpointRotation: hasProcessRouting
+        });
+      } catch (error) {
+        if (hasProcessRouting && generation === this.processRoutingGeneration && this.status.state === "Connected") {
+          this.startProcessRoutingMonitor(request, socksEndpoint);
+        }
+        throw error;
       }
-      throw error;
     }
     if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
       return;
@@ -669,7 +762,7 @@ export class XrayServiceBridge {
     }
     this.appendDiagnostic(
       summary.enabledRules > 0 ? "info" : "warning",
-      `Selected routing prepared for Xray transport: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}.`
+      `Selected routing prepared for Xray transport: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}, learnedProcessDomains=${this.currentProcessRoutingDomains().size}.`
     );
   }
 
@@ -680,9 +773,7 @@ export class XrayServiceBridge {
     }
 
     const generation = this.processRoutingGeneration;
-    this.processRoutingDiscoveryStep = this.processRoutingIps.size > 0 && !this.processRoutingApplyPending
-      ? PROCESS_ROUTE_DISCOVERY_DELAYS_MS.length
-      : 0;
+    this.processRoutingDiscoveryStep = 0;
     this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
   }
 
@@ -733,53 +824,125 @@ export class XrayServiceBridge {
     if (generation !== this.processRoutingGeneration || this.status.state !== "Connected") {
       return;
     }
-    await this.learnProcessRoutingIps(request.routingRules, generation);
+    let literalIpSnapshotResult: SystemProxyApplyResult | undefined;
+    let literalIpSnapshotError: unknown;
+    let literalIpSnapshotFailed = false;
+    let literalIpSnapshotSignature: string | undefined;
+    await this.learnProcessRoutingIps(
+      request.routingRules,
+      request.routingDirectDomains,
+      generation,
+      async (signature) => {
+        literalIpSnapshotSignature = signature;
+        try {
+          literalIpSnapshotResult = await this.publishProcessRoutingSnapshot(
+            request,
+            socksEndpoint,
+            generation,
+            signature
+          );
+        } catch (error) {
+          literalIpSnapshotFailed = true;
+          literalIpSnapshotError = error;
+          this.processRoutingApplyPending = true;
+        }
+      }
+    );
     if (
-      generation !== this.processRoutingGeneration ||
-      this.status.state !== "Connected" ||
-      (!this.processRoutingApplyPending && this.processRoutingLastSignature === this.processRoutingAppliedSignature)
+      literalIpSnapshotFailed &&
+      literalIpSnapshotSignature === this.processRoutingLastSignature
     ) {
+      throw literalIpSnapshotError;
+    }
+    if (generation !== this.processRoutingGeneration || this.status.state !== "Connected") {
+      return;
+    }
+    if (
+      literalIpSnapshotResult &&
+      literalIpSnapshotSignature === this.processRoutingLastSignature
+    ) {
+      this.appendDiagnostic(
+        literalIpSnapshotResult.applied ? "info" : "warning",
+        `Process-name literal-IP routing updated before DNS enrichment for Xray transport: matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}. ${literalIpSnapshotResult.message}`
+      );
+      return;
+    }
+    if (!this.processRoutingApplyPending && this.processRoutingLastSignature === this.processRoutingAppliedSignature) {
       return;
     }
 
     const observedSignature = this.processRoutingLastSignature;
-    const effectiveRules = buildSelectedRulesWithProcessIps(request.routingRules, this.currentProcessRoutingIps());
+    const result = await this.publishProcessRoutingSnapshot(
+      request,
+      socksEndpoint,
+      generation,
+      observedSignature
+    );
+    if (!result) {
+      return;
+    }
+    this.appendDiagnostic(
+      result.applied ? "info" : "warning",
+      `Process-name routing updated for Xray transport: matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}, learnedProcessDomains=${this.currentProcessRoutingDomains().size}. ${result.message}`
+    );
+  }
+
+  private async publishProcessRoutingSnapshot(
+    request: ProxyConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number,
+    signature: string
+  ): Promise<SystemProxyApplyResult | undefined> {
+    if (
+      generation !== this.processRoutingGeneration ||
+      !this.isRoutingApplicable() ||
+      signature !== this.processRoutingLastSignature
+    ) {
+      return undefined;
+    }
     this.processRoutingApplyPending = true;
+    const endpoint = this.httpEndpoint ?? socksEndpoint;
     const result = await this.systemProxy.apply({
       mode: request.routingMode,
-      rules: effectiveRules,
+      rules: buildSelectedRulesWithProcessIps(
+        request.routingRules,
+        this.currentProcessRoutingIps(),
+        this.currentProcessRoutingDomains()
+      ),
       proxyDomains: request.routingProxyDomains,
       directDomains: request.routingDirectDomains,
-      socksHost: (this.httpEndpoint ?? socksEndpoint).host,
-      socksPort: (this.httpEndpoint ?? socksEndpoint).port,
+      socksHost: endpoint.host,
+      socksPort: endpoint.port,
       proxyProtocol: "http",
       forcePacEndpointRotation: true
     });
     if (
       result.applied &&
       generation === this.processRoutingGeneration &&
-      this.status.state === "Connected" &&
-      this.processRoutingLastSignature === observedSignature
+      this.isRoutingApplicable() &&
+      this.processRoutingLastSignature === signature
     ) {
-      this.processRoutingAppliedSignature = observedSignature;
+      this.processRoutingAppliedSignature = signature;
       this.processRoutingApplyPending = false;
-      if (this.processRoutingIps.size > 0) {
-        this.processRoutingDiscoveryStep = PROCESS_ROUTE_DISCOVERY_DELAYS_MS.length;
-      }
     }
-    this.appendDiagnostic(
-      result.applied ? "info" : "warning",
-      `Process-name routing updated for Xray transport: matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}. ${result.message}`
-    );
+    return result;
   }
 
-  private async learnProcessRoutingIps(rules: RoutingRule[], generation?: number): Promise<boolean> {
+  private async learnProcessRoutingIps(
+    rules: RoutingRule[],
+    directDomains: string[] = [],
+    generation?: number,
+    publishLiteralIpSnapshot?: (signature: string) => Promise<void>
+  ): Promise<boolean> {
     if (!supportsDynamicProcessRouting("selected-rules", rules)) {
       return false;
     }
     if (generation !== undefined && generation !== this.processRoutingGeneration) {
       return false;
     }
+    const directDomainSuffixes = normalizeProcessRouteDirectDomains(directDomains);
+    const signatureBeforeLearning = this.processRoutingLastSignature;
+    const literalIpsBeforeLearning = new Set(this.processRoutingIps.keys());
 
     try {
       const processNames = enabledProcessRuleNames(rules);
@@ -789,24 +952,273 @@ export class XrayServiceBridge {
         return false;
       }
       const now = Date.now();
-      const expiresBefore = now - this.currentProcessRoutingTtlMs();
+      const routeTtlMs = this.currentProcessRoutingTtlMs();
+      const expiresBefore = now - routeTtlMs;
       const nextIps = new Map([...this.processRoutingIps].filter((entry) => entry[1] >= expiresBefore));
+      const nextDomains = new Map(
+        [...this.processRoutingDomains].filter((entry) =>
+          entry[1] > now && !isDomainCoveredByDirectDomainSuffixes(entry[0], directDomainSuffixes)
+        )
+      );
+      const activeProfileCoveredAddresses = new Map(
+        [...this.processRoutingProfileCoveredAddresses].filter((entry) => entry[1] > now)
+      );
+      const nextSessionLeases = new Map(this.processRoutingSessionLeases);
+      const knownAddressesBeforeObservation = new Set([
+        ...nextIps.keys(),
+        ...activeProfileCoveredAddresses.keys(),
+        ...nextSessionLeases.keys()
+      ]);
+      const observedAddresses = new Set<string>();
+      const unprofiledAddresses = new Set<string>();
+      const processOwnersByAddress = new Map<string, Set<string>>();
+      const profilePatternsByAddress = new Map<string, Set<string>>();
+      const profilePatternsByProcess = new Map(
+        [...processNames].map((processName) => [processName, processRouteDomainHints([processName])] as const)
+      );
       let matchedConnections = 0;
       for (const connection of connections) {
         const processName = normalizeWindowsProcessName(connection.processName);
         if (processNames.has(processName)) {
           matchedConnections += 1;
+          observedAddresses.add(connection.remoteAddress);
           recordBoundedProcessRouteIp(nextIps, connection.remoteAddress, now);
+          const owners = processOwnersByAddress.get(connection.remoteAddress) ?? new Set<string>();
+          owners.add(processName);
+          processOwnersByAddress.set(connection.remoteAddress, owners);
+          const profilePatterns = profilePatternsByProcess.get(processName) ?? new Set<string>();
+          if (profilePatterns.size === 0) {
+            unprofiledAddresses.add(connection.remoteAddress);
+          } else {
+            const addressPatterns = profilePatternsByAddress.get(connection.remoteAddress) ?? new Set<string>();
+            for (const pattern of profilePatterns) {
+              addressPatterns.add(pattern);
+            }
+            profilePatternsByAddress.set(connection.remoteAddress, addressPatterns);
+          }
         }
       }
       this.processRoutingLastMatchedConnections = matchedConnections;
 
-      const nextSignature = [...nextIps.keys()].sort().join(",");
-      const changed = nextSignature !== this.processRoutingLastSignature;
-      this.processRoutingIps = nextIps;
-      this.processRoutingLastSignature = nextSignature;
-      return changed;
+      for (const [address, lease] of [...nextSessionLeases]) {
+        if (isDomainCoveredByDirectDomainSuffixes(lease.domain, directDomainSuffixes)) {
+          nextSessionLeases.delete(address);
+        }
+      }
+
+      for (const address of [...activeProfileCoveredAddresses.keys()]) {
+        if (profilePatternsByAddress.has(address) && !unprofiledAddresses.has(address)) {
+          activeProfileCoveredAddresses.set(address, now + routeTtlMs);
+          nextIps.delete(address);
+        }
+      }
+
+      // This first phase is useful only when PAC receives an IP literal. Keep
+      // DNS enrichment mandatory below so hostname process routing is never
+      // weakened by the fast path.
+      const literalIpSnapshotChanged = this.commitProcessRoutingSnapshot(
+        nextIps,
+        nextDomains,
+        activeProfileCoveredAddresses,
+        nextSessionLeases
+      );
+      const literalIpSetChanged =
+        literalIpsBeforeLearning.size !== nextIps.size ||
+        [...literalIpsBeforeLearning].some((address) => !nextIps.has(address));
+      if (
+        directDomainSuffixes.size === 0 &&
+        literalIpSnapshotChanged &&
+        literalIpSetChanged &&
+        publishLiteralIpSnapshot
+      ) {
+        await publishLiteralIpSnapshot(this.processRoutingLastSignature);
+        if (generation !== undefined && generation !== this.processRoutingGeneration) {
+          return false;
+        }
+      }
+
+      const dnsLookupAddresses = [...observedAddresses].filter((address) => {
+        const nextLookupAt = this.processRoutingDnsLookupAt.get(address);
+        return nextLookupAt === undefined || now >= nextLookupAt;
+      });
+      if (dnsLookupAddresses.length > 0) {
+        for (const address of dnsLookupAddresses) {
+          const failures = Math.min((this.processRoutingDnsLookupFailures.get(address) ?? 0) + 1, 16);
+          const retryDelay = Math.min(
+            PROCESS_ROUTE_DNS_REFRESH_MS,
+            PROCESS_ROUTE_DNS_RETRY_BASE_MS * 2 ** Math.min(failures - 1, 5)
+          );
+          recordBoundedProcessRouteIp(this.processRoutingDnsLookupFailures, address, failures);
+          recordBoundedProcessRouteIp(this.processRoutingDnsLookupAt, address, now + retryDelay);
+        }
+        try {
+          const dnsEntries = await this.processDnsEntriesProvider(dnsLookupAddresses);
+          if (generation !== undefined && generation !== this.processRoutingGeneration) {
+            return false;
+          }
+          const configuredDomainPatterns = rules
+            .filter((rule) => rule.enabled && rule.type === "domain" && validateRoutingRuleValue(rule.type, rule.value).ok)
+            .map((rule) => normalizeRuleValue("domain", rule.value));
+          const stableDomainPatterns = [...this.processRoutingHintDomains, ...configuredDomainPatterns];
+          const addressesWithDnsEntries = new Set<string>();
+          const profileCoveredAddresses = new Set<string>();
+          const validDnsEntriesByTuple = new Map<string, WindowsDnsCacheEntry>();
+          for (const entry of dnsEntries) {
+            const domain = normalizeRuleValue("domain", entry.domain).replace(/\.$/u, "");
+            if (
+              !observedAddresses.has(entry.address) ||
+              !Number.isSafeInteger(entry.ttlSeconds) ||
+              entry.ttlSeconds <= 0 ||
+              domain.startsWith("*.") ||
+              !validateRoutingRuleValue("domain", domain).ok
+            ) {
+              continue;
+            }
+            const key = `${entry.address}\u0000${domain}`;
+            const existing = validDnsEntriesByTuple.get(key);
+            if (!existing || entry.ttlSeconds > existing.ttlSeconds) {
+              validDnsEntriesByTuple.set(key, { ...entry, domain });
+            }
+          }
+          const validDnsEntries = [...validDnsEntriesByTuple.values()];
+          const exactDomainsByAddress = new Map<string, Set<string>>();
+          for (const entry of validDnsEntries) {
+            addressesWithDnsEntries.add(entry.address);
+            const domains = exactDomainsByAddress.get(entry.address) ?? new Set<string>();
+            domains.add(entry.domain);
+            exactDomainsByAddress.set(entry.address, domains);
+            const profilePatterns = profilePatternsByAddress.get(entry.address);
+            if (profilePatterns && isDomainCoveredByRoutePatterns(entry.domain, profilePatterns)) {
+              profileCoveredAddresses.add(entry.address);
+            }
+          }
+          const dnsRefreshAtByAddress = new Map<string, number>();
+          for (const entry of validDnsEntries) {
+            const ttlMs = Math.min(routeTtlMs, PROCESS_ROUTE_DNS_REFRESH_MS, entry.ttlSeconds * 1000);
+            const refreshAt = now + Math.max(PROCESS_ROUTE_DNS_MIN_REFRESH_MS, ttlMs);
+            const currentRefreshAt = dnsRefreshAtByAddress.get(entry.address);
+            if (currentRefreshAt === undefined || refreshAt < currentRefreshAt) {
+              dnsRefreshAtByAddress.set(entry.address, refreshAt);
+            }
+          }
+
+          const promotedSessionLeaseAddresses = new Set<string>();
+          for (const address of dnsLookupAddresses) {
+            const owners = processOwnersByAddress.get(address);
+            const soleProcessName = owners?.size === 1 ? owners.values().next().value as string | undefined : undefined;
+            const exactDomains = exactDomainsByAddress.get(address) ?? new Set<string>();
+            const exactDomain = exactDomains.size === 1
+              ? exactDomains.values().next().value as string | undefined
+              : undefined;
+            const hasProfileEvidence =
+              profilePatternsByAddress.has(address) ||
+              profileCoveredAddresses.has(address) ||
+              activeProfileCoveredAddresses.has(address);
+            const isHighConfidenceEvidence = Boolean(
+              soleProcessName &&
+              exactDomain &&
+              (profilePatternsByProcess.get(soleProcessName)?.size ?? 0) === 0 &&
+              !hasProfileEvidence &&
+              isAutoLearnableRemoteAddress(address) &&
+              !isDomainCoveredByDirectDomainSuffixes(exactDomain, directDomainSuffixes)
+            );
+            if (
+              isHighConfidenceEvidence &&
+              soleProcessName &&
+              exactDomain &&
+              !knownAddressesBeforeObservation.has(address) &&
+              nextSessionLeases.size < MAX_PROCESS_ROUTE_SESSION_LEASES
+            ) {
+              nextSessionLeases.set(address, {
+                processName: soleProcessName,
+                address,
+                domain: exactDomain,
+                firstObservedAt: now
+              });
+              promotedSessionLeaseAddresses.add(address);
+            }
+          }
+
+          for (const entry of validDnsEntries) {
+            const profilePatterns = profilePatternsByAddress.get(entry.address);
+            const restrictToReviewedProfile =
+              (profileCoveredAddresses.has(entry.address) || activeProfileCoveredAddresses.has(entry.address)) &&
+              !unprofiledAddresses.has(entry.address);
+            const ttlMs = Math.min(routeTtlMs, PROCESS_ROUTE_DNS_REFRESH_MS, entry.ttlSeconds * 1000);
+            if (
+              restrictToReviewedProfile &&
+              (!profilePatterns || !isDomainCoveredByRoutePatterns(entry.domain, profilePatterns))
+            ) {
+              continue;
+            }
+            if (!isDomainCoveredByRoutePatterns(
+              entry.domain,
+              stableDomainPatterns
+            ) && !isDomainCoveredByDirectDomainSuffixes(entry.domain, directDomainSuffixes)) {
+              recordBoundedProcessRouteDomain(nextDomains, entry.domain, now + ttlMs);
+            }
+          }
+          for (const address of addressesWithDnsEntries) {
+            const refreshAt = dnsRefreshAtByAddress.get(address) ?? now + PROCESS_ROUTE_DNS_RETRY_BASE_MS;
+            recordBoundedProcessRouteIp(this.processRoutingDnsLookupAt, address, refreshAt);
+            this.processRoutingDnsLookupFailures.delete(address);
+          }
+          for (const address of promotedSessionLeaseAddresses) {
+            recordBoundedProcessRouteIp(
+              this.processRoutingDnsLookupAt,
+              address,
+              now + PROCESS_ROUTE_DNS_RETRY_BASE_MS
+            );
+          }
+          for (const address of profileCoveredAddresses) {
+            recordBoundedProcessRouteIp(
+              activeProfileCoveredAddresses,
+              address,
+              now + routeTtlMs
+            );
+            if (!unprofiledAddresses.has(address)) {
+              nextIps.delete(address);
+            }
+          }
+          if (addressesWithDnsEntries.size > 0) {
+            this.processRoutingDnsWarningEmitted = false;
+          }
+        } catch (error) {
+          for (const address of dnsLookupAddresses) {
+            if (nextSessionLeases.has(address) && observedAddresses.has(address)) {
+              recordBoundedProcessRouteIp(nextIps, address, now);
+            }
+          }
+          if (!this.processRoutingDnsWarningEmitted) {
+            this.processRoutingDnsWarningEmitted = true;
+            this.appendDiagnostic(
+              "warning",
+              `Process-name DNS enrichment failed for Xray transport; IP fallback remains active: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        }
+      }
+
+      this.commitProcessRoutingSnapshot(
+        nextIps,
+        nextDomains,
+        activeProfileCoveredAddresses,
+        nextSessionLeases
+      );
+      return this.processRoutingLastSignature !== signatureBeforeLearning;
     } catch (error) {
+      this.processRoutingLastMatchedConnections = 0;
+      this.processRoutingDomains = new Map(
+        [...this.processRoutingDomains].filter((entry) =>
+          !isDomainCoveredByDirectDomainSuffixes(entry[0], directDomainSuffixes)
+        )
+      );
+      this.processRoutingSessionLeases = new Map(
+        [...this.processRoutingSessionLeases].filter((entry) =>
+          !isDomainCoveredByDirectDomainSuffixes(entry[1].domain, directDomainSuffixes)
+        )
+      );
+      const changed = this.pruneExpiredProcessRoutingState();
       if (!this.processRoutingWarningEmitted) {
         this.processRoutingWarningEmitted = true;
         this.appendDiagnostic(
@@ -814,8 +1226,31 @@ export class XrayServiceBridge {
           `Process-name routing monitor failed: ${error instanceof Error ? error.message : String(error)}`
         );
       }
-      return false;
+      return changed;
     }
+  }
+
+  private commitProcessRoutingSnapshot(
+    ips: ReadonlyMap<string, number>,
+    domains: ReadonlyMap<string, number>,
+    profileCoveredAddresses: ReadonlyMap<string, number>,
+    sessionLeases: ReadonlyMap<string, ProcessRouteSessionEvidence>
+  ): boolean {
+    const signature = buildProcessRouteSignature(
+      ips.keys(),
+      [
+        ...this.processRoutingHintDomains,
+        ...domains.keys(),
+        ...[...sessionLeases.values()].map((lease) => lease.domain)
+      ]
+    );
+    const changed = signature !== this.processRoutingLastSignature;
+    this.processRoutingIps = new Map(ips);
+    this.processRoutingDomains = new Map(domains);
+    this.processRoutingProfileCoveredAddresses = new Map(profileCoveredAddresses);
+    this.processRoutingSessionLeases = new Map(sessionLeases);
+    this.processRoutingLastSignature = signature;
+    return changed;
   }
 
   private setStatus(update: Partial<RuntimeStatus>): void {
@@ -901,6 +1336,37 @@ export class XrayServiceBridge {
     return new Set(this.processRoutingIps.keys());
   }
 
+  private currentProcessRoutingDomains(): Set<string> {
+    return new Set([
+      ...this.processRoutingHintDomains,
+      ...this.processRoutingDomains.keys(),
+      ...[...this.processRoutingSessionLeases.values()].map((lease) => lease.domain)
+    ]);
+  }
+
+  private pruneExpiredProcessRoutingState(now = Date.now()): boolean {
+    const expiresBefore = now - this.currentProcessRoutingTtlMs();
+    const nextIps = new Map([...this.processRoutingIps].filter((entry) => entry[1] >= expiresBefore));
+    const nextDomains = new Map([...this.processRoutingDomains].filter((entry) => entry[1] > now));
+    const activeProfileCoveredAddresses = new Map(
+      [...this.processRoutingProfileCoveredAddresses].filter((entry) => entry[1] > now)
+    );
+    const nextSignature = buildProcessRouteSignature(
+      nextIps.keys(),
+      [
+        ...this.processRoutingHintDomains,
+        ...nextDomains.keys(),
+        ...[...this.processRoutingSessionLeases.values()].map((lease) => lease.domain)
+      ]
+    );
+    const changed = nextSignature !== this.processRoutingLastSignature;
+    this.processRoutingIps = nextIps;
+    this.processRoutingDomains = nextDomains;
+    this.processRoutingProfileCoveredAddresses = activeProfileCoveredAddresses;
+    this.processRoutingLastSignature = nextSignature;
+    return changed;
+  }
+
   private resetProcessRoutingIpsForTargets(processNames: Set<string>): void {
     const targetSignature = [...processNames].sort().join(",");
     if (targetSignature === this.processRoutingTargetSignature) {
@@ -908,11 +1374,21 @@ export class XrayServiceBridge {
     }
     this.processRoutingTargetSignature = targetSignature;
     this.processRoutingIps.clear();
+    this.processRoutingHintDomains.clear();
+    this.processRoutingDomains.clear();
+    this.processRoutingDnsLookupAt.clear();
+    for (const domain of processRouteDomainHints(processNames)) {
+      this.processRoutingHintDomains.add(domain);
+    }
+    this.processRoutingDnsLookupFailures.clear();
+    this.processRoutingProfileCoveredAddresses.clear();
+    this.processRoutingSessionLeases.clear();
     this.processRoutingLastSignature = "";
     this.processRoutingAppliedSignature = "";
     this.processRoutingApplyPending = false;
     this.processRoutingLastMatchedConnections = 0;
     this.processRoutingWarningEmitted = false;
+    this.processRoutingDnsWarningEmitted = false;
   }
 
   private isRoutingApplicable(): boolean {

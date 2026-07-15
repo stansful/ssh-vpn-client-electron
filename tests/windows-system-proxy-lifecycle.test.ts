@@ -124,7 +124,7 @@ describe("WindowsSystemProxyManager lifecycle", () => {
     try {
       await manager.apply(request);
       const firstUrl = registry.get("AutoConfigURL");
-      await manager.apply(request);
+      await manager.apply({ ...request, rules: [routingRule("live-process-update.example")] });
       const secondUrl = registry.get("AutoConfigURL");
 
       expect(firstUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/shadow-ssh-routing\.pac$/u);
@@ -137,7 +137,9 @@ describe("WindowsSystemProxyManager lifecycle", () => {
       expect(new URL(secondUrl).port).not.toBe(new URL(firstUrl).port);
       expect(new URL(secondUrl).search).toBe("");
       expect(firstServer.listenCalls).toBe(1);
-      expect(firstServer.closeCalls).toBe(1);
+      expect(firstServer.closeCalls).toBe(0);
+      expect(firstServer.listening).toBe(true);
+      expect(firstServer.request(firstUrl).body).toContain("live-process-update.example");
       expect(secondServer.listenCalls).toBe(1);
       expect(secondServer.closeCalls).toBe(0);
       expect(childProcessMocks.execFile.mock.calls.filter(
@@ -153,7 +155,8 @@ describe("WindowsSystemProxyManager lifecycle", () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-process-rollback-"));
     const firstServer = new FakePacServer(31_082);
     const secondServer = new FakePacServer(31_083);
-    const manager = createRotatingManager(directory, [firstServer, secondServer]);
+    const thirdServer = new FakePacServer(31_087);
+    const manager = createRotatingManager(directory, [firstServer, secondServer, thirdServer]);
     const request = { ...pacRequest(), forcePacEndpointRotation: true };
     try {
       await manager.apply(request);
@@ -161,7 +164,15 @@ describe("WindowsSystemProxyManager lifecycle", () => {
       if (!firstUrl) {
         throw new Error("Initial process PAC URL was not registered.");
       }
+      await manager.apply({ ...request, rules: [routingRule("published.example")] });
+      const secondUrl = registry.get("AutoConfigURL");
+      if (!secondUrl) {
+        throw new Error("Updated process PAC URL was not registered.");
+      }
       const firstResponse = firstServer.request(firstUrl);
+      const secondResponse = secondServer.request(secondUrl);
+      expect(firstResponse.body).toContain("published.example");
+      expect(secondResponse.body).toContain("published.example");
       failCommand = (command, args) =>
         command.toLowerCase() === "reg.exe" &&
         args[0]?.toLowerCase() === "add" &&
@@ -171,11 +182,13 @@ describe("WindowsSystemProxyManager lifecycle", () => {
         manager.apply({ ...request, rules: [routingRule("unpublished.example")] })
       ).rejects.toThrow(/reg\.exe/u);
 
-      expect(registry.get("AutoConfigURL")).toBe(firstUrl);
+      expect(registry.get("AutoConfigURL")).toBe(secondUrl);
       expect(firstServer.listening).toBe(true);
       expect(firstServer.request(firstUrl)).toEqual(firstResponse);
-      expect(secondServer.listening).toBe(false);
-      expect(secondServer.closeCalls).toBe(1);
+      expect(secondServer.listening).toBe(true);
+      expect(secondServer.request(secondUrl)).toEqual(secondResponse);
+      expect(thirdServer.listening).toBe(false);
+      expect(thirdServer.closeCalls).toBe(1);
     } finally {
       failCommand = undefined;
       await manager.restore().catch(() => undefined);
@@ -220,11 +233,11 @@ describe("WindowsSystemProxyManager lifecycle", () => {
       failCommand = undefined;
       await manager.apply({ ...request, rules: [routingRule("newer-process-ip.example")] });
 
-      expect(firstServer.listening).toBe(false);
-      expect(secondServer.listening).toBe(false);
+      expect(firstServer.listening).toBe(true);
+      expect(secondServer.listening).toBe(true);
       expect(thirdServer.listening).toBe(true);
-      expect(firstServer.closeCalls).toBe(1);
-      expect(secondServer.closeCalls).toBe(1);
+      expect(firstServer.closeCalls).toBe(0);
+      expect(secondServer.closeCalls).toBe(0);
       expect(secondServer.listenCalls).toBe(1);
       expect(thirdServer.listenCalls).toBe(1);
       expect(registry.get("AutoConfigURL")).not.toBe(failedNotificationUrl);
@@ -233,8 +246,46 @@ describe("WindowsSystemProxyManager lifecycle", () => {
         throw new Error("Final process PAC URL was not registered.");
       }
       expect(thirdServer.request(finalUrl).body).toContain("newer-process-ip.example");
+      expect(firstServer.request(firstUrl).body).toContain("newer-process-ip.example");
+      expect(secondServer.request(failedNotificationUrl).body).toContain("newer-process-ip.example");
     } finally {
       failCommand = undefined;
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds retained process PAC endpoints and closes every endpoint on restore", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-process-retention-"));
+    const servers = Array.from({ length: 6 }, (_, index) => new FakePacServer(31_090 + index));
+    const manager = createRotatingManager(directory, servers);
+    const request = { ...pacRequest(), forcePacEndpointRotation: true };
+    const urls: string[] = [];
+    try {
+      for (let revision = 0; revision < servers.length; revision += 1) {
+        await manager.apply({ ...request, rules: [routingRule(`process-revision-${revision}.example`)] });
+        const url = registry.get("AutoConfigURL");
+        if (!url) {
+          throw new Error("Rotated process PAC URL was not registered.");
+        }
+        urls.push(url);
+      }
+
+      expect(servers[0].listening).toBe(false);
+      expect(servers[0].closeCalls).toBe(1);
+      for (let index = 1; index < servers.length; index += 1) {
+        expect(servers[index].listening).toBe(true);
+        expect(servers[index].closeCalls).toBe(0);
+        expect(servers[index].request(urls[index]).body).toContain("process-revision-5.example");
+      }
+
+      await manager.restore();
+
+      for (const server of servers) {
+        expect(server.listening).toBe(false);
+        expect(server.closeCalls).toBe(1);
+      }
+    } finally {
       await manager.restore().catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
     }
@@ -415,6 +466,33 @@ describe("WindowsSystemProxyManager lifecycle", () => {
       expect(registry.has("AutoConfigURL")).toBe(false);
     } finally {
       failCommand = undefined;
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "<local>",
+    "*;<local>;legacy-corporate.example"
+  ])("clears inherited ProxyOverride %s during static proxy-all and restores it exactly", async (proxyOverride) => {
+    registry.set("ProxyOverride", proxyOverride);
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-static-override-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+
+      expect(registry.get("ProxyEnable")).toBe("1");
+      expect(registry.get("ProxyServer")).toBe(
+        "http=127.0.0.1:1080;https=127.0.0.1:1080;socks=127.0.0.1:1080"
+      );
+      expect(registry.has("ProxyOverride")).toBe(false);
+
+      await manager.restore();
+
+      expect(registry.get("ProxyOverride")).toBe(proxyOverride);
+      expect(registry.get("ProxyServer")).toBe("corp.proxy:8080");
+      expect(registry.get("AutoConfigURL")).toBe("https://corp.example/proxy.pac");
+    } finally {
       await manager.restore().catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
     }

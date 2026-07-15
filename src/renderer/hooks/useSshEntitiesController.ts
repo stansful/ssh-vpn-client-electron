@@ -22,6 +22,9 @@ export function useSshEntitiesController({
   const [keyModalError, setKeyModalError] = useState("");
 
   function editConfig(config: SshConfig): void {
+    setKeyModalOpen(false);
+    setKeyDraft(emptyKeyDraft());
+    setKeyModalError("");
     setConfigModalError("");
     setConfigDraft({
       mode: "edit",
@@ -66,12 +69,18 @@ export function useSshEntitiesController({
   }
 
   function openKeyModal(draft: KeyDraft): void {
+    setConfigModalOpen(false);
+    setConfigDraft(emptyConfigDraft());
+    setConfigModalError("");
     setKeyModalError("");
     setKeyDraft(draft);
     setKeyModalOpen(true);
   }
 
   function openConfigModal(draft: ConfigDraft): void {
+    setKeyModalOpen(false);
+    setKeyDraft(emptyKeyDraft());
+    setKeyModalError("");
     setConfigModalError("");
     setConfigDraft(draft);
     setConfigModalOpen(true);

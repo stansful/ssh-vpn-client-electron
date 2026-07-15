@@ -15,6 +15,7 @@ import type { useSshEntitiesController } from "../../hooks/useSshEntitiesControl
 import type { useTerminalController } from "../../hooks/useTerminalController.js";
 import type { useUpdateController } from "../../hooks/useUpdateController.js";
 import type { useXrayController } from "../../hooks/useXrayController.js";
+import type { ConfirmationRequest } from "../../lib/confirmation-controller.js";
 import type { AppSettings, AppSnapshot, GlobalTab, RuntimeStatus, SshConfig } from "../../../shared/types.js";
 
 type RunAction = (action: () => Promise<AppSnapshot | void>) => Promise<void>;
@@ -30,6 +31,7 @@ export function AppViews({
   setChecking,
   run,
   commitSnapshotAction,
+  requestConfirmation,
   updateSettings,
   openEndpointModal,
   routing,
@@ -49,6 +51,7 @@ export function AppViews({
   setChecking: Dispatch<SetStateAction<boolean>>;
   run: RunAction;
   commitSnapshotAction: (action: () => Promise<AppSnapshot>, successMessage?: string) => Promise<void>;
+  requestConfirmation: (request: ConfirmationRequest) => boolean;
   updateSettings: (patch: Partial<AppSettings>) => void;
   openEndpointModal: () => void;
   routing: ReturnType<typeof useRoutingController>;
@@ -93,6 +96,7 @@ export function AppViews({
             onTogglePin={(id) => run(() => api.toggleProxyProfilePin(id))}
             onDelete={(id) => commitSnapshotAction(() => api.deleteProxyProfile(id), "Xray profile deleted.")}
             onDeleteUnpinned={() => commitSnapshotAction(() => api.deleteUnpinnedProxyProfiles(), "Unpinned Xray profiles deleted.")}
+            requestConfirmation={requestConfirmation}
             onAcceptRisk={xray.acceptXrayRisk}
           />
         ) : (
@@ -133,9 +137,13 @@ export function AppViews({
         onSelect={(id) => void run(() => api.selectConfig(id))}
         onEdit={ssh.editConfig}
         onDelete={(config) => {
-          if (window.confirm(`Delete SSH configuration "${config.name}"?`)) {
-            void run(() => api.deleteConfig(config.id));
-          }
+          requestConfirmation({
+            title: "Delete SSH configuration",
+            message: `Delete SSH configuration "${config.name}"?`,
+            confirmLabel: "Delete",
+            pendingLabel: "Deleting...",
+            onConfirm: () => run(() => api.deleteConfig(config.id))
+          });
         }}
       />
     );
@@ -148,9 +156,13 @@ export function AppViews({
         onNew={() => ssh.openKeyModal(emptyKeyDraft())}
         onEdit={ssh.editKey}
         onDelete={(key) => {
-          if (window.confirm(`Delete SSH key "${key.name}"?`)) {
-            void run(() => api.deleteKey(key.id));
-          }
+          requestConfirmation({
+            title: "Delete SSH key",
+            message: `Delete SSH key "${key.name}"?`,
+            confirmLabel: "Delete",
+            pendingLabel: "Deleting...",
+            onConfirm: () => run(() => api.deleteKey(key.id))
+          });
         }}
       />
     );

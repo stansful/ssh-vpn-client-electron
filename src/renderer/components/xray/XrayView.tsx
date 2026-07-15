@@ -2,6 +2,7 @@ import { Check, Download, Pin, PinOff, Plus, RefreshCw, RotateCw, ShieldAlert, S
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type { AppSnapshot, ImportProxyProfilesInput, ProxyProfile, UpsertProxyProfileInput } from "../../../shared/types.js";
 import { checkButtonClass } from "../../lib/labels.js";
+import type { ConfirmationRequest } from "../../lib/confirmation-controller.js";
 import { nextRenderPageCount, sliceRenderPage } from "../../lib/render-page.js";
 import { Modal } from "../ui/index.js";
 
@@ -23,6 +24,7 @@ export function XrayView({
   onTogglePin,
   onDelete,
   onDeleteUnpinned,
+  requestConfirmation,
   onAcceptRisk
 }: {
   snapshot: AppSnapshot;
@@ -40,6 +42,7 @@ export function XrayView({
   onTogglePin: (id: string) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
   onDeleteUnpinned: () => Promise<void>;
+  requestConfirmation: (request: ConfirmationRequest) => boolean;
   onAcceptRisk: () => void;
 }): JSX.Element {
   const { store, runtime, lastTunnelCheck } = snapshot;
@@ -190,9 +193,13 @@ export function XrayView({
             className="ghost-button"
             disabled={busy || store.proxyProfiles.every((profile) => profile.isPinned)}
             onClick={() => {
-              if (window.confirm("Delete all unpinned Xray profiles?")) {
-                void onDeleteUnpinned().catch(() => undefined);
-              }
+              requestConfirmation({
+                title: "Delete unpinned Xray profiles",
+                message: "Delete all unpinned Xray profiles?",
+                confirmLabel: "Delete",
+                pendingLabel: "Deleting...",
+                onConfirm: onDeleteUnpinned
+              });
             }}
           >
             <Trash2 size={18} /> Delete unpinned
@@ -224,9 +231,13 @@ export function XrayView({
                     className="icon-button danger"
                     disabled={connected && runtime.activeConfigId === profile.id}
                     onClick={() => {
-                      if (window.confirm(`Delete profile "${profile.name}"?`)) {
-                        void onDelete(profile.id).catch(() => undefined);
-                      }
+                      requestConfirmation({
+                        title: "Delete Xray profile",
+                        message: `Delete profile "${profile.name}"?`,
+                        confirmLabel: "Delete",
+                        pendingLabel: "Deleting...",
+                        onConfirm: () => onDelete(profile.id)
+                      });
                     }}
                     aria-label="Delete profile"
                   >

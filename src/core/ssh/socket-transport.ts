@@ -15,6 +15,7 @@ const EMPTY_BUFFER = Buffer.alloc(0);
 // single SSH TCP connection retain enough admitted upload data for high-BDP
 // links even when Node's much smaller stream HWM reports backpressure.
 export const DEFAULT_SSH_SOCKET_PIPELINE_BYTES = 4 * 1024 * 1024;
+const MAX_CONSECUTIVE_CHANNEL_OPENS = 8;
 
 export interface SshTcpConnectOptions {
   host: string;
@@ -45,6 +46,8 @@ export type SshPacketTransportEvent =
 type OutboundQueueEntry = {
   payload: Buffer;
   bulk: boolean;
+  started: boolean;
+  detachAbort?: () => void;
   resolve: () => void;
   reject: (error: Error) => void;
 };
@@ -59,11 +62,13 @@ export class SshSocketTransport {
   private pendingInboundProtection: PacketProtectionConfig | undefined;
   private readonly outboundQueue: OutboundQueueEntry[] = [];
   private readonly outboundPriorityQueue: OutboundQueueEntry[] = [];
+  private readonly outboundChannelOpenQueue: OutboundQueueEntry[] = [];
   private readonly outboundKexQueue: OutboundQueueEntry[] = [];
   private outboundQueueBytes = 0;
   private outboundBulkQueueBytes = 0;
   private outboundPumpRunning = false;
   private outboundFrameInProgress = false;
+  private consecutiveChannelOpens = 0;
   private runtimeKeyExchangeActive = false;
   private unusable = false;
   private bytesSent = 0;
@@ -145,11 +150,14 @@ export class SshSocketTransport {
    * means the ordered socket buffer accepted the frame (and waits for `drain`
    * only under real backpressure), not that the peer acknowledged it.
    */
-  sendOwned(payload: Buffer): Promise<void> {
-    return this.enqueueOutboundPayload(payload, false);
+  sendOwned(payload: Buffer, signal?: AbortSignal): Promise<void> {
+    return this.enqueueOutboundPayload(payload, false, signal);
   }
 
-  private enqueueOutboundPayload(payload: Buffer, copyPayload: boolean): Promise<void> {
+  private enqueueOutboundPayload(payload: Buffer, copyPayload: boolean, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(outboundPayloadCancelledError());
+    }
     this.startPacketReader();
     if (this.unusable || this.socket.destroyed) {
       return Promise.reject(new Error("SSH transport is not writable."));
@@ -170,12 +178,40 @@ export class SshSocketTransport {
       // NEWKEYS, as required for the transport protection transition.
       const keyExchangePayload = isKeyExchangePayload(payload);
       const priority = !this.runtimeKeyExchangeActive && isPriorityControlPayload(payload);
+      const channelOpen = !this.runtimeKeyExchangeActive && payload[0] === 90;
       const queue = this.runtimeKeyExchangeActive && keyExchangePayload
         ? this.outboundKexQueue
         : priority
           ? this.outboundPriorityQueue
-          : this.outboundQueue;
-      queue.push({ payload: queuedPayload, bulk, resolve, reject });
+          : channelOpen
+            ? this.outboundChannelOpenQueue
+            : this.outboundQueue;
+      const entry: OutboundQueueEntry = {
+        payload: queuedPayload,
+        bulk,
+        started: false,
+        resolve,
+        reject
+      };
+      if (signal) {
+        const onAbort = (): void => {
+          if (entry.started) {
+            return;
+          }
+          const index = queue.indexOf(entry);
+          if (index < 0) {
+            return;
+          }
+          queue.splice(index, 1);
+          this.releaseOutboundEntry(entry);
+          entry.detachAbort?.();
+          entry.detachAbort = undefined;
+          reject(outboundPayloadCancelledError());
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        entry.detachAbort = () => signal.removeEventListener("abort", onAbort);
+      }
+      queue.push(entry);
       this.outboundQueueBytes += payload.length;
       if (bulk) {
         this.outboundBulkQueueBytes += payload.length;
@@ -217,7 +253,9 @@ export class SshSocketTransport {
   enableOutboundEncryption(outbound: PacketProtectionConfig): void {
     const pendingKeyExchangeWrite = this.outboundFrameInProgress || this.outboundKexQueue.length > 0;
     const pendingOrdinaryWrite = !this.runtimeKeyExchangeActive && (
-      this.outboundQueue.length > 0 || this.outboundPriorityQueue.length > 0
+      this.outboundQueue.length > 0 ||
+      this.outboundPriorityQueue.length > 0 ||
+      this.outboundChannelOpenQueue.length > 0
     );
     if (pendingKeyExchangeWrite || pendingOrdinaryWrite) {
       throw new Error("Cannot switch SSH outbound packet protection while writes are pending.");
@@ -323,6 +361,12 @@ export class SshSocketTransport {
         }
         const entry = queue[0];
         try {
+          // Once the packet writer starts a frame it cannot be withdrawn from
+          // the TCP stream. Stop observing cancellation at this boundary; a
+          // late channel confirmation is closed by the SSH session layer.
+          entry.started = true;
+          entry.detachAbort?.();
+          entry.detachAbort = undefined;
           this.outboundFrameInProgress = true;
           let frameBytes: number;
           if (this.writer instanceof SshEncryptedPacketStreamWriter) {
@@ -342,10 +386,7 @@ export class SshSocketTransport {
           this.outboundFrameInProgress = false;
           this.bytesSent += frameBytes;
           queue.shift();
-          this.outboundQueueBytes -= entry.payload.length;
-          if (entry.bulk) {
-            this.outboundBulkQueueBytes -= entry.payload.length;
-          }
+          this.releaseOutboundEntry(entry);
           entry.resolve();
         } catch (error) {
           this.outboundFrameInProgress = false;
@@ -365,21 +406,49 @@ export class SshSocketTransport {
     if (this.runtimeKeyExchangeActive) {
       return this.outboundKexQueue.length > 0 ? this.outboundKexQueue : undefined;
     }
+    // Window adjustment and global request responses are liveness-critical and
+    // remain immediately prioritized. New channel opens get a bounded burst so
+    // connection churn cannot indefinitely starve an established upload.
     if (this.outboundPriorityQueue.length > 0) {
       return this.outboundPriorityQueue;
     }
+    if (
+      this.outboundChannelOpenQueue.length > 0 &&
+      (this.outboundQueue.length === 0 || this.consecutiveChannelOpens < MAX_CONSECUTIVE_CHANNEL_OPENS)
+    ) {
+      this.consecutiveChannelOpens += 1;
+      return this.outboundChannelOpenQueue;
+    }
     if (this.outboundQueue.length > 0) {
+      this.consecutiveChannelOpens = 0;
       return this.outboundQueue;
     }
+    if (this.outboundChannelOpenQueue.length > 0) {
+      this.consecutiveChannelOpens = Math.min(
+        MAX_CONSECUTIVE_CHANNEL_OPENS,
+        this.consecutiveChannelOpens + 1
+      );
+      return this.outboundChannelOpenQueue;
+    }
     return this.outboundKexQueue.length > 0 ? this.outboundKexQueue : undefined;
+  }
+
+  private releaseOutboundEntry(entry: OutboundQueueEntry): void {
+    this.outboundQueueBytes = Math.max(0, this.outboundQueueBytes - entry.payload.length);
+    if (entry.bulk) {
+      this.outboundBulkQueueBytes = Math.max(0, this.outboundBulkQueueBytes - entry.payload.length);
+    }
   }
 
   private rejectOutboundQueue(error: Error): void {
     for (const entry of [
       ...this.outboundKexQueue.splice(0),
       ...this.outboundPriorityQueue.splice(0),
+      ...this.outboundChannelOpenQueue.splice(0),
       ...this.outboundQueue.splice(0)
     ]) {
+      entry.detachAbort?.();
+      entry.detachAbort = undefined;
       entry.reject(error);
     }
     this.outboundQueueBytes = 0;
@@ -395,6 +464,12 @@ function isKeyExchangePayload(payload: Buffer): boolean {
 function isPriorityControlPayload(payload: Buffer): boolean {
   const number = payload[0];
   return number === 80 || number === 81 || number === 82 || number === 93;
+}
+
+function outboundPayloadCancelledError(): Error {
+  const error = new Error("SSH outbound payload was cancelled before writing.");
+  error.name = "AbortError";
+  return error;
 }
 
 export async function readServerIdentificationLine(socket: net.Socket, maxBytes = 8192, timeoutMs = 10000): Promise<string> {

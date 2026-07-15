@@ -158,12 +158,17 @@ describe("Xray service lifecycle", () => {
     const systemProxy = fakeSystemProxy();
     const processConnectionsProvider = vi.fn()
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{
+      .mockResolvedValue([{
         processName: "Telegram.exe",
         remoteAddress: "149.154.167.41",
         remotePort: 443,
         state: "Established"
       }]);
+    const processDnsEntriesProvider = vi.fn(async () => [{
+      address: "149.154.167.41",
+      domain: "api.telegram.org",
+      ttlSeconds: 120
+    }]);
     const runtimeDirectory = path.join(os.tmpdir(), `shadow-ssh-xray-lifecycle-${process.pid}-process-routing`);
     runtimeDirectories.add(runtimeDirectory);
     const service = new XrayServiceBridge(initialStatus(), {
@@ -171,6 +176,7 @@ describe("Xray service lifecycle", () => {
       runtimeDirectory,
       systemProxy,
       processConnectionsProvider,
+      processDnsEntriesProvider,
       processRoutingRefreshIntervalMs: () => 30_000
     });
     const request: ProxyConnectRequest = {
@@ -193,12 +199,25 @@ describe("Xray service lifecycle", () => {
 
       await vi.advanceTimersByTimeAsync(1_000);
 
-      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
-      expect(vi.mocked(systemProxy.apply).mock.calls[1][0]).toMatchObject({
+      expect(systemProxy.apply).toHaveBeenCalledTimes(3);
+      const literalIpRequest = vi.mocked(systemProxy.apply).mock.calls[1][0];
+      expect(literalIpRequest).toMatchObject({
         proxyProtocol: "http",
         forcePacEndpointRotation: true,
         rules: expect.arrayContaining([
           expect.objectContaining({ type: "ip", value: "149.154.167.41", enabled: true })
+        ])
+      });
+      expect(literalIpRequest.rules).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "domain", value: "api.telegram.org" })
+      ]));
+      const enrichedRequest = vi.mocked(systemProxy.apply).mock.calls[2][0];
+      expect(enrichedRequest).toMatchObject({
+        proxyProtocol: "http",
+        forcePacEndpointRotation: true,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ type: "ip", value: "149.154.167.41", enabled: true }),
+          expect.objectContaining({ type: "domain", value: "api.telegram.org", enabled: true })
         ])
       });
     } finally {
@@ -206,6 +225,532 @@ describe("Xray service lifecycle", () => {
         await service.dispose();
       } finally {
         vi.useRealTimers();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("publishes a literal process IP before DNS enrichment and then adds the Xray hostname route", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const processHandle = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(processHandle);
+    const systemProxy = fakeSystemProxy();
+    const address = "8.8.4.4";
+    const domain = "media.generic-xray-client.example";
+    const dnsEnrichment = deferred<Array<{ address: string; domain: string; ttlSeconds: number }>>();
+    let dnsResolved = false;
+    const processDnsEntriesProvider = vi.fn(() => dnsEnrichment.promise);
+    const runtimeDirectory = path.join(
+      os.tmpdir(),
+      `shadow-ssh-xray-lifecycle-${process.pid}-literal-ip-before-dns`
+    );
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy,
+      processConnectionsProvider: vi.fn(async () => [{
+        processName: "generic-xray-client.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }]),
+      processDnsEntriesProvider
+    });
+    const request: ProxyConnectRequest = {
+      ...proxyRequest("literal-ip-before-dns"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "generic-xray-client",
+        type: "process.name",
+        value: "generic-xray-client.exe",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const connecting = service.connect(request);
+
+    try {
+      await vi.waitFor(() => expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1));
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+      const literalIpPublish = vi.mocked(systemProxy.apply).mock.calls[0][0];
+      expect(literalIpPublish).toMatchObject({ proxyProtocol: "http" });
+      expect(literalIpPublish.rules).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `process-ip:${address}`, type: "ip", value: address, enabled: true })
+      ]));
+      expect(literalIpPublish.rules).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `process-domain:${domain}` })
+      ]));
+
+      dnsResolved = true;
+      dnsEnrichment.resolve([{ address, domain, ttlSeconds: 60 }]);
+      await connecting;
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(systemProxy.apply).mock.calls[1][0].rules).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: `process-domain:${domain}`, type: "domain", value: domain, enabled: true })
+      ]));
+    } finally {
+      if (!dnsResolved) {
+        dnsEnrichment.resolve([]);
+        await connecting;
+      }
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("does not publish an interim Xray process IP when explicit direct domains are configured", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "8.8.8.8";
+    const dnsEnrichment = deferred<Array<{ address: string; domain: string; ttlSeconds: number }>>();
+    let dnsResolved = false;
+    const processDnsEntriesProvider = vi.fn(() => dnsEnrichment.promise);
+    const runtimeDirectory = path.join(
+      os.tmpdir(),
+      `shadow-ssh-xray-lifecycle-${process.pid}-direct-domain-no-interim-ip`
+    );
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy: fakeSystemProxy(),
+      processConnectionsProvider: vi.fn(async () => [{
+        processName: "generic-direct-xray-client.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }]),
+      processDnsEntriesProvider
+    });
+    const publishLiteralIpSnapshot = vi.fn(async () => undefined);
+    const rules: ProxyConnectRequest["routingRules"] = [{
+      id: "generic-direct-xray-client",
+      type: "process.name",
+      value: "generic-direct-xray-client.exe",
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    }];
+    const learning = (service as unknown as {
+      learnProcessRoutingIps(
+        rules: ProxyConnectRequest["routingRules"],
+        directDomains: string[],
+        generation: undefined,
+        publish: (signature: string) => Promise<void>
+      ): Promise<boolean>;
+    }).learnProcessRoutingIps(
+      rules,
+      [".direct.example"],
+      undefined,
+      publishLiteralIpSnapshot
+    );
+
+    try {
+      await vi.waitFor(() => expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1));
+      expect(publishLiteralIpSnapshot).not.toHaveBeenCalled();
+      dnsResolved = true;
+      dnsEnrichment.resolve([{ address, domain: "media.direct.example", ttlSeconds: 60 }]);
+      await learning;
+    } finally {
+      if (!dnsResolved) {
+        dnsEnrichment.resolve([]);
+        await learning;
+      }
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("hot-adds a process rule and learns its next connection without restarting Xray", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    vi.useFakeTimers();
+    const processHandle = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(processHandle);
+    const systemProxy = fakeSystemProxy();
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{
+        processName: "Chrome.exe",
+        remoteAddress: "142.250.74.110",
+        remotePort: 443,
+        state: "Established"
+      }]);
+    const runtimeDirectory = path.join(
+      os.tmpdir(),
+      `shadow-ssh-xray-lifecycle-${process.pid}-hot-add-process`
+    );
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy,
+      processConnectionsProvider,
+      processRoutingRefreshIntervalMs: () => 30_000
+    });
+    const initialRequest: ProxyConnectRequest = {
+      ...proxyRequest("hot-add-process"),
+      routingMode: "selected-rules",
+      routingRules: [{
+        id: "bootstrap-domain",
+        type: "domain",
+        value: "bootstrap.example",
+        enabled: true,
+        createdAt: "",
+        updatedAt: ""
+      }]
+    };
+    const chromeRule = {
+      id: "chrome",
+      type: "process.name" as const,
+      value: "chrome.exe",
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    };
+
+    try {
+      await service.connect(initialRequest);
+      expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+      expect(processConnectionsProvider).not.toHaveBeenCalled();
+
+      await service.updateRouting({
+        routingMode: "selected-rules",
+        routingRules: [...initialRequest.routingRules, chromeRule],
+        routingProxyDomains: [],
+        routingDirectDomains: [],
+        checkEndpoint: initialRequest.checkEndpoint
+      });
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      expect([...processConnectionsProvider.mock.calls[0][0]]).toEqual(["chrome.exe"]);
+      expect(vi.mocked(systemProxy.apply).mock.calls[1][0]).toMatchObject({
+        proxyProtocol: "http",
+        forcePacEndpointRotation: true,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ type: "process.name", value: "chrome.exe", enabled: true })
+        ])
+      });
+      expect(vi.mocked(systemProxy.apply).mock.calls[1][0].rules).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "ip", value: "142.250.74.110" })
+      ]));
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(systemProxy.apply).toHaveBeenCalledTimes(3);
+      expect(vi.mocked(systemProxy.apply).mock.calls[2][0]).toMatchObject({
+        proxyProtocol: "http",
+        forcePacEndpointRotation: true,
+        rules: expect.arrayContaining([
+          expect.objectContaining({ type: "process.name", value: "chrome.exe", enabled: true }),
+          expect.objectContaining({ type: "ip", value: "142.250.74.110", enabled: true })
+        ])
+      });
+      expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+      expect(runtime.terminateProcess).not.toHaveBeenCalled();
+      expect(service.getStatus()).toMatchObject({ state: "Connected", activeConfigId: "hot-add-process" });
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        vi.useRealTimers();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("refreshes generic DNS TTLs and prunes Xray routes after a snapshot failure", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "203.0.113.47";
+    const domain = "edge.xray-custom.example";
+    const connection = [{
+      processName: "custom-app.exe",
+      remoteAddress: address,
+      remotePort: 443,
+      state: "Established"
+    }];
+    const processConnectionsProvider = vi.fn()
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValueOnce(connection)
+      .mockRejectedValueOnce(new Error("process snapshot unavailable"));
+    const dnsTtls = [30, 60, 60];
+    const processDnsEntriesProvider = vi.fn(async () => [{
+      address,
+      domain,
+      ttlSeconds: dnsTtls.shift() ?? 60
+    }]);
+    const runtimeDirectory = path.join(
+      os.tmpdir(),
+      `shadow-ssh-xray-lifecycle-${process.pid}-generic-dns-ttl`
+    );
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy: fakeSystemProxy(),
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(rules: ProxyConnectRequest["routingRules"]): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+    };
+    const rules: ProxyConnectRequest["routingRules"] = [{
+      id: "custom-app",
+      type: "process.name",
+      value: "custom-app.exe",
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    }];
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+
+      now.mockReturnValue(1_030_000);
+      await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+
+      now.mockReturnValue(1_090_000);
+      await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(3);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+
+      now.mockReturnValue(1_390_001);
+      await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("keeps a DNS-covered Discord IP excluded across consecutive process scans", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const sharedAddress = "162.159.138.232";
+    const processConnectionsProvider = vi.fn(async () => [{
+      processName: "Discord.exe",
+      remoteAddress: sharedAddress,
+      remotePort: 443,
+      state: "Established"
+    }]);
+    const processDnsEntriesProvider = vi.fn()
+      .mockResolvedValueOnce([
+        {
+          address: sharedAddress,
+          domain: "gateway.discord.gg",
+          ttlSeconds: 60
+        },
+        {
+          address: sharedAddress,
+          domain: "unrelated.cloudflare.example",
+          ttlSeconds: 60
+        }
+      ])
+      .mockResolvedValueOnce([{
+        address: sharedAddress,
+        domain: "unrelated.cloudflare.example",
+        ttlSeconds: 60
+      }]);
+    const runtimeDirectory = path.join(
+      os.tmpdir(),
+      `shadow-ssh-xray-lifecycle-${process.pid}-discord-consecutive`
+    );
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy: fakeSystemProxy(),
+      processConnectionsProvider,
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(rules: ProxyConnectRequest["routingRules"]): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+    };
+    const rules: ProxyConnectRequest["routingRules"] = [{
+      id: "discord",
+      type: "process.name",
+      value: "discord.exe",
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    }];
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+
+    try {
+      await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(true);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(internals.currentProcessRoutingDomains().has("unrelated.cloudflare.example")).toBe(false);
+
+      now.mockReturnValue(1_060_001);
+      await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(2);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(internals.currentProcessRoutingDomains().has("unrelated.cloudflare.example")).toBe(false);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("passes explicit direct domains into Xray session-evidence learning", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "9.9.9.10";
+    const domain = "api.xray-direct.example";
+    const runtimeDirectory = path.join(
+      os.tmpdir(),
+      `shadow-ssh-xray-lifecycle-${process.pid}-direct-evidence`
+    );
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy: fakeSystemProxy(),
+      processConnectionsProvider: vi.fn(async () => [{
+        processName: "custom-app.exe",
+        remoteAddress: address,
+        remotePort: 443,
+        state: "Established"
+      }]),
+      processDnsEntriesProvider: vi.fn(async () => [{ address, domain, ttlSeconds: 60 }])
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(
+        rules: ProxyConnectRequest["routingRules"],
+        directDomains?: string[]
+      ): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const rules: ProxyConnectRequest["routingRules"] = [{
+      id: "custom-app",
+      type: "process.name",
+      value: "custom-app.exe",
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    }];
+
+    try {
+      await internals.learnProcessRoutingIps(rules, [".xray-direct.example"]);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect(internals.processRoutingSessionLeases.size).toBe(0);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, "platform", platform);
+        }
+      }
+    }
+  });
+
+  it("keeps additive Xray routes when a high-confidence socket disappears after its first scan", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    const address = "8.8.4.4";
+    const domain = "api.short-lived-xray-app.example";
+    const processDnsEntriesProvider = vi.fn(async () => [{ address, domain, ttlSeconds: 60 }]);
+    const runtimeDirectory = path.join(
+      os.tmpdir(),
+      `shadow-ssh-xray-lifecycle-${process.pid}-short-lived-evidence`
+    );
+    runtimeDirectories.add(runtimeDirectory);
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory,
+      systemProxy: fakeSystemProxy(),
+      processConnectionsProvider: vi.fn()
+        .mockResolvedValueOnce([{
+          processName: "short-lived-app.exe",
+          remoteAddress: address,
+          remotePort: 443,
+          state: "Established"
+        }])
+        .mockResolvedValueOnce([]),
+      processDnsEntriesProvider
+    });
+    const internals = service as unknown as {
+      learnProcessRoutingIps(
+        rules: ProxyConnectRequest["routingRules"],
+        directDomains?: string[]
+      ): Promise<boolean>;
+      currentProcessRoutingIps(): Set<string>;
+      currentProcessRoutingDomains(): Set<string>;
+      processRoutingSessionLeases: Map<string, unknown>;
+    };
+    const rules: ProxyConnectRequest["routingRules"] = [{
+      id: "short-lived-app",
+      type: "process.name",
+      value: "short-lived-app.exe",
+      enabled: true,
+      createdAt: "",
+      updatedAt: ""
+    }];
+    const now = vi.spyOn(Date, "now").mockReturnValue(6_000_000);
+
+    try {
+      await internals.learnProcessRoutingIps(rules);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+
+      now.mockReturnValue(6_001_000);
+      await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        now.mockRestore();
         if (platform) {
           Object.defineProperty(process, "platform", platform);
         }

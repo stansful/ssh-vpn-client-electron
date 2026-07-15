@@ -44,6 +44,7 @@ export interface SshLiveClientOptions {
   privateKeyPassphrase?: string;
   connectTimeoutMs?: number;
   operationTimeoutMs?: number;
+  directTcpIpOpenTimeoutMs?: number;
   keepaliveIntervalSec?: number;
   rekeyAfterBytes?: number;
   rekeyIntervalMs?: number;
@@ -79,6 +80,7 @@ type ChannelWaiter = {
   resolve: (event: ChannelEvent) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  detachAbort?: () => void;
 };
 
 type ChannelDeliveryState = {
@@ -232,23 +234,63 @@ export class SshLiveClient {
     await this.sendRuntimePayload(this.session.buildWindowChange(this.terminalChannel, columns, rows));
   }
 
-  async openDirectTcpIpChannel(target: DirectTcpIpTarget, originator: { address: string; port: number }): Promise<DirectTcpIpChannel> {
-    const { channel, payload } = await this.withRuntimeGate(() =>
-      this.session.openDirectTcpIpChannel({
+  async openDirectTcpIpChannel(
+    target: DirectTcpIpTarget,
+    originator: { address: string; port: number },
+    signal?: AbortSignal
+  ): Promise<DirectTcpIpChannel> {
+    if (signal?.aborted) {
+      throw channelOpenCancelledError();
+    }
+    const { channel, payload } = await this.withRuntimeGate(() => {
+      // The runtime gate may wait for a rekey. Re-check cancellation after it
+      // opens so a local client that already disconnected cannot allocate and
+      // enqueue a now-orphaned channel.
+      if (signal?.aborted) {
+        throw channelOpenCancelledError();
+      }
+      return this.session.openDirectTcpIpChannel({
         hostToConnect: target.host,
         portToConnect: target.port,
         originatorIpAddress: originator.address,
         originatorPort: originator.port
-      })
-    );
+      });
+    });
+    // The action above runs before the async gate continuation resumes. A local
+    // socket can close in that gap, so check once more before queueing anything.
+    if (signal?.aborted) {
+      await this.abortChannel(channel.localId);
+      throw channelOpenCancelledError();
+    }
+    const channelOpenController = new AbortController();
+    const forwardAbort = (): void => channelOpenController.abort();
+    signal?.addEventListener("abort", forwardAbort, { once: true });
+    if (signal?.aborted) {
+      channelOpenController.abort();
+    }
     const delivery = this.createChannelDelivery(channel.localId);
     try {
-      const openResponse = this.waitForChannelOpen(channel.localId);
-      await this.sendRuntimeAndWaitForChannel(channel.localId, payload, openResponse);
+      const openResponse = this.waitForChannelOpen(
+        channel.localId,
+        this.directTcpIpOpenTimeoutMs(),
+        channelOpenController.signal
+      );
+      await this.sendRuntimeAndWaitForChannel(
+        channel.localId,
+        payload,
+        openResponse,
+        channelOpenController.signal
+      );
     } catch (error) {
+      // This also removes a CHANNEL_OPEN that is still waiting in the transport
+      // queue. A frame that has already started remains on the wire and its late
+      // confirmation is handled as an abandoned channel by session-state.
+      channelOpenController.abort();
       this.deleteChannelDelivery(channel.localId);
       await this.abortChannel(channel.localId);
       throw error;
+    } finally {
+      signal?.removeEventListener("abort", forwardAbort);
     }
     return new SshDirectTcpIpChannel(
       channel.localId,
@@ -808,11 +850,16 @@ export class SshLiveClient {
     }
   }
 
-  private async waitForChannelOpen(localChannel: number): Promise<void> {
+  private async waitForChannelOpen(
+    localChannel: number,
+    timeoutMs = this.operationTimeoutMs(),
+    signal?: AbortSignal
+  ): Promise<void> {
     const event = await this.waitForChannelEvent(
       localChannel,
       (candidate) => candidate.type === "open-confirmed" || candidate.type === "open-failed",
-      this.operationTimeoutMs()
+      timeoutMs,
+      signal
     );
     if (event.type === "open-failed") {
       throw new Error(event.description || `SSH channel ${localChannel} open failed.`);
@@ -833,10 +880,11 @@ export class SshLiveClient {
   private async sendRuntimeAndWaitForChannel(
     localChannel: number,
     payload: Buffer,
-    response: Promise<void>
+    response: Promise<void>,
+    signal?: AbortSignal
   ): Promise<void> {
     try {
-      await Promise.all([this.sendRuntimePayload(payload), response]);
+      await Promise.all([this.sendRuntimePayload(payload, signal), response]);
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
       this.rejectChannelWaiters(localChannel, normalized);
@@ -907,7 +955,12 @@ export class SshLiveClient {
     }
   }
 
-  private waitForChannelEvent(localChannel: number, predicate: (event: ChannelEvent) => boolean, timeoutMs: number): Promise<ChannelEvent> {
+  private waitForChannelEvent(
+    localChannel: number,
+    predicate: (event: ChannelEvent) => boolean,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<ChannelEvent> {
     return new Promise<ChannelEvent>((resolve, reject) => {
       const waiter: ChannelWaiter = {
         localChannel,
@@ -915,11 +968,24 @@ export class SshLiveClient {
         resolve,
         reject,
         timer: setTimeout(() => {
-          this.channelWaiters.splice(this.channelWaiters.indexOf(waiter), 1);
+          this.removeChannelWaiter(waiter);
           reject(new Error(`Timed out waiting for SSH channel ${localChannel}.`));
         }, timeoutMs)
       };
       waiter.timer.unref();
+      if (signal) {
+        const onAbort = (): void => {
+          this.removeChannelWaiter(waiter);
+          reject(channelOpenCancelledError());
+        };
+        if (signal.aborted) {
+          clearTimeout(waiter.timer);
+          reject(channelOpenCancelledError());
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+        waiter.detachAbort = () => signal.removeEventListener("abort", onAbort);
+      }
       this.channelWaiters.push(waiter);
     });
   }
@@ -932,8 +998,7 @@ export class SshLiveClient {
       if (waiter.localChannel !== event.localChannel || !waiter.predicate(event)) {
         continue;
       }
-      this.channelWaiters.splice(this.channelWaiters.indexOf(waiter), 1);
-      clearTimeout(waiter.timer);
+      this.removeChannelWaiter(waiter);
       waiter.resolve(event);
     }
   }
@@ -986,6 +1051,7 @@ export class SshLiveClient {
     }
     for (const waiter of this.channelWaiters.splice(0)) {
       clearTimeout(waiter.timer);
+      waiter.detachAbort?.();
       waiter.reject(error);
     }
     this.events.emit("global-error", error);
@@ -1011,8 +1077,8 @@ export class SshLiveClient {
     return payloads;
   }
 
-  private async sendRuntimePayload(payload: Buffer): Promise<void> {
-    await this.withRuntimeGate(() => this.transport.sendOwned(payload));
+  private async sendRuntimePayload(payload: Buffer, signal?: AbortSignal): Promise<void> {
+    await this.withRuntimeGate(() => this.transport.sendOwned(payload, signal));
   }
 
   private async abortChannel(localChannel: number): Promise<void> {
@@ -1111,19 +1177,42 @@ export class SshLiveClient {
       if (waiter.localChannel !== localChannel) {
         continue;
       }
-      this.channelWaiters.splice(this.channelWaiters.indexOf(waiter), 1);
-      clearTimeout(waiter.timer);
+      this.removeChannelWaiter(waiter);
       waiter.reject(error);
     }
+  }
+
+  private removeChannelWaiter(waiter: ChannelWaiter): void {
+    const index = this.channelWaiters.indexOf(waiter);
+    if (index >= 0) {
+      this.channelWaiters.splice(index, 1);
+    }
+    clearTimeout(waiter.timer);
+    waiter.detachAbort?.();
+    waiter.detachAbort = undefined;
   }
 
   private operationTimeoutMs(): number {
     return this.options.operationTimeoutMs ?? 15000;
   }
 
+  private directTcpIpOpenTimeoutMs(): number {
+    const configured = this.options.directTcpIpOpenTimeoutMs;
+    if (configured !== undefined && Number.isFinite(configured) && configured > 0) {
+      return configured;
+    }
+    return Math.min(this.operationTimeoutMs(), 12_000);
+  }
+
   private markActivity(): void {
     this.lastActivityAt = Date.now();
   }
+}
+
+function channelOpenCancelledError(): Error {
+  const error = new Error("SSH direct-tcpip channel opening was cancelled.");
+  error.name = "AbortError";
+  return error;
 }
 
 class SshDirectTcpIpChannel implements DirectTcpIpChannel {

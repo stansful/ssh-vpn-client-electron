@@ -1,7 +1,7 @@
 import { createCipheriv } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { Duplex, PassThrough, type TransformCallback } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { deriveTransportKeys, transportKeyLengthsFor } from "../src/core/ssh/key-derivation.js";
 import {
   SshEncryptedPacketStreamReader,
@@ -230,17 +230,118 @@ describe("SSH packet stream reader/writer", () => {
     const secondBulk = transport.send(Buffer.from([94, 2]));
     const windowAdjust = transport.send(Buffer.from([93, 3]));
     const globalFailure = transport.send(Buffer.from([82]));
+    const channelOpen = transport.send(Buffer.from([90, 4]));
 
     socket.releaseWrite();
-    await Promise.all([firstBulk, secondBulk, windowAdjust, globalFailure]);
+    await Promise.all([firstBulk, secondBulk, windowAdjust, globalFailure, channelOpen]);
 
     const payloads = new SshPlainPacketStreamReader().push(Buffer.concat(socket.writes));
     expect(payloads).toEqual([
       Buffer.from([94, 1]),
       Buffer.from([93, 3]),
       Buffer.from([82]),
+      Buffer.from([90, 4]),
       Buffer.from([94, 2])
     ]);
+    transport.destroy();
+  });
+
+  it("removes an aborted queued channel open and releases its queue accounting", async () => {
+    const socket = new ControlledDuplex(true);
+    const transport = SshSocketTransport.fromSocket(socket as never, { maximumSocketPipelineBytes: 0 });
+    const currentBulk = transport.send(Buffer.from([94, 1]));
+    await nextTurn();
+    const controller = new AbortController();
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    const queuedOpen = transport.sendOwned(Buffer.from([90, 2]), controller.signal);
+    const queuedOpenRejection = expect(queuedOpen).rejects.toMatchObject({ name: "AbortError" });
+    const internals = transport as unknown as {
+      outboundChannelOpenQueue: unknown[];
+      outboundQueueBytes: number;
+      outboundBulkQueueBytes: number;
+    };
+
+    expect(internals.outboundChannelOpenQueue).toHaveLength(1);
+    expect(internals.outboundQueueBytes).toBe(4);
+    expect(internals.outboundBulkQueueBytes).toBe(2);
+    controller.abort();
+    await queuedOpenRejection;
+
+    expect(removeListener).toHaveBeenCalled();
+    expect(internals.outboundChannelOpenQueue).toHaveLength(0);
+    expect(internals.outboundQueueBytes).toBe(2);
+    expect(internals.outboundBulkQueueBytes).toBe(2);
+    socket.releaseWrite();
+    await currentBulk;
+    expect(internals.outboundQueueBytes).toBe(0);
+    expect(internals.outboundBulkQueueBytes).toBe(0);
+    expect(new SshPlainPacketStreamReader().push(Buffer.concat(socket.writes))).toEqual([
+      Buffer.from([94, 1])
+    ]);
+    transport.destroy();
+  });
+
+  it("rejects a pre-aborted channel open without queueing or writing it", async () => {
+    const socket = new ControlledDuplex();
+    const transport = SshSocketTransport.fromSocket(socket as never);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(transport.sendOwned(Buffer.from([90, 1]), controller.signal)).rejects.toMatchObject({
+      name: "AbortError"
+    });
+
+    const internals = transport as unknown as {
+      outboundChannelOpenQueue: unknown[];
+      outboundQueueBytes: number;
+    };
+    expect(internals.outboundChannelOpenQueue).toHaveLength(0);
+    expect(internals.outboundQueueBytes).toBe(0);
+    expect(socket.writes).toEqual([]);
+    transport.destroy();
+  });
+
+  it("does not reject cancellation after a channel-open frame has started", async () => {
+    const socket = new ControlledDuplex(true);
+    const transport = SshSocketTransport.fromSocket(socket as never, { maximumSocketPipelineBytes: 0 });
+    const controller = new AbortController();
+    let settled = false;
+    const startedOpen = transport.sendOwned(Buffer.from([90, 1]), controller.signal).finally(() => {
+      settled = true;
+    });
+    await nextTurn();
+
+    controller.abort();
+    await nextTurn();
+    expect(settled).toBe(false);
+
+    socket.releaseWrite();
+    await expect(startedOpen).resolves.toBeUndefined();
+    expect(new SshPlainPacketStreamReader().push(Buffer.concat(socket.writes))).toEqual([
+      Buffer.from([90, 1])
+    ]);
+    transport.destroy();
+  });
+
+  it("bounds channel-open priority bursts so an established upload keeps moving", async () => {
+    const socket = new ControlledDuplex(true);
+    const transport = SshSocketTransport.fromSocket(socket as never, { maximumSocketPipelineBytes: 0 });
+    const currentBulk = transport.send(Buffer.from([94, 1]));
+    await nextTurn();
+    const queuedBulk = transport.send(Buffer.from([94, 2]));
+    const opens = Array.from({ length: 24 }, (_, index) => transport.send(Buffer.from([90, index])));
+    const windowAdjust = transport.send(Buffer.from([93, 7]));
+
+    socket.releaseWrite();
+    await Promise.all([currentBulk, queuedBulk, windowAdjust, ...opens]);
+
+    const payloads = new SshPlainPacketStreamReader().push(Buffer.concat(socket.writes));
+    const queuedBulkIndex = payloads.findIndex((payload) => payload.equals(Buffer.from([94, 2])));
+    const lastOpenIndex = payloads.map((payload) => payload[0]).lastIndexOf(90);
+    expect(payloads[1]).toEqual(Buffer.from([93, 7]));
+    expect(queuedBulkIndex).toBeGreaterThan(1);
+    expect(queuedBulkIndex).toBeLessThan(lastOpenIndex);
+    expect(payloads.slice(2, queuedBulkIndex).filter((payload) => payload[0] === 90)).toHaveLength(8);
     transport.destroy();
   });
 

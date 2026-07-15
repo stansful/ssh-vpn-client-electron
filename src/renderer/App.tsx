@@ -5,7 +5,9 @@ import { AppViews } from "./components/app/AppViews.js";
 import { Notice } from "./components/layout/Notice.js";
 import { Sidebar } from "./components/layout/Sidebar.js";
 import { Topbar } from "./components/layout/Topbar.js";
+import { ConfirmationModal } from "./components/ui/index.js";
 import { useAsyncAction } from "./hooks/useAsyncAction.js";
+import { useConfirmationController } from "./hooks/useConfirmationController.js";
 import { useEndpointController } from "./hooks/useEndpointController.js";
 import { useLogsController } from "./hooks/useLogsController.js";
 import { useRoutingController } from "./hooks/useRoutingController.js";
@@ -29,6 +31,7 @@ export function App(): JSX.Element {
   const [checking, setChecking] = useState(false);
   const { snapshot, setSnapshot, notice, setNotice, startupError, retrySnapshot } = useSnapshot();
   const { busy, setBusy, run, commitSnapshotAction } = useAsyncAction({ setSnapshot, setNotice });
+  const confirmation = useConfirmationController();
 
   const defaultStore = useMemo(createDefaultStore, []);
   const store = snapshot?.store ?? defaultStore;
@@ -167,6 +170,7 @@ export function App(): JSX.Element {
           setChecking={setChecking}
           run={run}
           commitSnapshotAction={commitSnapshotAction}
+          requestConfirmation={confirmation.request}
           updateSettings={updateSettings}
           openEndpointModal={endpoint.openEndpointModal}
           routing={routing}
@@ -179,6 +183,11 @@ export function App(): JSX.Element {
       </main>
 
       <AppModals store={store} ssh={ssh} endpoint={endpoint} />
+      <ConfirmationModal
+        state={confirmation.state}
+        onCancel={confirmation.cancel}
+        onConfirm={confirmation.confirm}
+      />
     </div>
   );
 }
