@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RotatingFileLog, readFileTail } from "../src/main/app/rotating-file-log.js";
-import { acquireSingleInstanceLock } from "../src/main/app/single-instance.js";
+import { acquireSingleInstanceLock } from "../src/main/app/single-instance.cjs";
 
 describe("RotatingFileLog", () => {
   const cleanupDirs: string[] = [];
@@ -76,20 +76,21 @@ describe("RotatingFileLog", () => {
 });
 
 describe("single instance guard", () => {
-  it("quits a secondary application without starting it", () => {
-    const quit = vi.fn();
-    const acquired = acquireSingleInstanceLock({ requestSingleInstanceLock: () => false, quit }, { channel: "test" });
+  it("exits a secondary application immediately without starting it", () => {
+    const exit = vi.fn();
+    const acquired = acquireSingleInstanceLock({ requestSingleInstanceLock: () => false, exit }, { channel: "test" });
 
     expect(acquired).toBe(false);
-    expect(quit).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledWith(0);
   });
 
   it("keeps the primary application running", () => {
-    const quit = vi.fn();
-    const acquired = acquireSingleInstanceLock({ requestSingleInstanceLock: () => true, quit });
+    const exit = vi.fn();
+    const acquired = acquireSingleInstanceLock({ requestSingleInstanceLock: () => true, exit });
 
     expect(acquired).toBe(true);
-    expect(quit).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
   });
 });
 

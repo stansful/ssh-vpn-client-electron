@@ -19,8 +19,8 @@ import { createMainWindow } from "./app/main-window.js";
 import { resolveUserDataPath, resolveXrayExecutablePath } from "./app/paths.js";
 import { PortableUpdateController } from "./app/portable-update-controller.js";
 import { RotatingFileLog } from "./app/rotating-file-log.js";
+import { fetchRoutingListText } from "./app/routing-list-fetch.js";
 import { hasSelectedRoutingTargets, routingMutationAction } from "./app/routing-targets.js";
-import { acquireSingleInstanceLock, waitForSecondaryInstanceExit } from "./app/single-instance.js";
 import { TransportMutationCoordinator } from "./app/transport-mutation-coordinator.js";
 import { refreshPublicProxyProfiles } from "./app/public-proxy-refresh.js";
 import {
@@ -33,7 +33,7 @@ import { TerminalOutputBatcher } from "./app/terminal-output-batcher.js";
 import { TrayController, resolveTrayIconPaths } from "./app/tray.js";
 import { shouldDeliverRendererEvent, SystemEnergyPolicy, type ThermalState } from "./app/energy-policy.js";
 import { GITHUB_REPOSITORY_URL, ROUTING_DOMAIN_LIST_SOURCE_URL } from "../shared/links.js";
-import { fetchTextWithLimit as fetchBoundedText, type FetchImplementation } from "../shared/http-fetch.js";
+import type { FetchImplementation } from "../shared/http-fetch.js";
 import {
   appendBoundedDiagnosticEntries,
   MAX_DIAGNOSTICS_HISTORY_BYTES,
@@ -77,8 +77,6 @@ const updateDownloadPath = path.join(explicitUserDataPath, "updates");
 const DEFAULT_WINDOW_WIDTH = 980;
 const DEFAULT_WINDOW_HEIGHT = 680;
 const START_MINIMIZED_TO_TRAY_ARG = "--shadow-ssh-start-minimized-to-tray";
-const ROUTING_PROXY_LIST_TIMEOUT_MS = 15_000;
-const MAX_ROUTING_PROXY_LIST_BYTES = 2 * 1024 * 1024;
 const MAX_MAIN_LOG_BYTES = 5 * 1024 * 1024;
 const MAX_MAIN_LOG_READ_BYTES = 1024 * 1024;
 const MAIN_LOG_BACKUP_COUNT = 2;
@@ -148,11 +146,9 @@ const terminalOutputBatcher = new TerminalOutputBatcher<"ssh" | "xray">(({ sourc
 
 app.setName(appDisplayName);
 registerProcessErrorHandlers();
+app.on("second-instance", requestWindowShow);
 await preloadLoggingPreference();
 await ensureExplicitUserDataPath();
-if (!acquireSingleInstanceLock(app, { userDataPath: explicitUserDataPath })) {
-  await waitForSecondaryInstanceExit();
-}
 await writeMainLog(`Main module loaded. pid=${process.pid}, platform=${process.platform}, arch=${process.arch}, userData=${explicitUserDataPath}`);
 
 await app.whenReady();
@@ -234,14 +230,6 @@ const trayController = new TrayController({
     app.quit();
   }
 });
-app.on("second-instance", () => {
-  if (BrowserWindow.getAllWindows().length > 0) {
-    trayController.showWindow();
-  } else {
-    requestWindowShow();
-  }
-});
-
 await initializeApplicationStorage();
 await restoreStaleWindowsProxyState();
 registerIpcHandlers();
@@ -1050,7 +1038,7 @@ function enqueueTransportMutation<T>(operation: () => Promise<T>): Promise<T> {
 async function refreshRoutingProxyList(options: { enabled?: boolean } = {}): Promise<void> {
   const current = storage.getStore().routingProxyList;
   const sourceUrl = current.sourceUrl || RUSSIA_INSIDE_PROXY_LIST_URL;
-  const text = await fetchTextWithLimit(sourceUrl, MAX_ROUTING_PROXY_LIST_BYTES, ROUTING_PROXY_LIST_TIMEOUT_MS);
+  const text = await fetchRoutingListText(sourceUrl);
   const domains = parseDomainProxyList(text);
   if (domains.length === 0) {
     throw new Error("Routing proxy list refresh returned no domains.");
@@ -1067,7 +1055,7 @@ async function refreshRoutingProxyList(options: { enabled?: boolean } = {}): Pro
 async function refreshRoutingDirectList(options: { enabled?: boolean } = {}): Promise<void> {
   const current = storage.getStore().routingDirectList;
   const sourceUrl = current.sourceUrl || RUSSIA_OUTSIDE_DIRECT_LIST_URL;
-  const text = await fetchTextWithLimit(sourceUrl, MAX_ROUTING_PROXY_LIST_BYTES, ROUTING_PROXY_LIST_TIMEOUT_MS);
+  const text = await fetchRoutingListText(sourceUrl);
   const domains = parseDomainProxyList(text);
   if (domains.length === 0) {
     throw new Error("Routing direct list refresh returned no domains.");
@@ -1079,19 +1067,6 @@ async function refreshRoutingDirectList(options: { enabled?: boolean } = {}): Pr
     updatedAt: new Date().toISOString()
   });
   appendInfo(`Routing direct list refreshed: ${domains.length} domains from ${sourceUrl}.`);
-}
-
-async function fetchTextWithLimit(url: string, maxBytes: number, timeoutMs: number): Promise<string> {
-  return fetchBoundedText({
-    fetchImpl: electronSessionFetch,
-    url,
-    headers: { "User-Agent": "shadow-ssh-desktop-routing-list" },
-    maxBytes,
-    timeoutMs,
-    failureMessagePrefix: "Routing list download failed",
-    limitMessage: "Routing list is larger than the allowed limit.",
-    timeoutMessage: "Routing list download timed out."
-  });
 }
 
 function activeRoutingProxyDomains(): string[] {

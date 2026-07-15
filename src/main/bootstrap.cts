@@ -2,6 +2,7 @@ import { app, BrowserWindow } from "electron";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { acquireSingleInstanceLock } from "./app/single-instance.cjs";
 
 const appDisplayName = process.env.SHADOW_SSH_BUILD_CHANNEL === "development" ? "Shadow SSH Dev" : "Shadow SSH";
 const explicitUserDataPath = resolveUserDataPath(appDisplayName);
@@ -11,19 +12,26 @@ const bootstrapLoggingEnabled = readPersistedLoggingEnabled();
 
 registerCrashLogging();
 
+let primaryInstance = false;
 try {
   app.setName(appDisplayName);
   ensureUserDataPath();
-  writeBootstrapLog(`Bootstrap loaded. pid=${process.pid}, platform=${process.platform}, arch=${process.arch}, userData=${explicitUserDataPath}`);
+  primaryInstance = acquireSingleInstanceLock(app, { userDataPath: explicitUserDataPath });
+  if (primaryInstance) {
+    writeBootstrapLog(`Bootstrap loaded. pid=${process.pid}, platform=${process.platform}, arch=${process.arch}, userData=${explicitUserDataPath}`);
+  }
 } catch (error) {
   writeBootstrapLog(`Bootstrap setup failed: ${formatError(error)}`);
+  app.exit(1);
 }
 
-void import("./main.js").catch(async (error) => {
-  const message = `Fatal main module import failure: ${formatError(error)}`;
-  writeBootstrapLog(message);
-  await showFatalWindow(message);
-});
+if (primaryInstance) {
+  void import("./main.js").catch(async (error) => {
+    const message = `Fatal main module import failure: ${formatError(error)}`;
+    writeBootstrapLog(message);
+    await showFatalWindow(message);
+  });
+}
 
 function registerCrashLogging(): void {
   process.on("uncaughtException", (error) => {
