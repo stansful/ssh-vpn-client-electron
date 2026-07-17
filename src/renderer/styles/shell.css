@@ -271,6 +271,22 @@
   flex: 0 0 auto;
 }
 
+.nav-icon {
+  display: grid;
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  line-height: 0;
+}
+
+.nav-icon svg,
+.github-link > svg,
+.github-copy > svg,
+.sidebar-toggle > svg {
+  display: block;
+}
+
 .sidebar-footer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -329,6 +345,13 @@
 .sidebar.collapsed .nav-button,
 .sidebar.collapsed .github-link {
   justify-content: center;
+}
+
+@media (min-width: 901px) {
+  .sidebar.collapsed .nav-button,
+  .sidebar.collapsed .github-link {
+    gap: 0;
+  }
 }
 
 .sidebar.collapsed .nav-button::before {

@@ -129,6 +129,30 @@
     grid-template-columns: 1fr;
   }
 
+  .connection-selector,
+  .connection-command,
+  .connection-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .connection-selector > .ghost-button,
+  .connection-primary-action {
+    width: 100%;
+  }
+
+  .connection-primary-action {
+    min-height: 70px;
+  }
+
+  .connection-warning {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .connection-warning .ghost-button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
   .wide-fact {
     grid-column: auto;
   }
@@ -213,6 +237,33 @@
 
   .section-title > .item-actions {
     justify-content: flex-start;
+  }
+
+  .connection-panel-title .status-pill {
+    margin-left: 50px;
+  }
+
+  .connection-step {
+    padding: 14px;
+  }
+
+  .connection-status-card {
+    align-items: flex-start;
+  }
+
+  .connection-status-copy > small {
+    white-space: normal;
+  }
+
+  .connection-fact-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .connection-fact > .ghost-button,
+  .connection-fact-actions > button {
+    justify-content: center;
+    width: 100%;
   }
 
   .toolbar,

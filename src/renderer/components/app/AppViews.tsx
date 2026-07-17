@@ -22,6 +22,7 @@ type RunAction = (action: () => Promise<AppSnapshot | void>) => Promise<void>;
 
 export function AppViews({
   view,
+  onViewChange,
   snapshot,
   runtime,
   selectedConfig,
@@ -42,6 +43,7 @@ export function AppViews({
   updates
 }: {
   view: View;
+  onViewChange: (view: View) => void;
   snapshot: AppSnapshot;
   runtime: RuntimeStatus | undefined;
   selectedConfig: SshConfig | undefined;
@@ -116,6 +118,8 @@ export function AppViews({
             onSelectConfig={(id) => void run(() => api.selectConfig(id))}
             onConnect={() => void run(() => api.connect())}
             onDisconnect={() => void run(() => api.disconnect())}
+            onCreateConfig={() => ssh.openConfigModal(emptyConfigDraft())}
+            onManageRouting={() => onViewChange("routing")}
             onCheckTunnel={() => {
               setChecking(true);
               void run(async () => api.checkTunnel(store.settings.checkEndpoint)).finally(() => setChecking(false));

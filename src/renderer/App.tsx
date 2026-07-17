@@ -187,6 +187,7 @@ export function App(): JSX.Element {
         <Notice message={notice} onDismiss={dismissNotice} />
         <AppViews
           view={view}
+          onViewChange={setView}
           snapshot={snapshot}
           runtime={runtime}
           selectedConfig={selectedConfig}
