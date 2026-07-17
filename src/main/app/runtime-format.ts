@@ -20,10 +20,12 @@ export function createErrorDataUrl(message: string): string {
     <meta charset="utf-8">
     <title>Shadow SSH startup error</title>
     <style>
-      body { margin: 0; font: 14px system-ui, sans-serif; color: #20242a; background: #f6f7f9; }
-      main { padding: 32px; max-width: 860px; }
-      h1 { margin: 0 0 12px; font-size: 24px; }
-      pre { white-space: pre-wrap; background: #fff; border: 1px solid #d6dae0; padding: 16px; border-radius: 8px; }
+      :root { color-scheme: dark; }
+      body { margin: 0; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: #f5f6f8; background: #0b0d10; }
+      main { box-sizing: border-box; width: min(760px, calc(100% - 40px)); margin: 10vh auto 0; padding: 28px; border: 1px solid #2b313b; border-radius: 20px; background: #171b22; box-shadow: 0 30px 90px rgb(0 0 0 / 34%); }
+      h1 { margin: 0 0 10px; font-size: 24px; letter-spacing: -.025em; }
+      p { color: #a6afbd; line-height: 1.5; }
+      pre { max-height: 42vh; overflow: auto; white-space: pre-wrap; color: #ff9ba5; background: #11141a; border: 1px solid #3b252b; padding: 16px; border-radius: 12px; }
     </style>
   </head>
   <body>

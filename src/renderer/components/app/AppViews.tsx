@@ -67,8 +67,10 @@ export function AppViews({
     return (
       <section className="screen main-transport-screen">
         <div className="main-transport-switch">
+          <span className="transport-label">Transport</span>
           <Segmented<GlobalTab>
             value={store.settings.activeGlobalTab}
+            ariaLabel="Connection transport"
             options={[
               ["ssh", "SSH"],
               ["xray", "Xray"]

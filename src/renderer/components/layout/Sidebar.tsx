@@ -28,10 +28,12 @@ export const Sidebar = memo(function Sidebar({
     <aside className={collapsed ? "sidebar collapsed" : "sidebar"} aria-label="Application navigation">
       <div className="sidebar-header">
         <div className="brand">
-          <img src="./icon.svg" alt="" />
-          <div className="brand-text">
+          <div className="brand-mark" aria-hidden="true">
+            <img src="./icon.svg" alt="" />
+          </div>
+          <div className="brand-copy">
             <strong>Shadow SSH</strong>
-            <span>{platform}/{arch}</span>
+            <span className="brand-meta">{platform}/{arch}</span>
           </div>
         </div>
         <button
@@ -45,26 +47,32 @@ export const Sidebar = memo(function Sidebar({
         </button>
       </div>
       <nav>
-        <NavButton compact={collapsed} active={view === "main"} icon={<Power size={18} />} label="Main" onClick={() => onViewChange("main")} />
-        <NavButton
-          compact={collapsed}
-          active={view === "configs"}
-          icon={<Server size={18} />}
-          label="SSH configs"
-          onClick={() => onViewChange("configs")}
-        />
-        <NavButton compact={collapsed} active={view === "keys"} icon={<KeyRound size={18} />} label="SSH keys" onClick={() => onViewChange("keys")} />
-        <NavButton compact={collapsed} active={view === "routing"} icon={<Network size={18} />} label="Routing" onClick={() => onViewChange("routing")} />
-        {loggingEnabled && (
-          <NavButton compact={collapsed} active={view === "logs"} icon={<FileText size={18} />} label="Logs" onClick={() => onViewChange("logs")} />
-        )}
-        <NavButton
-          compact={collapsed}
-          active={view === "settings"}
-          icon={<SettingsIcon size={18} />}
-          label="Settings"
-          onClick={() => onViewChange("settings")}
-        />
+        <div className="nav-group">
+          <span className="nav-label">Workspace</span>
+          <NavButton compact={collapsed} active={view === "main"} icon={<Power size={18} />} label="Main" onClick={() => onViewChange("main")} />
+          <NavButton
+            compact={collapsed}
+            active={view === "configs"}
+            icon={<Server size={18} />}
+            label="SSH configs"
+            onClick={() => onViewChange("configs")}
+          />
+          <NavButton compact={collapsed} active={view === "keys"} icon={<KeyRound size={18} />} label="SSH keys" onClick={() => onViewChange("keys")} />
+          <NavButton compact={collapsed} active={view === "routing"} icon={<Network size={18} />} label="Routing" onClick={() => onViewChange("routing")} />
+        </div>
+        <div className="nav-group">
+          <span className="nav-label">System</span>
+          {loggingEnabled && (
+            <NavButton compact={collapsed} active={view === "logs"} icon={<FileText size={18} />} label="Logs" onClick={() => onViewChange("logs")} />
+          )}
+          <NavButton
+            compact={collapsed}
+            active={view === "settings"}
+            icon={<SettingsIcon size={18} />}
+            label="Settings"
+            onClick={() => onViewChange("settings")}
+          />
+        </div>
       </nav>
       <div className="sidebar-footer">
         <button type="button" className="github-link" aria-label="Open GitHub repository" title="Open GitHub repository" onClick={onOpenGithub}>

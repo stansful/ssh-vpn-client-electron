@@ -16,6 +16,7 @@ export function useEndpointController({
   const [endpointModalOpen, setEndpointModalOpen] = useState(false);
   const [endpointModalError, setEndpointModalError] = useState("");
   const [endpointDraft, setEndpointDraft] = useState("youtube.com:443");
+  const [endpointSaving, setEndpointSaving] = useState(false);
 
   function openEndpointModal(): void {
     setEndpointDraft(settings.checkEndpoint);
@@ -31,6 +32,7 @@ export function useEndpointController({
       setEndpointModalError(validation.message);
       return;
     }
+    setEndpointSaving(true);
     setBusy(true);
     setEndpointModalError("");
     void api
@@ -40,7 +42,10 @@ export function useEndpointController({
         setEndpointModalOpen(false);
       })
       .catch((error: unknown) => setEndpointModalError(toErrorMessage(error)))
-      .finally(() => setBusy(false));
+      .finally(() => {
+        setEndpointSaving(false);
+        setBusy(false);
+      });
   }
 
   function closeEndpointModal(): void {
@@ -53,6 +58,7 @@ export function useEndpointController({
     endpointModalOpen,
     endpointModalError,
     endpointDraft,
+    endpointSaving,
     setEndpointDraft,
     openEndpointModal,
     closeEndpointModal,

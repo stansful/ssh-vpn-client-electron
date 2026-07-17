@@ -41,21 +41,25 @@ export function Modal({
   open,
   title,
   children,
-  onClose
+  onClose,
+  closeDisabled = false
 }: {
   open: boolean;
   title: string;
   children: React.ReactNode;
   onClose: () => void;
+  closeDisabled?: boolean;
 }): JSX.Element | null {
   const dialogRef = useRef<HTMLElement>(null);
   const focusTokenRef = useRef(Symbol("modal-focus"));
   const onCloseRef = useRef(onClose);
+  const closeDisabledRef = useRef(closeDisabled);
   const titleId = useId();
 
   useEffect(() => {
     onCloseRef.current = onClose;
-  }, [onClose]);
+    closeDisabledRef.current = closeDisabled;
+  }, [closeDisabled, onClose]);
 
   useEffect(() => {
     if (!open) {
@@ -86,7 +90,9 @@ export function Modal({
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        onCloseRef.current();
+        if (!closeDisabledRef.current) {
+          onCloseRef.current();
+        }
         return;
       }
       if (event.key !== "Tab") {
@@ -126,8 +132,12 @@ export function Modal({
       document.removeEventListener("keydown", handleKeyDown, true);
       document.removeEventListener("focusin", keepFocusInside, true);
       const wasTopmost = modalFocusStack.deactivate(focusToken);
-      if (wasTopmost && previouslyFocused?.isConnected) {
-        focusWithoutScrolling(previouslyFocused);
+      if (wasTopmost) {
+        const fallback = document.querySelector<HTMLElement>(".content");
+        const target = previouslyFocused?.isConnected ? previouslyFocused : fallback;
+        if (target) {
+          focusWithoutScrolling(target);
+        }
       }
     };
   }, [open]);
@@ -143,7 +153,7 @@ export function Modal({
       className="modal-backdrop"
       role="presentation"
       onClick={(event) => {
-        if (event.target === event.currentTarget) {
+        if (event.target === event.currentTarget && !closeDisabled) {
           onClose();
         }
       }}
@@ -157,8 +167,11 @@ export function Modal({
         tabIndex={-1}
       >
         <header className="modal-header">
-          <h2 id={titleId}>{title}</h2>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="Close modal">
+          <div className="modal-title-copy">
+            <span>Shadow SSH</span>
+            <h2 id={titleId}>{title}</h2>
+          </div>
+          <button type="button" className="icon-button" disabled={closeDisabled} onClick={onClose} aria-label="Close modal">
             <X size={16} />
           </button>
         </header>

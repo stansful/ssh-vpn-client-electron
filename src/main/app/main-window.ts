@@ -1,4 +1,4 @@
-import { BrowserWindow } from "electron";
+import { BrowserWindow, nativeTheme } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createErrorDataUrl, formatError, formatRuntimePath, formatRuntimeUrl, type RuntimeFormatOptions } from "./runtime-format.js";
@@ -16,6 +16,7 @@ export interface CreateMainWindowOptions extends RuntimeFormatOptions {
   iconPath: string;
   width: number;
   height: number;
+  backgroundColor?: string;
   startHidden: boolean;
   devServerUrl?: string;
   onCreated: (window: BrowserWindow) => void;
@@ -38,7 +39,7 @@ export async function createMainWindow(options: CreateMainWindowOptions): Promis
     title: options.appName,
     icon: options.iconPath,
     autoHideMenuBar: true,
-    backgroundColor: "#f6f7f9",
+    backgroundColor: options.backgroundColor ?? (nativeTheme.shouldUseDarkColors ? "#0b0d10" : "#f3f4f7"),
     show: energyOptions.show,
     paintWhenInitiallyHidden: energyOptions.paintWhenInitiallyHidden,
     webPreferences: {

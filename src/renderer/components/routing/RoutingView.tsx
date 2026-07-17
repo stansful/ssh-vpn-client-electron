@@ -1,4 +1,4 @@
-import { Copy, Download, ExternalLink, FileText, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
+import { Copy, Download, ExternalLink, FileText, ListFilter, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
 import { useEffect, useMemo, useState, type ChangeEvent, type Dispatch, type SetStateAction } from "react";
 import { placeholderForRule, routingSaveLabel } from "../../lib/labels.js";
 import { nextRenderPageCount, sliceRenderPage } from "../../lib/render-page.js";
@@ -81,8 +81,14 @@ export function RoutingView({
     <section className="screen">
       <section className="panel routing-panel">
         <div className="section-title">
-          <h2>Domain lists</h2>
-          <span>{enabledDomainCount > 0 ? `${enabledDomainCount} active` : "Disabled"}</span>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><ShieldCheck size={18} /></span>
+            <div className="panel-heading-copy">
+              <h2>Domain lists</h2>
+              <p>Curated routing intelligence, refreshed on demand</p>
+            </div>
+          </div>
+          <span className="count-badge">{enabledDomainCount > 0 ? `${enabledDomainCount} active` : "Disabled"}</span>
         </div>
         <div className="routing-list-grid">
           <article className="routing-list-card">
@@ -149,6 +155,7 @@ export function RoutingView({
           </div>
           <textarea
             className="routing-list-textarea"
+            aria-label={`${openList?.title ?? "Routing list"} domains`}
             readOnly
             value={openListText || "List is empty. Refresh it before viewing domains."}
           />
@@ -157,12 +164,19 @@ export function RoutingView({
 
       <section className="panel routing-panel">
         <div className="section-title">
-          <h2>Routing rules</h2>
-          <span>{enabledCount} enabled</span>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><ListFilter size={18} /></span>
+            <div className="panel-heading-copy">
+              <h2>Routing rules</h2>
+              <p>Choose exactly which traffic enters the secure tunnel</p>
+            </div>
+          </div>
+          <span className="count-badge">{enabledCount} enabled</span>
         </div>
         <div className="toolbar">
           <Segmented<RoutingRuleType>
             value={ruleTab}
+            ariaLabel="Routing rule type"
             options={[
               ["domain", "Domains"],
               ["ip", "IPs"],
@@ -172,28 +186,34 @@ export function RoutingView({
           />
           <div className="search-box">
             <Search size={16} />
-            <input value={ruleSearch} onChange={(event) => onRuleSearchChange(event.target.value)} placeholder="Search rules" />
+            <input aria-label="Search routing rules" value={ruleSearch} onChange={(event) => onRuleSearchChange(event.target.value)} placeholder="Search rules" />
           </div>
           <button type="button" className="ghost-button" onClick={onExportRules}><Download size={16} /> Export</button>
           <label className="ghost-button file-button">
             <Upload size={16} /> Import
-            <input type="file" accept="application/json" onChange={onImportRules} />
+            <input aria-label="Import routing rules JSON" type="file" accept="application/json" onChange={onImportRules} />
           </label>
-          <span className={`autosave-state ${routingSaveState}`}>{routingSaveLabel(routingSaveState)}</span>
+          <span
+            className={`autosave-state ${routingSaveState}`}
+            role={routingSaveState === "error" ? "alert" : "status"}
+            aria-live={routingSaveState === "error" ? "assertive" : "polite"}
+          >
+            {routingSaveLabel(routingSaveState)}
+          </span>
         </div>
 
         <div className="add-rule">
-          <input value={ruleValue} onChange={(event) => onRuleValueChange(event.target.value)} placeholder={placeholderForRule(ruleTab)} />
+          <input aria-label={`New ${ruleTab} routing rule`} value={ruleValue} onChange={(event) => onRuleValueChange(event.target.value)} placeholder={placeholderForRule(ruleTab)} />
           <button type="button" className="primary-button" onClick={onAddRule}><Plus size={16} /> Add</button>
         </div>
-        {ruleError && <div className="inline-error">{ruleError}</div>}
+        {ruleError && <div className="inline-error" role="alert">{ruleError}</div>}
 
         {ruleTab === "process.name" && (
           <div className="process-picker">
             <div className="toolbar compact">
               <div className="search-box">
                 <Search size={16} />
-                <input value={processSearch} onChange={(event) => onProcessSearchChange(event.target.value)} placeholder="Search active processes" />
+                <input aria-label="Search active processes" value={processSearch} onChange={(event) => onProcessSearchChange(event.target.value)} placeholder="Search active processes" />
               </div>
               <button type="button" className="ghost-button" onClick={onLoadProcesses}><RefreshCw size={16} /> Refresh</button>
             </div>
@@ -211,6 +231,7 @@ export function RoutingView({
               <label className="toggle">
                 <input
                   type="checkbox"
+                  aria-label={`${rule.enabled ? "Disable" : "Enable"} routing rule ${rule.value}`}
                   checked={rule.enabled}
                   onChange={(event) =>
                     onUpdateRules((rules) =>
@@ -229,7 +250,7 @@ export function RoutingView({
                 type="button"
                 className="icon-button danger"
                 onClick={() => onUpdateRules((rules) => rules.filter((candidate) => candidate.id !== rule.id))}
-                aria-label="Delete rule"
+                aria-label={`Delete routing rule ${rule.value}`}
               >
                 <Trash2 size={16} />
               </button>

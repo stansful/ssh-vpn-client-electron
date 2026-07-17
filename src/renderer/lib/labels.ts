@@ -3,12 +3,12 @@ import type { RoutingRuleType } from "../../shared/types.js";
 
 export function titleForView(view: View): string {
   const titles: Record<View, string> = {
-    main: "Main screen",
+    main: "Overview",
     configs: "SSH configurations",
     keys: "SSH keys",
-    routing: "Routing rules",
-    logs: "Logs",
-    settings: "Settings"
+    routing: "Traffic routing",
+    logs: "Diagnostics",
+    settings: "Preferences"
   };
   return titles[view];
 }

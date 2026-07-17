@@ -64,7 +64,16 @@ if (platformFlag && archFlag) {
 }
 
 const builderCli = path.join(root, "node_modules", "electron-builder", "cli.js");
-const child = spawn(process.execPath, [builderCli, ...builderArgs], { cwd: root, stdio: "inherit", shell: false });
+const builderEnvironment = {
+  ...process.env,
+  ELECTRON_BUILDER_CACHE: process.env.ELECTRON_BUILDER_CACHE || path.join(root, ".cache", "electron-builder")
+};
+const child = spawn(process.execPath, [builderCli, ...builderArgs], {
+  cwd: root,
+  env: builderEnvironment,
+  stdio: "inherit",
+  shell: false
+});
 
 child.on("error", (error) => {
   console.error(`[electron-builder] Unable to start: ${error instanceof Error ? error.message : String(error)}`);

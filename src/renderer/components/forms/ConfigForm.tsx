@@ -9,6 +9,7 @@ export function ConfigForm({
   draft,
   error,
   keys,
+  busy,
   onChange,
   onSubmit,
   onCancel
@@ -16,15 +17,17 @@ export function ConfigForm({
   draft: ConfigDraft;
   error: string;
   keys: SshKeyMetadata[];
+  busy: boolean;
   onChange: (draft: ConfigDraft) => void;
   onSubmit: (event: FormEvent) => void;
   onCancel: () => void;
 }): JSX.Element {
   const set = <K extends keyof ConfigDraft>(key: K, value: ConfigDraft[K]): void => onChange({ ...draft, [key]: value });
   return (
-    <form className="modal-form" onSubmit={onSubmit}>
-      {error && <div className="inline-error modal-error">{error}</div>}
-      <div className="form-grid">
+    <form className="modal-form" aria-busy={busy} onSubmit={onSubmit}>
+      {error && <div className="inline-error modal-error" role="alert">{error}</div>}
+      <fieldset className="modal-fieldset" disabled={busy}>
+        <div className="form-grid">
         <Field label="Name"><input required value={draft.name} onChange={(event) => set("name", event.target.value)} /></Field>
         <Field label="Host"><input required value={draft.host} onChange={(event) => set("host", event.target.value)} /></Field>
         <Field label="Port"><input required type="number" min={1} max={65535} value={draft.port} onChange={(event) => set("port", Number(event.target.value))} /></Field>
@@ -69,11 +72,12 @@ export function ConfigForm({
           <span>Note</span>
           <textarea value={draft.note} onChange={(event) => set("note", event.target.value)} />
         </label>
-      </div>
-      <div className="modal-actions">
-        <button type="button" className="ghost-button" onClick={onCancel}>Cancel</button>
-        <button type="submit" className="primary-button"><Save size={16} /> Save</button>
-      </div>
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="ghost-button" disabled={busy} onClick={onCancel}>Cancel</button>
+          <button type="submit" className="primary-button" disabled={busy}><Save size={16} /> {busy ? "Saving…" : "Save"}</button>
+        </div>
+      </fieldset>
     </form>
   );
 }

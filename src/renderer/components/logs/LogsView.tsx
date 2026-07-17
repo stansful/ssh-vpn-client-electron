@@ -1,4 +1,4 @@
-import { Clipboard, RefreshCw, Trash2 } from "lucide-react";
+import { Clipboard, FileClock, RefreshCw, ScrollText, Trash2 } from "lucide-react";
 import { useMemo } from "react";
 import { formatRuntimeDiagnostics } from "../../lib/diagnostics.js";
 import type { AppSettings, AppSnapshot } from "../../../shared/types.js";
@@ -29,7 +29,13 @@ export function LogsView({
     <section className="screen logs-screen">
       <section className="panel logs-control-panel">
         <div className="section-title">
-          <h2>Logging</h2>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><FileClock size={18} /></span>
+            <div className="panel-heading-copy">
+              <h2>Logging</h2>
+              <p>Control diagnostic retention and local file output</p>
+            </div>
+          </div>
           <span>{snapshot.diagnostics.length} live entries</span>
         </div>
         <div className="logging-toggles">
@@ -59,7 +65,13 @@ export function LogsView({
 
       <section className="panel logs-panel">
         <div className="section-title">
-          <h2>Unified log</h2>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><ScrollText size={18} /></span>
+            <div className="panel-heading-copy">
+              <h2>Unified log</h2>
+              <p>Runtime events and persisted main-process diagnostics</p>
+            </div>
+          </div>
           <div className="item-actions">
             <button type="button" className="ghost-button" disabled={fileLogBusy} onClick={onRefresh}>
               <RefreshCw className={fileLogBusy ? "spin" : undefined} size={16} /> Refresh
@@ -72,7 +84,7 @@ export function LogsView({
             </button>
           </div>
         </div>
-        <textarea className="file-log-output" readOnly value={displayedLog} />
+        <textarea className="file-log-output" aria-label="Unified application log" readOnly value={displayedLog} />
       </section>
     </section>
   );

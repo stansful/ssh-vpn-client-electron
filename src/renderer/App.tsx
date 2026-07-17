@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { LoaderCircle, RotateCcw, ShieldCheck } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api.js";
 import { AppModals } from "./components/app/AppModals.js";
 import { AppViews } from "./components/app/AppViews.js";
@@ -28,6 +29,7 @@ import { normalizeProxyDomain } from "../core/routing/domain-proxy-list.js";
 
 export function App(): JSX.Element {
   const [view, setView] = useState<View>("main");
+  const previousViewRef = useRef<View>("main");
   const [checking, setChecking] = useState(false);
   const { snapshot, setSnapshot, notice, setNotice, startupError, retrySnapshot } = useSnapshot();
   const { busy, setBusy, run, commitSnapshotAction } = useAsyncAction({ setSnapshot, setNotice });
@@ -112,24 +114,47 @@ export function App(): JSX.Element {
     }
   }, [loggingEnabled, view]);
 
+  useEffect(() => {
+    if (previousViewRef.current === view) {
+      return undefined;
+    }
+    previousViewRef.current = view;
+    const frame = window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>(".topbar h1")?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [view]);
+
   if (!snapshot) {
     return (
       <div
         className="app-shell"
         data-theme={theme}
         data-startup-state={startupError ? "error" : "loading"}
+        data-connection-state="Disconnected"
         style={customStyle}
       >
         <main className="startup-screen">
           <section className="loading" aria-live="polite">
+            <div className="startup-brand">
+              <div className="brand-mark" aria-hidden="true"><img src="./icon.svg" alt="" /></div>
+              <div className="startup-brand-copy">
+                <span>Secure network control</span>
+                <strong>Shadow SSH</strong>
+              </div>
+            </div>
             {startupError ? (
               <>
                 <strong>Shadow SSH could not load its initial state.</strong>
                 <span className="startup-error" role="alert">{startupError}</span>
-                <button type="button" className="primary-button" onClick={retrySnapshot}>Retry</button>
+                <button type="button" className="primary-button" onClick={retrySnapshot}><RotateCcw size={16} /> Retry</button>
               </>
             ) : (
-              <span>Loading Shadow SSH...</span>
+              <div className="startup-loading-row">
+                <LoaderCircle className="spin" size={18} aria-hidden="true" />
+                <span>Preparing your secure workspace…</span>
+                <ShieldCheck size={17} aria-hidden="true" />
+              </div>
             )}
           </section>
         </main>
@@ -142,6 +167,7 @@ export function App(): JSX.Element {
       className={sidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell"}
       data-theme={theme}
       data-startup-state="ready"
+      data-connection-state={runtime?.state ?? "Disconnected"}
       style={customStyle}
     >
       <Sidebar
@@ -156,7 +182,7 @@ export function App(): JSX.Element {
         onViewChange={setView}
       />
 
-      <main className="content">
+      <main className="content" tabIndex={-1}>
         <Topbar title={titleForView(view)} message={runtime?.message} state={runtime?.state ?? "Disconnected"} />
         <Notice message={notice} onDismiss={dismissNotice} />
         <AppViews

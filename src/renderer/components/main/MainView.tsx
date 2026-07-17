@@ -1,4 +1,4 @@
-import { Check, Power, RefreshCw, SlidersHorizontal, Terminal, X } from "lucide-react";
+import { ArrowUp, Check, Power, RefreshCw, SlidersHorizontal, Terminal, X } from "lucide-react";
 import type { Dispatch, FormEvent, SetStateAction } from "react";
 import { checkButtonClass } from "../../lib/labels.js";
 import type { AppSnapshot, RuntimeStatus, SshConfig, TunnelCheckResult } from "../../../shared/types.js";
@@ -45,7 +45,13 @@ export function MainView({
   onTerminalSubmit: (event: FormEvent) => void;
 }): JSX.Element {
   const sshRuntimeActive = runtime?.transport !== "xray";
-  const connected = sshRuntimeActive && (runtime?.state === "Connected" || runtime?.state === "Connecting" || runtime?.state === "Reconnecting");
+  const sshState = sshRuntimeActive ? runtime?.state ?? "Disconnected" : "Disconnected";
+  const connected = sshState === "Connected" || sshState === "Connecting" || sshState === "Reconnecting";
+  const connectionMarkClass = sshState === "Connected"
+    ? "connection-mark active"
+    : sshState === "Connecting" || sshState === "Reconnecting" || sshState === "Disconnecting"
+      ? "connection-mark pending"
+      : "connection-mark";
 
   return (
     <section className="screen">
@@ -54,6 +60,17 @@ export function MainView({
           <div className="section-title">
             <h2>Connection</h2>
             <span>{selectedConfig ? selectedConfig.name : "No configuration selected"}</span>
+          </div>
+
+          <div className="connection-summary">
+            <div className={connectionMarkClass} aria-hidden="true">
+              <Power size={21} />
+            </div>
+            <div className="connection-copy">
+              <span className="connection-label">{sshState}</span>
+              <strong>{selectedConfig?.name ?? "Ready for configuration"}</strong>
+              <span>{selectedConfig ? `${selectedConfig.username}@${selectedConfig.host}:${selectedConfig.port}` : "Choose an SSH profile to begin"}</span>
+            </div>
           </div>
 
           <label className="field">
@@ -115,25 +132,25 @@ export function MainView({
           <details open={store.settings.terminalExpanded} onToggle={(event) => onTerminalToggle(event.currentTarget.open)}>
             <summary>
               <span><Terminal size={18} /> SSH terminal</span>
-              {store.settings.terminalExpanded && (
+              <span className="meta-chip">{sshState === "Connected" ? "Live" : "Offline"}</span>
+            </summary>
+            {store.settings.terminalExpanded && (
+              <div className="terminal-toolbar">
+                <span className="connection-label">Encrypted interactive shell</span>
                 <button
                   type="button"
                   className="ghost-button"
-                  disabled={runtime?.state !== "Connected" || terminalOpening}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onCloseTerminalShell();
-                  }}
+                  disabled={sshState !== "Connected" || terminalOpening}
+                  onClick={onCloseTerminalShell}
                 >
                   {terminalOpening ? <RefreshCw className="spin" size={16} /> : <X size={16} />} Close shell
                 </button>
-              )}
-            </summary>
-            <textarea className="terminal-output" readOnly value={terminalText} />
+              </div>
+            )}
+            <textarea className="terminal-output" aria-label="SSH terminal output" readOnly value={terminalText} />
             <form className="terminal-input" onSubmit={onTerminalSubmit}>
-              <input value={terminalInput} disabled={runtime?.state !== "Connected"} onChange={(event) => onTerminalInputChange(event.target.value)} placeholder="Command input" />
-              <button type="submit" disabled={runtime?.state !== "Connected"}>Send</button>
+              <input aria-label="SSH command" value={terminalInput} disabled={sshState !== "Connected"} onChange={(event) => onTerminalInputChange(event.target.value)} placeholder="Type a command…" />
+              <button type="submit" disabled={sshState !== "Connected"}><ArrowUp size={16} /> Send</button>
             </form>
           </details>
         </section>

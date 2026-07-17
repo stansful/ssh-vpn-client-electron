@@ -12,12 +12,12 @@ export function ConfirmationModal({
 }): JSX.Element {
   const pending = state?.pending ?? false;
   return (
-    <Modal open={Boolean(state)} title={state?.title ?? "Confirm action"} onClose={() => {
+    <Modal open={Boolean(state)} title={state?.title ?? "Confirm action"} closeDisabled={pending} onClose={() => {
       if (!pending) {
         onCancel();
       }
     }}>
-      <div className="modal-form">
+      <div className="modal-form" aria-busy={pending}>
         <p>{state?.message}</p>
         <div className="modal-actions">
           <button type="button" className="ghost-button" disabled={pending} autoFocus onClick={onCancel}>Cancel</button>

@@ -20,6 +20,8 @@ export function useSshEntitiesController({
   const [keyModalOpen, setKeyModalOpen] = useState(false);
   const [configModalError, setConfigModalError] = useState("");
   const [keyModalError, setKeyModalError] = useState("");
+  const [configSaving, setConfigSaving] = useState(false);
+  const [keySaving, setKeySaving] = useState(false);
 
   function editConfig(config: SshConfig): void {
     setKeyModalOpen(false);
@@ -52,6 +54,7 @@ export function useSshEntitiesController({
       setConfigModalError(fingerprintValidation.message ?? "Invalid SSH server fingerprint.");
       return;
     }
+    setConfigSaving(true);
     setBusy(true);
     void api
       .upsertConfig({
@@ -65,7 +68,10 @@ export function useSshEntitiesController({
         setConfigModalOpen(false);
       })
       .catch((error: unknown) => setConfigModalError(toErrorMessage(error)))
-      .finally(() => setBusy(false));
+      .finally(() => {
+        setConfigSaving(false);
+        setBusy(false);
+      });
   }
 
   function openKeyModal(draft: KeyDraft): void {
@@ -111,6 +117,7 @@ export function useSshEntitiesController({
 
   function saveKey(event: FormEvent): void {
     event.preventDefault();
+    setKeySaving(true);
     setBusy(true);
     setKeyModalError("");
     const payload: UpsertSshKeyInput = {
@@ -127,7 +134,10 @@ export function useSshEntitiesController({
         setKeyModalOpen(false);
       })
       .catch((error: unknown) => setKeyModalError(toErrorMessage(error)))
-      .finally(() => setBusy(false));
+      .finally(() => {
+        setKeySaving(false);
+        setBusy(false);
+      });
   }
 
   function copySavedPrivateKey(id: string | undefined): void {
@@ -151,6 +161,8 @@ export function useSshEntitiesController({
     keyModalOpen,
     configModalError,
     keyModalError,
+    configSaving,
+    keySaving,
     openConfigModal,
     closeConfigModal,
     openKeyModal,

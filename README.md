@@ -92,12 +92,42 @@ runs Electron Builder. Platform artifacts are written to `release/`.
 
 Portable/package scripts use prepared Electron runtime folders in `.cache/electron-<platform>-<arch>` when present, so
 packaging can run without downloading Electron during the build. If a local runtime folder is missing, the wrapper lets
-Electron Builder use its normal download/cache behavior.
+Electron Builder use its normal download behavior. Auxiliary NSIS, DMG, AppImage, and DEB toolchains are cached in
+`.cache/electron-builder` instead of a user-global directory; set `ELECTRON_BUILDER_CACHE` to override that location.
 
-Runnable portable artifacts are the default production packaging mode. Windows gets both unpacked folder builds with
-`Shadow SSH.exe` inside and single-file portable `.exe` artifacts in `release/`, macOS gets an unpacked `.app` bundle
-directory, and Linux gets AppImage. No ZIP, tarball, DMG, DEB, or installer is produced by the default portable
-commands.
+The complete production release is built with:
+
+```sh
+npm run build:prod
+```
+
+It cleans `release/`, prepares the native services and Electron application once, then builds and verifies the full
+two-architecture release matrix:
+
+| Platform | x64 | arm64 |
+| --- | --- | --- |
+| Windows | unpacked app, portable EXE, NSIS installer | unpacked app, portable EXE, NSIS installer |
+| macOS | unpacked `.app`, DMG | unpacked `.app`, DMG |
+| Linux | AppImage, DEB | AppImage, DEB |
+
+The final verification step fails the build if any of the 14 production targets is absent or malformed. It also checks
+the CPU architecture and bundled `app.asar`, native service, and Xray runtime in each unpacked application.
+
+Complete production builds for one platform are available separately:
+
+```sh
+npm run build:prod-win
+npm run build:prod-mac
+npm run build:prod-linux
+```
+
+`build:prod-all` is an alias for the complete build, `build:prod-exe` is an alias for the complete Windows build, and
+`build:prod-macos` is an alias for the complete macOS build. Complete production commands clean `release/` first; use
+`build:prod` rather than running platform commands one after another when all platforms are required.
+
+Runnable-only portable artifacts remain available when installable packages are not needed. Windows gets unpacked
+folder builds with `Shadow SSH.exe` and single-file portable `.exe` files, macOS gets unpacked `.app` bundles, and
+Linux gets AppImages.
 
 Windows portable:
 
@@ -160,10 +190,7 @@ npm run build:portable
 This cleans `release/` first, then builds the runnable portable artifacts for every configured platform and
 architecture. Target-specific commands such as `build:portable-win` do not clean the whole `release/` directory.
 
-`npm run build:prod` and `npm run build:prod-*` are aliases to the portable build commands, so production builds do not
-produce installers by default.
-
-Opt-in installable packages are still available only when explicitly requested:
+Installable packages can also be rebuilt independently without producing the rest of the complete matrix:
 
 ```sh
 npm run build:installer-win
@@ -180,12 +207,18 @@ Release artifact names include platform and architecture, for example:
 ```text
 release/win-unpacked/Shadow SSH.exe
 release/win-arm64-unpacked/Shadow SSH.exe
-release/shadow-ssh-0.1.0-windows-portable-x64.exe
-release/shadow-ssh-0.1.0-windows-portable-arm64.exe
+release/shadow-ssh-<version>-windows-portable-x64.exe
+release/shadow-ssh-<version>-windows-portable-arm64.exe
+release/shadow-ssh-<version>-windows-installer-x64.exe
+release/shadow-ssh-<version>-windows-installer-arm64.exe
 release/mac/Shadow SSH.app
 release/mac-arm64/Shadow SSH.app
-release/shadow-ssh-0.1.0-linux-portable-x86_64.AppImage
-release/shadow-ssh-0.1.0-linux-portable-arm64.AppImage
+release/shadow-ssh-<version>-macos-dmg-x64.dmg
+release/shadow-ssh-<version>-macos-dmg-arm64.dmg
+release/shadow-ssh-<version>-linux-portable-x86_64.AppImage
+release/shadow-ssh-<version>-linux-portable-arm64.AppImage
+release/shadow-ssh-<version>-linux-package-amd64.deb
+release/shadow-ssh-<version>-linux-package-arm64.deb
 ```
 
 If a signing certificate is configured through Electron Builder environment variables such as `CSC_LINK` and

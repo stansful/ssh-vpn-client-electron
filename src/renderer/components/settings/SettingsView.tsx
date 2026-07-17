@@ -1,3 +1,4 @@
+import { AppWindow, DownloadCloud, FileClock, FolderOpen, Palette, RefreshCw, Route } from "lucide-react";
 import { useMemo } from "react";
 import type { AppSettings, AppSnapshot, DesktopPlatform, RoutingMode, ThemeMode } from "../../../shared/types.js";
 import { Segmented } from "../ui/index.js";
@@ -37,7 +38,10 @@ export function SettingsView({
     <section className="screen two-column">
       <section className="panel">
         <div className="section-title">
-          <h2>Logging</h2>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><FileClock size={18} /></span>
+            <div className="panel-heading-copy"><h2>Logging</h2><p>Diagnostics and local retention</p></div>
+          </div>
           <span>{loggingEnabled ? "Enabled" : "Disabled"}</span>
         </div>
         <div className="logging-toggles">
@@ -83,7 +87,10 @@ export function SettingsView({
 
       <section className="panel">
         <div className="section-title">
-          <h2>Window</h2>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><AppWindow size={18} /></span>
+            <div className="panel-heading-copy"><h2>Window</h2><p>Startup, tray, and memory behaviour</p></div>
+          </div>
           <span>{store.settings.autoConnectOnStartup ? "Auto-connect" : store.settings.startWithWindowsInTray ? "Startup tray" : store.settings.closeToTrayEnabled ? "Tray close" : "Quit on close"}</span>
         </div>
         <div className="logging-toggles">
@@ -131,11 +138,15 @@ export function SettingsView({
 
       <section className="panel">
         <div className="section-title">
-          <h2>Routing</h2>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><Route size={18} /></span>
+            <div className="panel-heading-copy"><h2>Routing</h2><p>Default traffic policy</p></div>
+          </div>
           <span>{store.routingMode === "proxy-all" ? "Proxy all" : `${enabledRules + enabledProxyListDomains} targets`}</span>
         </div>
         <Segmented<RoutingMode>
           value={store.routingMode}
+          ariaLabel="Default routing mode"
           options={[
             ["proxy-all", "Proxy all"],
             ["selected-rules", "Selected rules"]
@@ -151,33 +162,55 @@ export function SettingsView({
 
       <section className="panel settings-wide">
         <div className="section-title">
-          <h2>Updates</h2>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><DownloadCloud size={18} /></span>
+            <div className="panel-heading-copy"><h2>Updates</h2><p>Portable release delivery</p></div>
+          </div>
           <span>{updateInfo?.latestVersion ? `Latest ${updateInfo.latestVersion}` : "Portable"}</span>
         </div>
         <div className="toolbar">
-          <button type="button" className="ghost-button" onClick={onCheckForUpdates}>Check for updates</button>
+          <button type="button" className="ghost-button" onClick={onCheckForUpdates}><RefreshCw size={16} /> Check for updates</button>
           <button type="button" className="primary-button" disabled={!updateInfo?.asset || updateDownload?.state === "downloading"} onClick={onDownloadUpdate}>
-            {updateDownload?.state === "downloading" ? "Downloading" : "Download portable"}
+            <DownloadCloud size={16} /> {updateDownload?.state === "downloading" ? "Downloading" : "Download portable"}
           </button>
-          <button type="button" className="ghost-button" disabled={!updateDownload?.filePath} onClick={onRevealDownloadedUpdate}>Open folder with file</button>
+          <button type="button" className="ghost-button" disabled={!updateDownload?.filePath} onClick={onRevealDownloadedUpdate}><FolderOpen size={16} /> Open folder with file</button>
         </div>
         {updateInfo && (
           <dl className="facts log-facts">
             <div><dt>Status</dt><dd>{updateInfo.message}</dd></div>
             <div><dt>Current</dt><dd>{updateInfo.currentVersion}</dd></div>
-            <div><dt>Downloaded</dt><dd>{updateDownload?.message ?? "Not downloaded"}</dd></div>
-            <div><dt>Progress</dt><dd>{updateDownload?.percent !== undefined ? `${Math.round(updateDownload.percent)}%` : updateDownload?.state ?? "idle"}</dd></div>
+            <div><dt>Downloaded</dt><dd role="status" aria-live="polite">{updateDownload?.message ?? "Not downloaded"}</dd></div>
+            <div>
+              <dt>Progress</dt>
+              <dd>
+                {updateDownload?.state === "downloading" ? (
+                  <span
+                    role="progressbar"
+                    aria-label="Portable update download"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={Math.round(updateDownload.percent ?? 0)}
+                  >
+                    {Math.round(updateDownload.percent ?? 0)}%
+                  </span>
+                ) : updateDownload?.state ?? "idle"}
+              </dd>
+            </div>
           </dl>
         )}
       </section>
 
       <section className="panel settings-wide">
         <div className="section-title">
-          <h2>Theme</h2>
+          <div className="panel-heading">
+            <span className="panel-heading-icon" aria-hidden="true"><Palette size={18} /></span>
+            <div className="panel-heading-copy"><h2>Theme</h2><p>Appearance tuned to your workspace</p></div>
+          </div>
           <span>{store.settings.theme}</span>
         </div>
         <Segmented<ThemeMode>
           value={store.settings.theme}
+          ariaLabel="Application theme"
           options={[
             ["system", "System"],
             ["light", "Light"],
@@ -186,6 +219,12 @@ export function SettingsView({
           ]}
           onChange={(themeMode) => onUpdateSettings({ theme: themeMode })}
         />
+        {store.settings.theme !== "custom" && (
+          <div className="theme-preset-note">
+            <Palette size={18} aria-hidden="true" />
+            <div><strong>System surfaces, personal signals</strong><span>Accent and status colours apply everywhere; Custom enables the full palette.</span></div>
+          </div>
+        )}
         <ThemeDesigner settings={store.settings} onChange={onUpdateSettings} />
       </section>
     </section>

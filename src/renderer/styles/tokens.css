@@ -1,0 +1,156 @@
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif;
+  color: #f5f6f8;
+  background: #0b0d10;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --scrollbar-track: #eef0f4;
+  --scrollbar-thumb: #bdc4cf;
+  --scrollbar-thumb-hover: #919ba9;
+}
+
+.app-shell {
+  color-scheme: light;
+  /* Brand and semantic colour */
+  --accent: #ff9d2e;
+  --accent-hover: color-mix(in srgb, var(--accent), white 12%);
+  --accent-active: color-mix(in srgb, var(--accent), black 13%);
+  --accent-ink: #17130d;
+  --accent-text: color-mix(in srgb, var(--accent), var(--text) 48%);
+  --success: #137a4c;
+  --success-text: color-mix(in srgb, var(--success), var(--text) 44%);
+  --success-soft: color-mix(in srgb, var(--success), var(--surface) 88%);
+  --danger: #c93849;
+  --danger-ink: #ffffff;
+  --danger-text: color-mix(in srgb, var(--danger), var(--text) 42%);
+  --danger-soft: color-mix(in srgb, var(--danger), var(--surface) 88%);
+  --warning-text: #7a3b00;
+  --warning-soft: #fff4e3;
+  --info-text: #245ca6;
+  --info-soft: #ecf3ff;
+
+  /* Surface hierarchy */
+  --bg: #f3f4f7;
+  --bg-deep: #e9ebef;
+  --surface: #ffffff;
+  --surface-alt: #f8f9fb;
+  --surface-strong: #eef1f5;
+  --surface-elevated: #ffffff;
+  --border: #dde1e7;
+  --border-strong: #c5cbd5;
+  --control-border: #929cab;
+  --text: #15181e;
+  --muted: #596273;
+  --subtle: #626c7b;
+  --terminal: #0c0f14;
+  --terminal-text: #d9f7e9;
+
+  /* Geometry and rhythm */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --radius-compact: 8px;
+  --radius-control: 11px;
+  --radius-card: 17px;
+  --radius-panel: 21px;
+  --radius-modal: 24px;
+  --radius-pill: 999px;
+  --control-height: 44px;
+  --sidebar-width: 264px;
+  --sidebar-collapsed-width: 80px;
+
+  /* Depth and motion */
+  --shadow-xs: 0 1px 2px rgb(23 28 36 / 5%);
+  --shadow-sm: 0 8px 22px rgb(23 28 36 / 7%);
+  --shadow-md: 0 18px 48px rgb(23 28 36 / 12%);
+  --shadow-lg: 0 30px 90px rgb(8 12 20 / 22%);
+  --focus-outline: #a54600;
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--focus-outline), transparent 56%);
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+
+  --scrollbar-track: color-mix(in srgb, var(--surface), var(--bg) 58%);
+  --scrollbar-thumb: color-mix(in srgb, var(--muted), transparent 45%);
+  --scrollbar-thumb-hover: color-mix(in srgb, var(--accent), var(--muted) 45%);
+}
+
+.app-shell[data-theme="dark"] {
+  color-scheme: dark;
+  --accent: #ffb45c;
+  --accent-hover: color-mix(in srgb, var(--accent), white 12%);
+  --accent-active: color-mix(in srgb, var(--accent), black 13%);
+  --accent-ink: #17120b;
+  --accent-text: color-mix(in srgb, var(--accent), var(--text) 48%);
+  --success: #38c98a;
+  --success-text: color-mix(in srgb, var(--success), var(--text) 44%);
+  --success-soft: color-mix(in srgb, var(--success), var(--surface) 82%);
+  --danger: #ff6574;
+  --danger-ink: #271014;
+  --danger-text: color-mix(in srgb, var(--danger), var(--text) 42%);
+  --danger-soft: color-mix(in srgb, var(--danger), var(--surface) 82%);
+  --warning-text: #ffc16f;
+  --warning-soft: #322414;
+  --info-text: #8cb9ff;
+  --info-soft: #17243a;
+  --bg: #0b0d10;
+  --bg-deep: #07080a;
+  --surface: #11141a;
+  --surface-alt: #171b22;
+  --surface-strong: #1d222b;
+  --surface-elevated: #181c23;
+  --border: rgb(255 255 255 / 8%);
+  --border-strong: rgb(255 255 255 / 15%);
+  --control-border: #667286;
+  --text: #f5f6f8;
+  --muted: #a6afbd;
+  --subtle: #838d9c;
+  --focus-outline: #ffd08f;
+  --terminal: #07090c;
+  --terminal-text: #c9f5df;
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / 18%);
+  --shadow-sm: 0 10px 28px rgb(0 0 0 / 18%);
+  --shadow-md: 0 22px 58px rgb(0 0 0 / 28%);
+  --shadow-lg: 0 38px 110px rgb(0 0 0 / 48%);
+}
+
+.app-shell[data-theme="custom"] {
+  --accent: var(--custom-accent);
+  --accent-hover: color-mix(in srgb, var(--custom-accent), white 12%);
+  --accent-active: color-mix(in srgb, var(--custom-accent), black 12%);
+  --accent-ink: color-mix(in srgb, var(--custom-accent), black 84%);
+  --accent-text: color-mix(in srgb, var(--custom-accent), var(--custom-text) 48%);
+  --success: var(--custom-success);
+  --success-text: color-mix(in srgb, var(--custom-success), var(--custom-text) 44%);
+  --success-soft: color-mix(in srgb, var(--custom-success), var(--custom-surface) 86%);
+  --danger: var(--custom-danger);
+  --danger-ink: color-mix(in srgb, var(--custom-danger), black 82%);
+  --danger-text: color-mix(in srgb, var(--custom-danger), var(--custom-text) 42%);
+  --danger-soft: color-mix(in srgb, var(--custom-danger), var(--custom-surface) 86%);
+  --warning-text: color-mix(in srgb, var(--custom-accent), var(--custom-text) 35%);
+  --warning-soft: color-mix(in srgb, var(--custom-accent), var(--custom-surface) 86%);
+  --info-text: color-mix(in srgb, #4f8fe8, var(--custom-text) 34%);
+  --info-soft: color-mix(in srgb, #4f8fe8, var(--custom-surface) 88%);
+  --bg: var(--custom-background);
+  --bg-deep: color-mix(in srgb, var(--custom-background), black 7%);
+  --surface: var(--custom-surface);
+  --surface-alt: color-mix(in srgb, var(--custom-surface), var(--custom-background) 32%);
+  --surface-strong: color-mix(in srgb, var(--custom-surface), var(--custom-text) 7%);
+  --surface-elevated: color-mix(in srgb, var(--custom-surface), white 3%);
+  --border: var(--custom-border);
+  --border-strong: color-mix(in srgb, var(--custom-border), var(--custom-text) 18%);
+  --control-border: color-mix(in srgb, var(--custom-border), var(--custom-text) 42%);
+  --text: var(--custom-text);
+  --muted: var(--custom-muted);
+  --subtle: color-mix(in srgb, var(--custom-muted), var(--custom-text) 18%);
+  --focus-outline: color-mix(in srgb, var(--custom-accent), var(--custom-text) 48%);
+  --terminal: color-mix(in srgb, var(--custom-background), black 72%);
+  --terminal-text: color-mix(in srgb, var(--custom-success), white 42%);
+}

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ipcMain, Menu, powerMonitor, session, shell, webContents, webFrameMain } from "electron";
+import { app, BrowserWindow, clipboard, ipcMain, Menu, nativeTheme, powerMonitor, session, shell, webContents, webFrameMain } from "electron";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -85,6 +85,20 @@ const MAX_TERMINAL_INPUT_CHARACTERS = 64 * 1024;
 
 const formatRuntimePath = (value: string): string => formatRuntimePathValue(runtimeFormatOptions, value);
 const formatRuntimeUrl = (value: string): string => formatRuntimeUrlValue(runtimeFormatOptions, value);
+const windowBackgroundColor = (settings: AppSettings): string => {
+  if (settings.theme === "dark") {
+    return "#0b0d10";
+  }
+  if (settings.theme === "light") {
+    return "#f3f4f7";
+  }
+  if (settings.theme === "custom") {
+    return `#${[settings.customTheme.background.r, settings.customTheme.background.g, settings.customTheme.background.b]
+      .map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0"))
+      .join("")}`;
+  }
+  return nativeTheme.shouldUseDarkColors ? "#0b0d10" : "#f3f4f7";
+};
 const startMinimizedToTray = process.argv.includes(START_MINIMIZED_TO_TRAY_ARG);
 const electronSessionFetch: FetchImplementation = (input, init) => session.defaultSession.fetch(input, init);
 const trustedRendererEntryUrl = process.env.VITE_DEV_SERVER_URL ?? pathToFileURL(path.join(rendererDist, "index.html")).href;
@@ -191,6 +205,17 @@ runtime = {
   message: "Application services are starting."
 };
 const storage = new AppStorage();
+nativeTheme.on("updated", () => {
+  if (!storageInitialized || storage.getSettings().theme !== "system") {
+    return;
+  }
+  const backgroundColor = windowBackgroundColor(storage.getSettings());
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.setBackgroundColor(backgroundColor);
+    }
+  }
+});
 service = new InProcessServiceBridge(runtime);
 serviceEventUnsubscribe = service.onEvent(handleServiceEvent);
 const xrayService = new XrayServiceBridge(
@@ -322,6 +347,7 @@ async function createWindow(): Promise<void> {
     iconPath,
     width: DEFAULT_WINDOW_WIDTH,
     height: DEFAULT_WINDOW_HEIGHT,
+    backgroundColor: windowBackgroundColor(storage.getSettings()),
     startHidden: false,
     devServerUrl: process.env.VITE_DEV_SERVER_URL,
     onCreated: (window) => {
@@ -583,6 +609,11 @@ function registerIpcHandlers(): void {
     const nextStore = await storage.updateSettings(patch);
     const nextSettings = nextStore.settings;
     applyLoggingSettings(nextSettings);
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) {
+        window.setBackgroundColor(windowBackgroundColor(nextSettings));
+      }
+    }
     if (previousSettings.startWithWindowsInTray !== nextSettings.startWithWindowsInTray) {
       syncWindowsStartupSetting(nextSettings);
     }

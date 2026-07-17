@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { inflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import packageJson from "../package.json";
@@ -10,6 +11,50 @@ describe("build assets", () => {
     expect(packageLock.packages[""].version).toBe(packageJson.version);
     expect(packageJson.scripts.prebuild).toContain("clean:dist");
     expect(packageJson.scripts["build:node"]).toContain("clean:node");
+  });
+
+  it("builds and verifies the complete production artifact matrix", () => {
+    const scripts = packageJson.scripts;
+
+    expect(scripts["build:prod"]).toBe("npm run build:prod-all");
+    expect(scripts["build:prod-all"]).toContain("clean:release");
+    expect(scripts["build:prod-all"]).toContain("package:prepare");
+    expect(scripts["build:prod-all"]).toContain("pack:prod-all");
+    expect(scripts["build:prod-all"]).toContain("verify:prod-artifacts");
+    expect(scripts["pack:prod-all"]).toBe(
+      "npm run pack:prod-win && npm run pack:prod-mac && npm run pack:prod-linux"
+    );
+    expect(scripts["pack:prod-win"]).toBe("npm run pack:prod-win-x64 && npm run pack:prod-win-arm64");
+    expect(scripts["pack:prod-mac"]).toBe("npm run pack:prod-mac-x64 && npm run pack:prod-mac-arm64");
+    expect(scripts["pack:prod-linux"]).toBe("npm run pack:prod-linux-x64 && npm run pack:prod-linux-arm64");
+    expect(scripts["pack:prod-win-x64"]).toContain("--win dir portable nsis --x64");
+    expect(scripts["pack:prod-win-arm64"]).toContain("--win dir portable nsis --arm64");
+    expect(scripts["pack:prod-mac-x64"]).toContain("--mac dir dmg --x64");
+    expect(scripts["pack:prod-mac-arm64"]).toContain("--mac dir dmg --arm64");
+    expect(scripts["pack:prod-linux-x64"]).toContain("--linux AppImage deb --x64");
+    expect(scripts["pack:prod-linux-arm64"]).toContain("--linux AppImage deb --arm64");
+    expect(scripts["build:prod-win"]).toContain("verify:prod-artifacts -- --win");
+    expect(scripts["build:prod-mac"]).toContain("verify:prod-artifacts -- --mac");
+    expect(scripts["build:prod-linux"]).toContain("verify:prod-artifacts -- --linux");
+    expect(scripts["build:prod-exe"]).toBe("npm run build:prod-win");
+    expect(packageJson.author.email).toMatch(/@/u);
+    expect(readFileSync("scripts/electron-builder-with-local-dist.mjs", "utf8")).toContain(
+      'path.join(root, ".cache", "electron-builder")'
+    );
+
+    const plan = spawnSync(process.execPath, ["scripts/verify-production-artifacts.mjs", "--plan"], {
+      encoding: "utf8"
+    });
+    expect(plan.error).toBeUndefined();
+    expect(plan.status, plan.stderr).toBe(0);
+    const targetLines = plan.stdout.split("\n").filter((line) => /^\[(win|mac|linux)\]/u.test(line));
+    expect(targetLines).toHaveLength(14);
+    expect(targetLines.filter((line) => line.startsWith("[win]")).length).toBe(6);
+    expect(targetLines.filter((line) => line.startsWith("[mac]")).length).toBe(4);
+    expect(targetLines.filter((line) => line.startsWith("[linux]")).length).toBe(4);
+    expect(plan.stdout).toContain(`shadow-ssh-${packageJson.version}-windows-installer-arm64.exe`);
+    expect(plan.stdout).toContain(`shadow-ssh-${packageJson.version}-macos-dmg-x64.dmg`);
+    expect(plan.stdout).toContain(`shadow-ssh-${packageJson.version}-linux-package-amd64.deb`);
   });
 
   it("uses Electron's required .mjs extension for the ESM preload bridge", () => {

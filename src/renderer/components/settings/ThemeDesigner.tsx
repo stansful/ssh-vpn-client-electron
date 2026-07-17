@@ -75,7 +75,7 @@ export function ThemeDesigner({
   return (
     <div className="theme-designer">
       <div className="theme-wheel" style={wheelStyle} aria-hidden="true">
-        <div className="theme-wheel-core">Theme</div>
+        <div className="theme-wheel-core">Custom</div>
       </div>
       <div className="theme-swatches">
         {THEME_ENTRIES.map(([key, label]) => (
@@ -90,7 +90,10 @@ export function ThemeDesigner({
               })}
             />
             <span style={{ background: rgb(draftTheme[key]) }} />
-            <strong>{label}</strong>
+            <div className="theme-swatch-copy">
+              <strong>{label}</strong>
+              <small>{rgbToHex(draftTheme[key]).toUpperCase()}</small>
+            </div>
           </label>
         ))}
       </div>

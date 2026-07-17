@@ -1,4 +1,4 @@
-import { X } from "lucide-react";
+import { CircleAlert, X } from "lucide-react";
 import { memo } from "react";
 
 export const Notice = memo(function Notice({ message, onDismiss }: { message: string; onDismiss: () => void }): JSX.Element | null {
@@ -8,8 +8,9 @@ export const Notice = memo(function Notice({ message, onDismiss }: { message: st
 
   return (
     <div className="notice">
-      <span>{message}</span>
-      <button type="button" className="icon-button" onClick={onDismiss} aria-label="Dismiss">
+      <CircleAlert className="notice-icon" size={17} aria-hidden="true" />
+      <span className="notice-copy" role="status" aria-live="polite">{message}</span>
+      <button type="button" className="icon-button" onClick={onDismiss} aria-label="Dismiss notification">
         <X size={16} />
       </button>
     </div>

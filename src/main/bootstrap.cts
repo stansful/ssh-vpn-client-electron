@@ -99,7 +99,7 @@ async function showFatalWindow(message: string): Promise<void> {
       minWidth: 720,
       minHeight: 420,
       title: `${appDisplayName} startup error`,
-      backgroundColor: "#f6f7f9",
+      backgroundColor: "#0b0d10",
       webPreferences: {
         contextIsolation: true,
         nodeIntegration: false,
@@ -120,11 +120,12 @@ function createErrorDataUrl(message: string): string {
     <meta charset="utf-8">
     <title>${escapeHtml(appDisplayName)} startup error</title>
     <style>
-      body { margin: 0; font: 14px system-ui, sans-serif; color: #20242a; background: #f6f7f9; }
-      main { padding: 32px; max-width: 900px; }
-      h1 { margin: 0 0 12px; font-size: 24px; }
-      p { line-height: 1.45; }
-      pre { white-space: pre-wrap; background: #fff; border: 1px solid #d6dae0; padding: 16px; border-radius: 8px; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 28px; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: #f5f6f8; background: radial-gradient(circle at 80% 0%, rgb(255 180 92 / 10%), transparent 34%), #0b0d10; }
+      main { width: min(820px, 100%); padding: 30px; border: 1px solid rgb(255 255 255 / 10%); border-radius: 22px; background: #11141a; box-shadow: 0 30px 90px rgb(0 0 0 / 45%); }
+      h1 { margin: 0 0 10px; font-size: 28px; letter-spacing: -0.03em; }
+      p { margin: 12px 0; color: #a6afbd; line-height: 1.5; }
+      pre { max-height: 210px; overflow: auto; white-space: pre-wrap; color: #ffc7cd; background: #090b0f; border: 1px solid rgb(255 101 116 / 25%); padding: 16px; border-radius: 12px; font: 12px/1.55 "SFMono-Regular", Consolas, monospace; }
     </style>
   </head>
   <body>

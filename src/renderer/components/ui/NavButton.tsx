@@ -20,8 +20,8 @@ export function NavButton({
       title={compact ? label : undefined}
       onClick={onClick}
     >
-      {icon}
-      <span>{label}</span>
+      <span className="nav-icon" aria-hidden="true">{icon}</span>
+      <span className="nav-label-text">{label}</span>
     </button>
   );
 }
