@@ -305,8 +305,10 @@ throttle tunnel throughput. Only low-priority UI and process-routing discovery w
   multi-endpoint API/CDN/WebSocket applications are not frozen at their first socket. It enriches public destination
   IPs with exact A/AAAA and reverse-CNAME hostnames from the local Windows DNS cache (without a network lookup).
   A sole public process/IP/hostname tuple immediately adds an exact session route (at most 256) without suppressing
-  its working IP and TTL hostname fallbacks; ambiguous/shared destinations retain the same bounded fallbacks (at most
-  2,048 IPs and 512 hostnames).
+  its working IP and hostname fallbacks; ambiguous/shared destinations retain the same bounded fallbacks (at most
+  2,048 IPs and 512 hostnames). A learned route cannot be re-observed once it is in the PAC, because the application
+  then connects to the loopback proxy instead of the real destination, so every retained route is renewed on each
+  successful discovery cycle and only decays after discovery itself has been failing for a full 5-minute TTL.
   The compatibility snapshot then refreshes every 10 seconds on AC or battery;
 - SSH keepalive and time-based rekey share one deadline timer, while byte-based rekey is checked on active traffic and
   causes no idle polling;
@@ -394,8 +396,10 @@ Disconnect/app quit:
   before CIDR checks so IP rules can match destinations reached by domain name.
 - Process-name rules: Windows PAC/system proxy has no process context, so the portable backend watches Windows TCP
   connections for enabled process names, adds matched public remote IPs as temporary rules, and converts local DNS-cache
-  matches into exact-domain rules. An unambiguous tuple is retained for the connected session while its immediately
-  working IP and TTL-domain fallbacks remain active, so short-lived sockets cannot leave the PAC without a route.
+  matches into exact-domain rules. Learned IP and hostname routes are held for the connected session and refreshed on
+  every discovery cycle rather than expiring with the DNS record TTL, because a destination stops being observable as
+  soon as it is routed through the loopback proxy. An unambiguous tuple is additionally retained as an exact session
+  route, so short-lived sockets cannot leave the PAC without a route.
   Shared IPs, multiple aliases, private/special-use addresses, and direct-list conflicts stay on conservative bounded
   fallbacks.
   Reviewed bootstrap host families are included for applications such as Discord whose critical API/CDN/WebSocket

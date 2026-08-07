@@ -962,14 +962,33 @@ export class LiveSshServiceBridge implements ServiceBridge {
       const now = Date.now();
       const routeTtlMs = this.currentProcessRoutingTtlMs();
       const expiresBefore = now - routeTtlMs;
-      const nextIps = new Map([...this.processRoutingIps].filter((entry) => entry[1] >= expiresBefore));
+      // A learned destination can never be observed a second time: as soon as it
+      // enters the PAC the application connects to the loopback proxy instead of
+      // the real remote address, so Get-NetTCPConnection stops reporting it and
+      // nothing re-populates its Windows DNS cache entry. Expiring such a route
+      // on its original TTL therefore dropped a destination the application was
+      // still actively using back to DIRECT, which is why process-name routing
+      // only ever covered part of an application's traffic. Renew every retained
+      // route on each successful discovery cycle instead: routes live for the
+      // connected session (bounded by the LRU caps, and cleared by stopRouting()
+      // or a routing-target change) and only decay once discovery itself has
+      // been failing for a full TTL.
+      const nextIps = new Map(
+        [...this.processRoutingIps]
+          .filter((entry) => entry[1] >= expiresBefore)
+          .map(([address]) => [address, now] as const)
+      );
       const nextDomains = new Map(
-        [...this.processRoutingDomains].filter((entry) =>
-          entry[1] > now && !isDomainCoveredByDirectDomainSuffixes(entry[0], directDomainSuffixes)
-        )
+        [...this.processRoutingDomains]
+          .filter((entry) =>
+            entry[1] > now && !isDomainCoveredByDirectDomainSuffixes(entry[0], directDomainSuffixes)
+          )
+          .map(([domain]) => [domain, now + routeTtlMs] as const)
       );
       const activeProfileCoveredAddresses = new Map(
-        [...this.processRoutingProfileCoveredAddresses].filter((entry) => entry[1] > now)
+        [...this.processRoutingProfileCoveredAddresses]
+          .filter((entry) => entry[1] > now)
+          .map(([address]) => [address, now + routeTtlMs] as const)
       );
       const nextSessionLeases = new Map(this.processRoutingSessionLeases);
       const knownAddressesBeforeObservation = new Set([
@@ -1153,7 +1172,6 @@ export class LiveSshServiceBridge implements ServiceBridge {
             const restrictToReviewedProfile =
               (profileCoveredAddresses.has(entry.address) || activeProfileCoveredAddresses.has(entry.address)) &&
               !unprofiledAddresses.has(entry.address);
-            const ttlMs = Math.min(routeTtlMs, PROCESS_ROUTE_DNS_REFRESH_MS, entry.ttlSeconds * 1000);
             if (
               restrictToReviewedProfile &&
               (!profilePatterns || !isDomainCoveredByRoutePatterns(entry.domain, profilePatterns))
@@ -1164,7 +1182,13 @@ export class LiveSshServiceBridge implements ServiceBridge {
               entry.domain,
               stableDomainPatterns
             ) && !isDomainCoveredByDirectDomainSuffixes(entry.domain, directDomainSuffixes)) {
-              recordBoundedProcessRouteDomain(nextDomains, entry.domain, now + ttlMs);
+              // The record TTL only says when the Windows DNS cache entry has to
+              // be re-read (dnsRefreshAtByAddress above); it says nothing about
+              // how long the application keeps using the hostname. Binding the
+              // PAC route to it expired CDN/API hosts after a few tens of
+              // seconds, so route on the process-route TTL and let the renewal
+              // above keep it alive for the session.
+              recordBoundedProcessRouteDomain(nextDomains, entry.domain, now + routeTtlMs);
             }
           }
           for (const address of addressesWithDnsEntries) {
