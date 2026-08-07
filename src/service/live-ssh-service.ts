@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { RoutingMatcher } from "../core/routing/routing-matcher.js";
+import { RoutingMatcher, type RoutingMatcherSummary } from "../core/routing/routing-matcher.js";
 import { Socks5Proxy } from "../core/network/socks5-proxy.js";
 import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
 import {
@@ -18,6 +18,11 @@ import {
   processRouteDomainHints,
   type ProcessRouteSessionEvidence
 } from "../core/routing/process-route-domains.js";
+import { openDirectEgressChannel } from "../core/network/direct-tcp-channel.js";
+import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/local-tcp-proxy.js";
+import { TrafficPolicy } from "../core/routing/traffic-policy.js";
+import { parseIpAddress } from "../core/routing/ip-address.js";
+import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
@@ -30,6 +35,10 @@ export interface LiveSshServiceBridgeOptions {
   processRoutingRefreshIntervalMs?: () => number;
   processConnectionsProvider?: (processNames: Iterable<string>) => Promise<WindowsProcessConnection[]>;
   processDnsEntriesProvider?: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
+  /** Path to the native helper used for per-connection process attribution. */
+  nativeServiceExecutablePath?: string;
+  /** Injection seam for tests; defaults to the native helper when a path is set. */
+  processAttribution?: ProcessAttribution;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
@@ -73,6 +82,13 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private processRoutingWarningEmitted = false;
   private processRoutingDnsWarningEmitted = false;
   private processRoutingDiscoveryStep = 0;
+  private readonly processAttribution: ProcessAttribution | undefined;
+  private localProcessEnforcement = false;
+  private localRoutingPolicyCache: {
+    request: ConnectRequest;
+    policy: TrafficPolicy;
+    proxyListSuffixes: ReadonlySet<string>;
+  } | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
   private terminalMutationTail: Promise<void> = Promise.resolve();
   private lifecycleGeneration = 0;
@@ -85,6 +101,12 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.processConnectionsProvider = options.processConnectionsProvider ?? listWindowsProcessConnections;
     this.processDnsEntriesProvider = options.processDnsEntriesProvider ??
       (options.processConnectionsProvider ? async () => [] : listWindowsDnsCacheEntries);
+    this.processAttribution = options.processAttribution ?? (options.nativeServiceExecutablePath
+      ? new NativeProcessAttribution({
+          executablePath: options.nativeServiceExecutablePath,
+          onDiagnostic: (level, message) => this.appendDiagnostic(level, message)
+        })
+      : undefined);
     this.status = {
       ...initialStatus,
       state: "Disconnected",
@@ -462,7 +484,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
       realTunnelAvailable: false,
       message: "Stopping SSH service."
     });
-    return this.enqueueMutation(() => this.disconnectInternal(generation, "Application is quitting."));
+    return this.enqueueMutation(async () => {
+      await this.disconnectInternal(generation, "Application is quitting.");
+      await this.processAttribution?.dispose().catch(() => undefined);
+    });
   }
 
   private handleClientEvent(client: SshLiveClient, generation: number, event: SshLiveClientEvent): void {
@@ -555,7 +580,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     const proxy = new Socks5Proxy({
       listenHost: "127.0.0.1",
       idleTimeoutMs: 5 * 60 * 1000,
-      connectChannel: (target, originator, signal) => client.openDirectTcpIpChannel(target, originator, signal)
+      connectChannel: (target, originator, signal) => this.openProxyChannel(client, target, originator, signal)
     });
     proxy.onEvent((event) => {
       if (!this.isCurrentLifecycle(generation) || this.client !== client) {
@@ -577,6 +602,79 @@ export class LiveSshServiceBridge implements ServiceBridge {
       await proxy.stop().catch(() => undefined);
       throw error;
     }
+  }
+
+  /**
+   * Chooses the egress path for one accepted proxy connection.
+   *
+   * While local per-process enforcement is active the system proxy hands us
+   * every proxy-aware TCP connection, because Windows PAC cannot express
+   * process identity. The routing decision therefore moves here, where the
+   * owning process is known: `TrafficPolicy` evaluates domain, IP and
+   * process.name rules together, matching traffic enters the SSH tunnel, and
+   * everything else leaves the machine directly and unchanged.
+   *
+   * When enforcement is inactive the system proxy has already selected the
+   * traffic, so every accepted connection is tunnelled as before.
+   */
+  private async openProxyChannel(
+    client: SshLiveClient,
+    target: DirectTcpIpTarget,
+    originator: { address: string; port: number },
+    signal?: AbortSignal
+  ): Promise<DirectTcpIpChannel> {
+    const request = this.lastRequest;
+    if (!this.localProcessEnforcement || !request) {
+      return client.openDirectTcpIpChannel(target, originator, signal);
+    }
+
+    const processName = await this.processAttribution?.resolveProcessName(originator.port);
+    const { policy, proxyListSuffixes } = this.localRoutingPolicy(request);
+    const destination = describeDestination(target.host);
+    const decision = policy.decide("tcp", {
+      ...destination,
+      destinationPort: target.port,
+      processName
+    });
+
+    // The curated proxy list is not expressible as routing rules (its entries
+    // include bare TLD suffixes such as `.ru`), so it is matched separately
+    // with the same domain-or-parent semantics the PAC applies to it.
+    const proxyListed =
+      destination.destinationDomain !== undefined &&
+      decision.blockedReason === undefined &&
+      request.routingMode === "selected-rules" &&
+      isDomainCoveredByDirectDomainSuffixes(destination.destinationDomain, proxyListSuffixes);
+
+    if (decision.shouldProxy || proxyListed) {
+      return client.openDirectTcpIpChannel(target, originator, signal);
+    }
+    this.appendProxyDiagnostic(
+      "info",
+      `Direct egress for ${target.host}:${target.port}${processName ? ` from ${processName}` : ""} (${decision.blockedReason ?? decision.reason}).`
+    );
+    return openDirectEgressChannel(target, { signal });
+  }
+
+  /**
+   * Compiles the per-connection matcher once per routing revision.
+   *
+   * A curated proxy list holds tens of thousands of domains, so rebuilding the
+   * matcher for every accepted socket would put a full list scan on the
+   * connection hot path. Routing mutations replace `lastRequest` wholesale, so
+   * its identity is a sufficient and cheap cache key.
+   */
+  private localRoutingPolicy(request: ConnectRequest): { policy: TrafficPolicy; proxyListSuffixes: ReadonlySet<string> } {
+    if (this.localRoutingPolicyCache?.request !== request) {
+      this.localRoutingPolicyCache = {
+        request,
+        policy: new TrafficPolicy(request.routingMode, request.routingRules, {
+          protectedSshEndpoint: { host: request.config.host, port: request.config.port }
+        }),
+        proxyListSuffixes: normalizeProcessRouteDirectDomains(request.routingProxyDomains ?? [])
+      };
+    }
+    return this.localRoutingPolicyCache;
   }
 
   private async cleanupClientResources(
@@ -625,8 +723,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     return !this.disposed && this.isCurrentLifecycle(lifecycleGeneration) && routingGeneration === this.routingGeneration;
   }
 
-  private async stopRouting(): Promise<void> {
-    this.stopProcessRoutingMonitor();
+  private clearProcessRoutingState(): void {
     this.processRoutingIps.clear();
     this.processRoutingHintDomains.clear();
     this.processRoutingDomains.clear();
@@ -640,6 +737,12 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.processRoutingApplyPending = false;
     this.processRoutingLastMatchedConnections = 0;
     this.processRoutingDnsWarningEmitted = false;
+  }
+
+  private async stopRouting(): Promise<void> {
+    this.stopProcessRoutingMonitor();
+    this.localProcessEnforcement = false;
+    this.clearProcessRoutingState();
     const socksProxy = this.socksProxy;
     this.socksProxy = undefined;
     this.socksEndpoint = undefined;
@@ -666,6 +769,19 @@ export class LiveSshServiceBridge implements ServiceBridge {
     const generation = this.processRoutingGeneration;
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
     const hasProcessRouting = supportsDynamicProcessRouting(request);
+
+    // Per-process routing is enforced locally whenever the native helper can
+    // attribute connections. Only when it cannot do we fall back to guessing an
+    // application's destinations and feeding them to PAC.
+    this.localProcessEnforcement = hasProcessRouting && (await this.processAttribution?.isAvailable()) === true;
+    if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
+      return;
+    }
+    if (this.localProcessEnforcement) {
+      await this.applyLocallyEnforcedRouting(request, socksEndpoint, generation, allowConnecting, summary);
+      return;
+    }
+
     let literalIpSnapshotResult: SystemProxyApplyResult | undefined;
     let literalIpSnapshotError: unknown;
     let literalIpSnapshotFailed = false;
@@ -706,19 +822,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         throw literalIpSnapshotError;
       }
     } else {
-      this.processRoutingIps.clear();
-      this.processRoutingHintDomains.clear();
-      this.processRoutingDomains.clear();
-      this.processRoutingDnsLookupAt.clear();
-      this.processRoutingDnsLookupFailures.clear();
-      this.processRoutingProfileCoveredAddresses.clear();
-      this.processRoutingSessionLeases.clear();
-      this.processRoutingLastSignature = "";
-      this.processRoutingAppliedSignature = "";
-      this.processRoutingTargetSignature = "";
-      this.processRoutingApplyPending = false;
-      this.processRoutingLastMatchedConnections = 0;
-      this.processRoutingDnsWarningEmitted = false;
+      this.clearProcessRoutingState();
     }
     this.processRoutingApplyPending = hasProcessRouting;
     let result: SystemProxyApplyResult;
@@ -769,6 +873,42 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.appendDiagnostic(
       summary.enabledRules > 0 ? "info" : "warning",
       `Selected routing prepared: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}, learnedProcessDomains=${this.currentProcessRoutingDomains().size}.`
+    );
+  }
+
+  /**
+   * Applies routing for the locally enforced path.
+   *
+   * The system proxy is pointed at the local listener for all proxy-aware TCP
+   * traffic, because a PAC file cannot tell which process opened a connection.
+   * That is not proxy-all routing: `openProxyChannel` evaluates every rule type
+   * per connection and gives non-matching traffic a direct egress, so only the
+   * selected domains, addresses and processes reach the tunnel. The configured
+   * direct list is still honoured by the PAC itself and never reaches us.
+   */
+  private async applyLocallyEnforcedRouting(
+    request: ConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number,
+    allowConnecting: boolean,
+    summary: RoutingMatcherSummary
+  ): Promise<void> {
+    this.clearProcessRoutingState();
+    const result = await this.systemProxy.apply({
+      mode: "proxy-all",
+      rules: request.routingRules,
+      proxyDomains: request.routingProxyDomains,
+      directDomains: request.routingDirectDomains,
+      socksHost: socksEndpoint.host,
+      socksPort: socksEndpoint.port
+    });
+    if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
+      return;
+    }
+    this.appendDiagnostic(result.applied ? "info" : "warning", result.message);
+    this.appendDiagnostic(
+      "info",
+      `Selected routing is enforced locally with native process attribution: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Domain, IP and process rules are evaluated together per connection; unmatched traffic leaves the machine directly.`
     );
   }
 
@@ -1436,6 +1576,16 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.processRoutingWarningEmitted = false;
     this.processRoutingDnsWarningEmitted = false;
   }
+}
+
+/**
+ * Splits a proxy target into the descriptor fields the matcher expects. A
+ * literal address must be offered as an IP so CIDR rules can match it, while a
+ * hostname must stay a domain so it is not parsed as an address.
+ */
+export function describeDestination(host: string): { destinationDomain?: string; destinationIp?: string } {
+  const value = host.trim().replace(/^\[|\]$/gu, "");
+  return parseIpAddress(value) ? { destinationIp: value } : { destinationDomain: value };
 }
 
 function requiredSecret(secret: string | undefined, label: string): string {

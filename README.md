@@ -394,7 +394,14 @@ Disconnect/app quit:
 - Selected domain/IP rules: writes a PAC file under the app data directory, serves it through a loopback HTTP PAC
   endpoint, and sets `AutoConfigURL` for enabled domain, exact IP, and IPv4 CIDR rules. The PAC resolves hostnames
   before CIDR checks so IP rules can match destinations reached by domain name.
-- Process-name rules: Windows PAC/system proxy has no process context, so the portable backend watches Windows TCP
+- Process-name rules (primary path): the bundled native helper attributes each accepted proxy connection to its owning
+  process through `GetExtendedTcpTable`, so routing is decided where process identity is actually known. While this path
+  is active the system proxy points all proxy-aware TCP at the local listener, and the listener evaluates domain, IP and
+  process rules together per connection: matching traffic enters the SSH tunnel and everything else leaves the machine
+  directly, exactly as it would with the tunnel off. Domain and process rules therefore apply simultaneously, and a
+  selected application is covered completely - including hosts no rule names, DoH clients that never populate the
+  Windows DNS cache, and destinations discovered after connect. The helper is read-only and never carries traffic.
+- Process-name rules (fallback when the native helper is unavailable): Windows PAC/system proxy has no process context, so the portable backend watches Windows TCP
   connections for enabled process names, adds matched public remote IPs as temporary rules, and converts local DNS-cache
   matches into exact-domain rules. Learned IP and hostname routes are held for the connected session and refreshed on
   every discovery cycle rather than expiring with the DNS record TTL, because a destination stops being observable as
@@ -406,10 +413,14 @@ Disconnect/app quit:
   sockets otherwise disappear behind the loopback proxy. Other destinations remain `DIRECT`; already-open target
   sockets may need reconnect, and strict per-process enforcement still requires WFP/TUN.
 
-This process mode is best-effort TCP/system-proxy routing: PAC destination rules are global once learned, and an
+The fallback process mode is best-effort TCP/system-proxy routing: PAC destination rules are global once learned, and an
 application may place network sockets in a helper executable with a different name. Raw sockets, custom proxy/DNS
 stacks, QUIC, and clients that ignore the Windows user proxy can bypass this path; add the network-owning helper name
 or explicit domain rules when needed.
+
+Both process modes still depend on the application honouring the Windows user proxy. An application that places its
+sockets in a helper executable is matched by that helper's name, so add it when the parent name alone does not cover
+the traffic. Raw sockets, custom proxy stacks and QUIC/UDP remain outside this path in either mode.
 
 UDP is production TCP-only: unsupported UDP traffic is not proxied. This means application UI/API/WebSocket traffic
 can use process routing, while UDP-only voice/video paths (including Discord voice) remain outside the SSH tunnel.

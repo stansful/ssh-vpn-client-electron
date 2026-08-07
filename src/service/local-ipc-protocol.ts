@@ -44,6 +44,23 @@ export interface NativeServiceHandshake {
   capabilities: NativeServiceCapabilities;
 }
 
+/** One row of the native `GetExtendedTcpTable` snapshot. */
+export interface NativeProcessConnection {
+  pid: number;
+  processName: string;
+  localAddress: string;
+  localPort: number;
+  remoteAddress: string;
+  remotePort: number;
+  protocol: string;
+}
+
+export interface NativeProcessConnectionsPayload {
+  connections: NativeProcessConnection[];
+}
+
+export const MAX_NATIVE_PROCESS_CONNECTIONS = 20_000;
+
 type VersionedWireMessage = { protocolVersion?: number };
 
 const SERVICE_COMMAND_TYPES = new Set([
@@ -93,7 +110,12 @@ export type ServiceResponse =
   | (VersionedWireMessage & { kind: "response"; id: string; ok: true; payload?: ServiceResponsePayload })
   | (VersionedWireMessage & { kind: "response"; id: string; ok: false; error: string });
 
-export type ServiceResponsePayload = RuntimeStatus | TunnelCheckResult | NativeServiceHandshake | { accepted: true };
+export type ServiceResponsePayload =
+  | RuntimeStatus
+  | TunnelCheckResult
+  | NativeServiceHandshake
+  | NativeProcessConnectionsPayload
+  | { accepted: true };
 export type ServiceEventEnvelope = VersionedWireMessage & { kind: "event"; event: ServiceEvent };
 export type ServiceWireMessage = ServiceCommand | ServiceResponse | ServiceEventEnvelope;
 
@@ -242,6 +264,41 @@ export function requestTimeoutMs(commandType: ServiceCommand["type"]): number {
   return commandType === "get-status" || commandType === "get-capabilities"
     ? SERVICE_CONNECT_TIMEOUT_MS
     : SERVICE_DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
+/**
+ * Extracts the usable rows of a `list-process-connections` response.
+ *
+ * Malformed rows are dropped rather than failing the whole snapshot: process
+ * attribution is advisory, and one unreadable row must not cost the caller
+ * every other connection in the table.
+ */
+export function parseNativeProcessConnections(payload: unknown): NativeProcessConnection[] {
+  if (!isRecord(payload) || !Array.isArray(payload.connections)) {
+    return [];
+  }
+  const rows: NativeProcessConnection[] = [];
+  for (const row of payload.connections.slice(0, MAX_NATIVE_PROCESS_CONNECTIONS)) {
+    if (!isRecord(row)) {
+      continue;
+    }
+    const processName = typeof row.processName === "string" ? row.processName.trim() : "";
+    const localPort = typeof row.localPort === "number" ? row.localPort : Number.NaN;
+    const pid = typeof row.pid === "number" ? row.pid : Number.NaN;
+    if (!processName || !Number.isInteger(localPort) || localPort <= 0 || localPort > 65_535) {
+      continue;
+    }
+    rows.push({
+      pid: Number.isInteger(pid) ? pid : 0,
+      processName,
+      localAddress: typeof row.localAddress === "string" ? row.localAddress : "",
+      localPort,
+      remoteAddress: typeof row.remoteAddress === "string" ? row.remoteAddress : "",
+      remotePort: typeof row.remotePort === "number" ? row.remotePort : 0,
+      protocol: typeof row.protocol === "string" ? row.protocol : ""
+    });
+  }
+  return rows;
 }
 
 export function isNativeServiceHandshake(value: unknown): value is NativeServiceHandshake {

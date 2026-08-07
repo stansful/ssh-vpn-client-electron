@@ -823,7 +823,12 @@ async function createServiceBridge(initialRuntime: RuntimeStatus): Promise<{ ser
       message: "Live SSH service is active."
     }, {
       systemProxy: sharedSystemProxy,
-      processRoutingRefreshIntervalMs: currentProcessRoutingRefreshIntervalMs
+      processRoutingRefreshIntervalMs: currentProcessRoutingRefreshIntervalMs,
+      // The bundled native binary is used purely as a read-only helper for
+      // per-connection process attribution; it never carries tunnel traffic.
+      nativeServiceExecutablePath: nativeBinaryAvailable
+        ? resolveNativeServicePath(projectRoot, platformTarget)
+        : undefined
     })
   };
 }
