@@ -38,7 +38,11 @@ interface CompiledProcessRule {
 }
 
 export class RoutingMatcher {
-  private readonly exactDomains = new Map<string, CompiledDomainRule>();
+  // A plain `example.com` rule covers the domain and every subdomain, matching
+  // how curated proxy-list entries behave. Exact-host-only matching made a rule
+  // silently miss `www.` and the API/CDN subdomains almost every site depends
+  // on, which made custom rules look inert next to the lists.
+  private readonly domains = new Map<string, CompiledDomainRule>();
   private readonly wildcardDomains = new Map<string, CompiledDomainRule>();
   private readonly ips: CompiledIpRule[] = [];
   private readonly processes = new Map<string, CompiledProcessRule>();
@@ -62,7 +66,7 @@ export class RoutingMatcher {
       if (rule.type === "domain") {
         const wildcard = normalized.startsWith("*.");
         const pattern = wildcard ? normalized.slice(2) : normalized;
-        const index = wildcard ? this.wildcardDomains : this.exactDomains;
+        const index = wildcard ? this.wildcardDomains : this.domains;
         // Map insertion is intentionally first-wins: duplicate rule IDs/values
         // historically matched the earliest enabled rule in the source array.
         if (!index.has(pattern)) {
@@ -142,14 +146,17 @@ export class RoutingMatcher {
   }
 
   private matchDomain(domain: string): CompiledDomainRule | undefined {
-    let matched = this.exactDomains.get(domain);
-    // A wildcard only matches a strict subdomain. Walking label boundaries
-    // makes lookup proportional to domain depth rather than total rule count.
+    let matched = this.domains.get(domain);
+    // A plain rule also matches through any parent label, while a wildcard only
+    // matches a strict subdomain. Walking label boundaries makes lookup
+    // proportional to domain depth rather than total rule count.
     let separator = domain.indexOf(".");
     while (separator >= 0 && separator + 1 < domain.length) {
-      const wildcard = this.wildcardDomains.get(domain.slice(separator + 1));
-      if (wildcard && (!matched || wildcard.order < matched.order)) {
-        matched = wildcard;
+      const parent = domain.slice(separator + 1);
+      for (const candidate of [this.domains.get(parent), this.wildcardDomains.get(parent)]) {
+        if (candidate && (!matched || candidate.order < matched.order)) {
+          matched = candidate;
+        }
       }
       separator = domain.indexOf(".", separator + 1);
     }

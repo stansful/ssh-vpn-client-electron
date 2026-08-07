@@ -4,7 +4,7 @@ import { RoutingMatcher } from "../src/core/routing/routing-matcher.js";
 import type { RoutingRule } from "../src/shared/types.js";
 
 describe("routing matcher core", () => {
-  it("matches exact and wildcard domains", () => {
+  it("matches plain and wildcard domains", () => {
     const matcher = new RoutingMatcher("selected-rules", [
       rule("domain", "youtube.com"),
       rule("domain", "*.googlevideo.com")
@@ -12,7 +12,23 @@ describe("routing matcher core", () => {
 
     expect(matcher.match({ destinationDomain: "youtube.com" })).toMatchObject({ shouldProxy: true, reason: "domain" });
     expect(matcher.match({ destinationDomain: "r1---sn.googlevideo.com" })).toMatchObject({ shouldProxy: true, reason: "domain" });
+    // A `*.` rule stays subdomain-only so an apex can be excluded deliberately.
     expect(matcher.match({ destinationDomain: "googlevideo.com" })).toMatchObject({ shouldProxy: false, reason: "no-match" });
+  });
+
+  // A plain rule used to match the literal host only, so it silently missed
+  // `www.` and the API/CDN subdomains nearly every site depends on. That made
+  // custom rules look inert next to the curated lists, which always matched
+  // a domain together with its subdomains.
+  it("covers subdomains of a plain domain rule without matching lookalikes", () => {
+    const matcher = new RoutingMatcher("selected-rules", [rule("domain", "godotengine.org")]);
+
+    for (const host of ["godotengine.org", "www.godotengine.org", "docs.godotengine.org", "a.b.godotengine.org"]) {
+      expect(matcher.match({ destinationDomain: host })).toMatchObject({ shouldProxy: true, reason: "domain" });
+    }
+    for (const host of ["notgodotengine.org", "godotengine.org.evil.test", "org", "example.com"]) {
+      expect(matcher.match({ destinationDomain: host })).toMatchObject({ shouldProxy: false });
+    }
   });
 
   it("preserves first-rule precedence across exact, wildcard, and duplicate indexed rules", () => {

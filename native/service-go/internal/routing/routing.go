@@ -252,5 +252,8 @@ func domainMatches(rule compiledDomainRule, domain string) bool {
 	if rule.wildcard {
 		return strings.HasSuffix(domain, "."+rule.pattern) && len(domain) > len(rule.pattern)+1
 	}
-	return domain == rule.pattern
+	// A plain rule covers the domain and every subdomain, matching the
+	// TypeScript matcher and the curated proxy lists. Exact-host-only matching
+	// silently excluded `www.` and the API/CDN subdomains sites depend on.
+	return domain == rule.pattern || strings.HasSuffix(domain, "."+rule.pattern)
 }

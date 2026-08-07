@@ -625,6 +625,32 @@ describe("Windows PAC generation", () => {
     expect(pac).not.toContain("disabled.test");
   });
 
+  // A plain domain rule was emitted as an exact-host lookup while curated
+  // proxy-list entries matched a domain together with its subdomains. Custom
+  // rules therefore missed `www.` and every API/CDN subdomain and looked dead
+  // next to the lists.
+  it("routes subdomains of a plain domain rule and still lets the direct list win", () => {
+    const pac = buildProxyPac(
+      [{ id: "1", type: "domain", value: "example.com", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080,
+      "mixed",
+      { directDomains: ["cdn.example.com"], mode: "selected-rules" }
+    );
+    const findProxyForURL = new Function(
+      "dnsResolveEx",
+      "dnsResolve",
+      "isInNetEx",
+      `${pac}; return FindProxyForURL;`
+    )(() => "", () => "", () => false) as (url: string, host: string) => string;
+
+    for (const host of ["example.com", "www.example.com", "api.example.com"]) {
+      expect(findProxyForURL(`https://${host}/`, host)).toBe("PROXY 127.0.0.1:1080");
+    }
+    expect(findProxyForURL("https://cdn.example.com/", "cdn.example.com")).toBe("DIRECT");
+    expect(findProxyForURL("https://notexample.com/", "notexample.com")).toBe("DIRECT");
+  });
+
   it("preserves DNS matching for a user-authored exact IPv4 rule", () => {
     const pac = buildProxyPac(
       [{ id: "user-exact-ip", type: "ip", value: "203.0.113.2", enabled: true, createdAt: "", updatedAt: "" }],

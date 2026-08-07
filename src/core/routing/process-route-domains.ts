@@ -69,7 +69,9 @@ export function isDomainCoveredByRoutePatterns(domain: string, patterns: Iterabl
       }
       continue;
     }
-    if (normalizedDomain === pattern) {
+    // A plain pattern covers the domain and its subdomains, so a learned host
+    // under an already-configured rule must not be added a second time.
+    if (normalizedDomain === pattern || normalizedDomain.endsWith(`.${pattern}`)) {
       return true;
     }
   }

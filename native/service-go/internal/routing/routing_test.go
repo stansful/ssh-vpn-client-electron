@@ -12,7 +12,11 @@ func TestMatcherSelectedRules(t *testing.T) {
 	})
 
 	assertDecision(t, matcher.Decide(Descriptor{DestinationDomain: "example.com"}), true, "domain", "domain-root")
+	// A plain rule covers the domain and its subdomains, like the curated lists.
+	assertDecision(t, matcher.Decide(Descriptor{DestinationDomain: "www.example.com"}), true, "domain", "domain-root")
+	assertDecision(t, matcher.Decide(Descriptor{DestinationDomain: "notexample.com"}), false, "no-match", "")
 	assertDecision(t, matcher.Decide(Descriptor{DestinationDomain: "api.internal.test"}), true, "domain", "domain-wild")
+	// A `*.` rule stays subdomain-only so an apex can be excluded deliberately.
 	assertDecision(t, matcher.Decide(Descriptor{DestinationDomain: "internal.test"}), false, "no-match", "")
 	assertDecision(t, matcher.Decide(Descriptor{DestinationIP: "2001:db8::42"}), true, "ip", "v6")
 	assertDecision(t, matcher.Decide(Descriptor{ProcessName: "chrome.exe"}), true, "process.name", "proc")

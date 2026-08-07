@@ -393,7 +393,9 @@ Disconnect/app quit:
 - Proxy all: sets Windows HTTP/HTTPS/SOCKS proxy entries pointing at the local HTTP/SOCKS listener.
 - Selected domain/IP rules: writes a PAC file under the app data directory, serves it through a loopback HTTP PAC
   endpoint, and sets `AutoConfigURL` for enabled domain, exact IP, and IPv4 CIDR rules. The PAC resolves hostnames
-  before CIDR checks so IP rules can match destinations reached by domain name.
+  before CIDR checks so IP rules can match destinations reached by domain name. A plain domain rule such as
+  `example.com` covers the domain and all of its subdomains, the same way curated proxy-list entries behave; write
+  `*.example.com` to route only subdomains and leave the apex direct.
 - Process-name rules (primary path): the bundled native helper attributes each accepted proxy connection to its owning
   process through `GetExtendedTcpTable`, so routing is decided where process identity is actually known. While this path
   is active the system proxy points all proxy-aware TCP at the local listener, and the listener evaluates domain, IP and

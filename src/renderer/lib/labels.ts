@@ -15,7 +15,8 @@ export function titleForView(view: View): string {
 
 export function placeholderForRule(type: RoutingRuleType): string {
   if (type === "domain") {
-    return "youtube.com or *.youtube.com";
+    // A plain entry covers the domain and its subdomains; `*.` excludes the apex.
+    return "youtube.com (with subdomains) or *.youtube.com";
   }
   if (type === "ip") {
     return "8.8.8.8 or 2a00:1450::/32";
