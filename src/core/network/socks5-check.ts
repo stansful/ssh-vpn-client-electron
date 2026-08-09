@@ -35,7 +35,7 @@ export function checkSocks5Connect(proxy: { host: string; port: number }, target
           return;
         }
         stage = "connect";
-        socket.write(buildSocksConnectRequest(target));
+        socket.write(buildSocks5ConnectRequest(target));
         return;
       }
       if (data.length < 2 || data[1] !== 0x00) {
@@ -49,7 +49,7 @@ export function checkSocks5Connect(proxy: { host: string; port: number }, target
   });
 }
 
-function buildSocksConnectRequest(target: { host: string; port: number }): Buffer {
+export function buildSocks5ConnectRequest(target: { host: string; port: number }): Buffer {
   const host = target.host.trim();
   const port = Buffer.alloc(2);
   port.writeUInt16BE(target.port);

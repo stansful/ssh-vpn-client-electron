@@ -396,10 +396,11 @@ Disconnect/app quit:
   before CIDR checks so IP rules can match destinations reached by domain name. A plain domain rule such as
   `example.com` covers the domain and all of its subdomains, the same way curated proxy-list entries behave; write
   `*.example.com` to route only subdomains and leave the apex direct.
-- Process-name rules (primary path): the bundled native helper attributes each accepted proxy connection to its owning
-  process through `GetExtendedTcpTable`, so routing is decided where process identity is actually known. While this path
-  is active the system proxy points all proxy-aware TCP at the local listener, and the listener evaluates domain, IP and
-  process rules together per connection: matching traffic enters the SSH tunnel and everything else leaves the machine
+- Process-name rules (primary path, both transports): the bundled native helper attributes each accepted proxy
+  connection to its owning process through `GetExtendedTcpTable`, so routing is decided where process identity is
+  actually known. While this path is active the system proxy points all proxy-aware TCP at a local listener, and the
+  listener evaluates domain, IP and process rules together per connection: matching traffic enters the tunnel
+  (SSH `direct-tcpip`, or Xray's SOCKS inbound when the Xray transport is active) and everything else leaves the machine
   directly, exactly as it would with the tunnel off. Domain and process rules therefore apply simultaneously, and a
   selected application is covered completely - including hosts no rule names, DoH clients that never populate the
   Windows DNS cache, and destinations discovered after connect. The helper is read-only and never carries traffic.

@@ -18,10 +18,8 @@ import {
   processRouteDomainHints,
   type ProcessRouteSessionEvidence
 } from "../core/routing/process-route-domains.js";
-import { openDirectEgressChannel } from "../core/network/direct-tcp-channel.js";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/local-tcp-proxy.js";
-import { TrafficPolicy } from "../core/routing/traffic-policy.js";
-import { parseIpAddress } from "../core/routing/ip-address.js";
+import { LocalRoutingEnforcer, type LocalRoutingContext } from "./local-routing-enforcement.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
 import type { ServiceEvent } from "../shared/ipc.js";
@@ -83,12 +81,9 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private processRoutingDnsWarningEmitted = false;
   private processRoutingDiscoveryStep = 0;
   private readonly processAttribution: ProcessAttribution | undefined;
+  private readonly localRoutingEnforcer: LocalRoutingEnforcer;
   private localProcessEnforcement = false;
-  private localRoutingPolicyCache: {
-    request: ConnectRequest;
-    policy: TrafficPolicy;
-    proxyListSuffixes: ReadonlySet<string>;
-  } | undefined;
+  private localRoutingContext: LocalRoutingContext | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
   private terminalMutationTail: Promise<void> = Promise.resolve();
   private lifecycleGeneration = 0;
@@ -107,6 +102,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
           onDiagnostic: (level, message) => this.appendDiagnostic(level, message)
         })
       : undefined);
+    this.localRoutingEnforcer = new LocalRoutingEnforcer(this.processAttribution);
     this.status = {
       ...initialStatus,
       state: "Disconnected",
@@ -628,53 +624,21 @@ export class LiveSshServiceBridge implements ServiceBridge {
       return client.openDirectTcpIpChannel(target, originator, signal);
     }
 
-    const processName = await this.processAttribution?.resolveProcessName(originator.port);
-    const { policy, proxyListSuffixes } = this.localRoutingPolicy(request);
-    const destination = describeDestination(target.host);
-    const decision = policy.decide("tcp", {
-      ...destination,
-      destinationPort: target.port,
-      processName
-    });
-
-    // The curated proxy list is not expressible as routing rules (its entries
-    // include bare TLD suffixes such as `.ru`), so it is matched separately
-    // with the same domain-or-parent semantics the PAC applies to it.
-    const proxyListed =
-      destination.destinationDomain !== undefined &&
-      decision.blockedReason === undefined &&
-      request.routingMode === "selected-rules" &&
-      isDomainCoveredByDirectDomainSuffixes(destination.destinationDomain, proxyListSuffixes);
-
-    if (decision.shouldProxy || proxyListed) {
-      return client.openDirectTcpIpChannel(target, originator, signal);
-    }
-    this.appendProxyDiagnostic(
-      "info",
-      `Direct egress for ${target.host}:${target.port}${processName ? ` from ${processName}` : ""} (${decision.blockedReason ?? decision.reason}).`
+    const context = this.localRoutingContext ?? buildLocalRoutingContext(request);
+    const { channel, decision } = await this.localRoutingEnforcer.openChannel(
+      context,
+      target,
+      originator,
+      () => client.openDirectTcpIpChannel(target, originator, signal),
+      signal
     );
-    return openDirectEgressChannel(target, { signal });
-  }
-
-  /**
-   * Compiles the per-connection matcher once per routing revision.
-   *
-   * A curated proxy list holds tens of thousands of domains, so rebuilding the
-   * matcher for every accepted socket would put a full list scan on the
-   * connection hot path. Routing mutations replace `lastRequest` wholesale, so
-   * its identity is a sufficient and cheap cache key.
-   */
-  private localRoutingPolicy(request: ConnectRequest): { policy: TrafficPolicy; proxyListSuffixes: ReadonlySet<string> } {
-    if (this.localRoutingPolicyCache?.request !== request) {
-      this.localRoutingPolicyCache = {
-        request,
-        policy: new TrafficPolicy(request.routingMode, request.routingRules, {
-          protectedSshEndpoint: { host: request.config.host, port: request.config.port }
-        }),
-        proxyListSuffixes: normalizeProcessRouteDirectDomains(request.routingProxyDomains ?? [])
-      };
+    if (!decision.shouldProxy) {
+      this.appendProxyDiagnostic(
+        "info",
+        `Direct egress for ${target.host}:${target.port}${decision.processName ? ` from ${decision.processName}` : ""} (${decision.reason}).`
+      );
     }
-    return this.localRoutingPolicyCache;
+    return channel;
   }
 
   private async cleanupClientResources(
@@ -742,6 +706,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private async stopRouting(): Promise<void> {
     this.stopProcessRoutingMonitor();
     this.localProcessEnforcement = false;
+    this.localRoutingContext = undefined;
     this.clearProcessRoutingState();
     const socksProxy = this.socksProxy;
     this.socksProxy = undefined;
@@ -773,14 +738,17 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // Per-process routing is enforced locally whenever the native helper can
     // attribute connections. Only when it cannot do we fall back to guessing an
     // application's destinations and feeding them to PAC.
-    this.localProcessEnforcement = hasProcessRouting && (await this.processAttribution?.isAvailable()) === true;
+    const context = buildLocalRoutingContext(request);
+    this.localProcessEnforcement = await this.localRoutingEnforcer.isEnforceable(context);
     if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
       return;
     }
     if (this.localProcessEnforcement) {
+      this.localRoutingContext = context;
       await this.applyLocallyEnforcedRouting(request, socksEndpoint, generation, allowConnecting, summary);
       return;
     }
+    this.localRoutingContext = undefined;
 
     let literalIpSnapshotResult: SystemProxyApplyResult | undefined;
     let literalIpSnapshotError: unknown;
@@ -1578,14 +1546,13 @@ export class LiveSshServiceBridge implements ServiceBridge {
   }
 }
 
-/**
- * Splits a proxy target into the descriptor fields the matcher expects. A
- * literal address must be offered as an IP so CIDR rules can match it, while a
- * hostname must stay a domain so it is not parsed as an address.
- */
-export function describeDestination(host: string): { destinationDomain?: string; destinationIp?: string } {
-  const value = host.trim().replace(/^\[|\]$/gu, "");
-  return parseIpAddress(value) ? { destinationIp: value } : { destinationDomain: value };
+function buildLocalRoutingContext(request: ConnectRequest): LocalRoutingContext {
+  return {
+    routingMode: request.routingMode,
+    routingRules: request.routingRules,
+    routingProxyDomains: request.routingProxyDomains,
+    protectedEndpoint: { host: request.config.host, port: request.config.port }
+  };
 }
 
 function requiredSecret(secret: string | undefined, label: string): string {

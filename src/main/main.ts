@@ -227,6 +227,11 @@ const xrayService = new XrayServiceBridge(
   {
     systemProxy: sharedSystemProxy,
     processRoutingRefreshIntervalMs: currentProcessRoutingRefreshIntervalMs,
+    // Read-only helper for per-connection process attribution; it never
+    // carries tunnel traffic.
+    nativeServiceExecutablePath: nativeServiceExists(projectRoot, platformTarget)
+      ? resolveNativeServicePath(projectRoot, platformTarget)
+      : undefined,
     runtimeDirectory: xrayRuntimeDataPath,
     executablePath: resolveXrayExecutablePath({
       packaged: app.isPackaged,

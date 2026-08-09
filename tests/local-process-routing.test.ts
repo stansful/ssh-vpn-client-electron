@@ -16,7 +16,11 @@ let echoServer: net.Server;
 let echoPort = 0;
 
 beforeAll(async () => {
-  echoServer = net.createServer((socket) => socket.end("ok"));
+  echoServer = net.createServer((socket) => {
+    // A client that hangs up mid-transfer must not raise an unhandled error.
+    socket.on("error", () => undefined);
+    socket.end("ok");
+  });
   await new Promise<void>((resolve) => echoServer.listen(0, "127.0.0.1", resolve));
   const address = echoServer.address();
   echoPort = typeof address === "object" && address ? address.port : 0;

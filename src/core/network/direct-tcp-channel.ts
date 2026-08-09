@@ -44,10 +44,20 @@ export async function openDirectEgressChannel(
   }
 
   configureLowLatencySocket(socket, { keepAlive: true });
-  return new DirectEgressChannel(socket, socketWriteTimeoutMs);
+  return new SocketBackedChannel(socket, socketWriteTimeoutMs);
 }
 
-class DirectEgressChannel implements DirectTcpIpChannel {
+/**
+ * Wraps an already-established socket as a channel. Used both for direct egress
+ * and for a connection handed over by an upstream SOCKS5 proxy.
+ */
+export function createSocketBackedChannel(socket: net.Socket, socketWriteTimeoutMs: number): DirectTcpIpChannel {
+  return new SocketBackedChannel(socket, socketWriteTimeoutMs);
+}
+
+export { DEFAULT_DIRECT_WRITE_TIMEOUT_MS, waitForConnect };
+
+class SocketBackedChannel implements DirectTcpIpChannel {
   private readonly events = new EventEmitter();
   private writeQueue: Promise<void> = Promise.resolve();
   private closed = false;

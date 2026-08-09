@@ -4,7 +4,7 @@ import { access, chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { checkSocks5Connect, parseEndpoint } from "../core/network/socks5-check.js";
-import { RoutingMatcher } from "../core/routing/routing-matcher.js";
+import { RoutingMatcher, type RoutingMatcherSummary } from "../core/routing/routing-matcher.js";
 import {
   isAutoLearnableRemoteAddress,
   listWindowsProcessConnections,
@@ -21,6 +21,10 @@ import {
   type ProcessRouteSessionEvidence
 } from "../core/routing/process-route-domains.js";
 import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
+import { Socks5Proxy } from "../core/network/socks5-proxy.js";
+import { openSocks5UpstreamChannel } from "../core/network/socks5-upstream.js";
+import { LocalRoutingEnforcer, type LocalRoutingContext } from "./local-routing-enforcement.js";
+import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { buildXrayConfig } from "../core/proxy/xray-config.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { DiagnosticsEntry, ProxyConnectRequest, RoutingRule, RoutingUpdateRequest, RuntimeStatus, TunnelCheckResult } from "../shared/types.js";
@@ -41,6 +45,10 @@ export interface XrayServiceBridgeOptions {
   processRoutingRefreshIntervalMs?: () => number;
   processConnectionsProvider?: (processNames: Iterable<string>) => Promise<WindowsProcessConnection[]>;
   processDnsEntriesProvider?: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
+  /** Path to the native helper used for per-connection process attribution. */
+  nativeServiceExecutablePath?: string;
+  /** Injection seam for tests; defaults to the native helper when a path is set. */
+  processAttribution?: ProcessAttribution;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
@@ -49,6 +57,7 @@ const PROCESS_ROUTE_DISCOVERY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
 const PROCESS_ROUTE_DNS_REFRESH_MS = 5 * 60 * 1000;
 const PROCESS_ROUTE_DNS_MIN_REFRESH_MS = 1_000;
 const PROCESS_ROUTE_DNS_RETRY_BASE_MS = 10_000;
+const MAX_LOCAL_PROXY_DIAGNOSTICS = 80;
 const MAX_XRAY_PROCESS_LOG_LINES = 80;
 const MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS = 64 * 1024;
 const MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS = 4096;
@@ -89,6 +98,11 @@ export class XrayServiceBridge {
   private processRoutingWarningEmitted = false;
   private processRoutingDnsWarningEmitted = false;
   private processRoutingDiscoveryStep = 0;
+  private readonly processAttribution: ProcessAttribution | undefined;
+  private readonly localRoutingEnforcer: LocalRoutingEnforcer;
+  private localRoutingContext: LocalRoutingContext | undefined;
+  private localProxy: Socks5Proxy | undefined;
+  private proxyDiagnostics = 0;
   private processLogLines = 0;
   private readonly processLogDrainers = new WeakMap<XrayProcess, () => void>();
   private mutationTail: Promise<void> = Promise.resolve();
@@ -102,6 +116,13 @@ export class XrayServiceBridge {
     this.processConnectionsProvider = options.processConnectionsProvider ?? listWindowsProcessConnections;
     this.processDnsEntriesProvider = options.processDnsEntriesProvider ??
       (options.processConnectionsProvider ? async () => [] : listWindowsDnsCacheEntries);
+    this.processAttribution = options.processAttribution ?? (options.nativeServiceExecutablePath
+      ? new NativeProcessAttribution({
+          executablePath: options.nativeServiceExecutablePath,
+          onDiagnostic: (level, message) => this.appendDiagnostic(level, message)
+        })
+      : undefined);
+    this.localRoutingEnforcer = new LocalRoutingEnforcer(this.processAttribution);
     this.runtimeDirectory = options.runtimeDirectory;
     this.configPath = path.join(this.runtimeDirectory, "xray-config.json");
     this.startupConfigCleanup = rm(this.configPath, { force: true }).catch(() => undefined);
@@ -520,8 +541,7 @@ export class XrayServiceBridge {
     this.startupAbortController = undefined;
   }
 
-  private async stopRouting(): Promise<void> {
-    this.stopProcessRoutingMonitor();
+  private clearProcessRoutingState(): void {
     this.processRoutingIps.clear();
     this.processRoutingHintDomains.clear();
     this.processRoutingDomains.clear();
@@ -535,6 +555,12 @@ export class XrayServiceBridge {
     this.processRoutingApplyPending = false;
     this.processRoutingLastMatchedConnections = 0;
     this.processRoutingDnsWarningEmitted = false;
+  }
+
+  private async stopRouting(): Promise<void> {
+    this.stopProcessRoutingMonitor();
+    await this.stopLocalProxy();
+    this.clearProcessRoutingState();
     try {
       await this.systemProxy.restore();
     } catch (error) {
@@ -657,6 +683,24 @@ export class XrayServiceBridge {
     const httpEndpoint = this.httpEndpoint ?? socksEndpoint;
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
     const hasProcessRouting = supportsDynamicProcessRouting(request.routingMode, request.routingRules);
+
+    // Process rules can only be honoured where the owning process is known, so
+    // when the native helper can attribute connections we place our own
+    // listener in front of Xray and decide there.
+    const context: LocalRoutingContext = {
+      routingMode: request.routingMode,
+      routingRules: request.routingRules,
+      routingProxyDomains: request.routingProxyDomains
+    };
+    if (await this.localRoutingEnforcer.isEnforceable(context)) {
+      if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+        return;
+      }
+      await this.applyLocallyEnforcedRouting(request, socksEndpoint, context, generation, summary);
+      return;
+    }
+    await this.stopLocalProxy();
+
     let literalIpSnapshotResult: SystemProxyApplyResult | undefined;
     let literalIpSnapshotError: unknown;
     let literalIpSnapshotFailed = false;
@@ -699,19 +743,7 @@ export class XrayServiceBridge {
         throw literalIpSnapshotError;
       }
     } else {
-      this.processRoutingIps.clear();
-      this.processRoutingHintDomains.clear();
-      this.processRoutingDomains.clear();
-      this.processRoutingDnsLookupAt.clear();
-      this.processRoutingDnsLookupFailures.clear();
-      this.processRoutingProfileCoveredAddresses.clear();
-      this.processRoutingSessionLeases.clear();
-      this.processRoutingLastSignature = "";
-      this.processRoutingAppliedSignature = "";
-      this.processRoutingTargetSignature = "";
-      this.processRoutingApplyPending = false;
-      this.processRoutingLastMatchedConnections = 0;
-      this.processRoutingDnsWarningEmitted = false;
+      this.clearProcessRoutingState();
     }
     this.processRoutingApplyPending = hasProcessRouting;
     let result: SystemProxyApplyResult;
@@ -764,6 +796,107 @@ export class XrayServiceBridge {
       summary.enabledRules > 0 ? "info" : "warning",
       `Selected routing prepared for Xray transport: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}, learnedProcessDomains=${this.currentProcessRoutingDomains().size}.`
     );
+  }
+
+  /**
+   * Routes all proxy-aware TCP through our own listener, which then evaluates
+   * domain, IP and process rules per connection and forwards only matching
+   * traffic into Xray's SOCKS inbound. Everything else leaves the machine
+   * directly, so unselected applications are untouched.
+   */
+  private async applyLocallyEnforcedRouting(
+    request: ProxyConnectRequest,
+    xraySocksEndpoint: { host: string; port: number },
+    context: LocalRoutingContext,
+    generation: number,
+    summary: RoutingMatcherSummary
+  ): Promise<void> {
+    this.clearProcessRoutingState();
+    const endpoint = await this.startLocalProxy(xraySocksEndpoint, context, generation);
+    if (!endpoint || generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+      return;
+    }
+
+    const result = await this.systemProxy.apply({
+      mode: "proxy-all",
+      rules: request.routingRules,
+      proxyDomains: request.routingProxyDomains,
+      directDomains: request.routingDirectDomains,
+      socksHost: endpoint.host,
+      socksPort: endpoint.port
+    });
+    if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+      return;
+    }
+    this.appendDiagnostic(result.applied ? "info" : "warning", result.message);
+    this.appendDiagnostic(
+      "info",
+      `Selected routing is enforced locally with native process attribution: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Matching traffic is forwarded into Xray; unmatched traffic leaves the machine directly.`
+    );
+  }
+
+  private async startLocalProxy(
+    xraySocksEndpoint: { host: string; port: number },
+    context: LocalRoutingContext,
+    generation: number
+  ): Promise<{ host: string; port: number } | undefined> {
+    // Retiring any previous listener clears the routing context, so publish the
+    // new one only afterwards: a connection accepted without a context cannot
+    // be attributed and would bypass the rules entirely.
+    await this.stopLocalProxy();
+    this.localRoutingContext = context;
+    const proxy = new Socks5Proxy({
+      listenHost: "127.0.0.1",
+      idleTimeoutMs: 5 * 60 * 1000,
+      connectChannel: async (target, originator, signal) => {
+        const context = this.localRoutingContext;
+        if (!context) {
+          return openSocks5UpstreamChannel(xraySocksEndpoint, target, { signal });
+        }
+        const { channel, decision } = await this.localRoutingEnforcer.openChannel(
+          context,
+          target,
+          originator,
+          () => openSocks5UpstreamChannel(xraySocksEndpoint, target, { signal }),
+          signal
+        );
+        if (!decision.shouldProxy) {
+          this.appendBoundedProxyDiagnostic(
+            "info",
+            `Direct egress for ${target.host}:${target.port}${decision.processName ? ` from ${decision.processName}` : ""} (${decision.reason}).`
+          );
+        }
+        return channel;
+      }
+    });
+    proxy.onEvent((event) => {
+      if (generation !== this.processRoutingGeneration) {
+        return;
+      }
+      if (event.type === "error") {
+        this.appendBoundedProxyDiagnostic("warning", event.message);
+      }
+    });
+    try {
+      const endpoint = await proxy.start();
+      this.localProxy = proxy;
+      this.appendDiagnostic("info", `Local routing proxy is listening on ${endpoint.host}:${endpoint.port}.`);
+      return endpoint;
+    } catch (error) {
+      await proxy.stop().catch(() => undefined);
+      this.appendDiagnostic(
+        "warning",
+        `Local routing proxy failed to start: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return undefined;
+    }
+  }
+
+  private async stopLocalProxy(): Promise<void> {
+    const proxy = this.localProxy;
+    this.localProxy = undefined;
+    this.localRoutingContext = undefined;
+    await proxy?.stop().catch(() => undefined);
   }
 
   private startProcessRoutingMonitor(request: ProxyConnectRequest, socksEndpoint: { host: string; port: number }): void {
@@ -1334,6 +1467,22 @@ export class XrayServiceBridge {
       this.appendDiagnostic(level, `Xray: ${boundedLine}`);
     }
     return true;
+  }
+
+  /**
+   * Per-connection routing decisions are useful for diagnosing a rule, but a
+   * busy browser opens hundreds of sockets, so the stream is capped.
+   */
+  private appendBoundedProxyDiagnostic(level: DiagnosticsEntry["level"], message: string): void {
+    if (this.proxyDiagnostics >= MAX_LOCAL_PROXY_DIAGNOSTICS) {
+      return;
+    }
+    this.proxyDiagnostics += 1;
+    if (this.proxyDiagnostics === MAX_LOCAL_PROXY_DIAGNOSTICS) {
+      this.appendDiagnostic("info", "Further local routing diagnostics are suppressed for this session.");
+      return;
+    }
+    this.appendDiagnostic(level, message);
   }
 
   private appendDiagnostic(level: DiagnosticsEntry["level"], message: string): void {
