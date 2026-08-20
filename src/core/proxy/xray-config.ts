@@ -40,9 +40,11 @@ export function buildXrayConfig(input: XrayConfigInput): string {
         listen: input.socksHost,
         port: input.socksPort,
         settings: {
-          // The supported desktop interception path is TCP-only. Do not keep
-          // an unused UDP association path alive inside Xray.
-          udp: false,
+          // Xray is the only transport that can carry UDP: SSH has no
+          // datagram channel. The association path is enabled here so the TUN
+          // dataplane can forward QUIC and other UDP through `UDP ASSOCIATE`;
+          // the inbound is loopback-only, so an idle association costs nothing.
+          udp: true,
           auth: "noauth"
         }
       },

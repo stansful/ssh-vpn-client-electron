@@ -713,6 +713,13 @@ function normalizeStore(input: AppStore): AppStore {
   const lastConnectedTransport = inputSettings.lastConnectedTransport === "xray" || inputSettings.lastConnectedTransport === "ssh"
     ? inputSettings.lastConnectedTransport
     : activeGlobalTab;
+  // A store from before the schema knew about tunnel-adapter capture cannot
+  // have a meaningful value for it, so the default applies instead of the
+  // stored one. Only this one field is reset; everything else is preserved.
+  const storedSchemaVersion = typeof input.schemaVersion === "number" ? input.schemaVersion : 0;
+  const tunDataplaneEnabled = storedSchemaVersion >= 2 && typeof inputSettings.tunDataplaneEnabled === "boolean"
+    ? inputSettings.tunDataplaneEnabled
+    : defaults.settings.tunDataplaneEnabled;
   const proxyProfiles = Array.isArray(input.proxyProfiles) ? input.proxyProfiles : [];
   assertStoredProxyProfileCapacity(proxyProfiles.length, 0);
   const routingRules = Array.isArray(input.routingRules) ? input.routingRules : [];
@@ -735,6 +742,7 @@ function normalizeStore(input: AppStore): AppStore {
       xrayConsentAccepted: inputSettings.xrayConsentAccepted ?? inputSettings.openSourceConsentAccepted ?? defaults.settings.xrayConsentAccepted,
       showXrayWarningOnEnter: inputSettings.showXrayWarningOnEnter ?? inputSettings.showOpenSourceWarningOnEnter ?? defaults.settings.showXrayWarningOnEnter,
       xrayRiskBannerExpanded: inputSettings.xrayRiskBannerExpanded ?? inputSettings.openSourceRiskBannerExpanded ?? defaults.settings.xrayRiskBannerExpanded,
+      tunDataplaneEnabled,
       customTheme: {
         ...defaults.settings.customTheme,
         ...inputSettings.customTheme

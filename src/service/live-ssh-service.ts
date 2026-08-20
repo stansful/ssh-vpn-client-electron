@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+import os from "node:os";
 import { RoutingMatcher, type RoutingMatcherSummary } from "../core/routing/routing-matcher.js";
 import { Socks5Proxy } from "../core/network/socks5-proxy.js";
 import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
@@ -21,6 +23,8 @@ import {
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/local-tcp-proxy.js";
 import { LocalRoutingEnforcer, type LocalRoutingContext } from "./local-routing-enforcement.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
+import { NativeDataplaneController, type DataplaneController } from "./native-dataplane.js";
+import { resolveProtectedAddresses, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
@@ -37,6 +41,10 @@ export interface LiveSshServiceBridgeOptions {
   nativeServiceExecutablePath?: string;
   /** Injection seam for tests; defaults to the native helper when a path is set. */
   processAttribution?: ProcessAttribution;
+  /** Injection seam for tests; defaults to the native helper when a path is set. */
+  dataplane?: DataplaneController;
+  /** Injection seam for tests; defaults to a DNS lookup of the config host. */
+  protectedAddressResolver?: (host: string) => Promise<string[]>;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
@@ -81,6 +89,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private processRoutingDnsWarningEmitted = false;
   private processRoutingDiscoveryStep = 0;
   private readonly processAttribution: ProcessAttribution | undefined;
+  private readonly dataplane: DataplaneController | undefined;
+  private readonly dataplaneJournalPath: string;
+  private readonly protectedAddressResolver: (host: string) => Promise<string[]>;
+  private tunRoutingActive = false;
   private readonly localRoutingEnforcer: LocalRoutingEnforcer;
   private localProcessEnforcement = false;
   private localRoutingContext: LocalRoutingContext | undefined;
@@ -102,6 +114,14 @@ export class LiveSshServiceBridge implements ServiceBridge {
           onDiagnostic: (level, message) => this.appendDiagnostic(level, message)
         })
       : undefined);
+    this.dataplane = options.dataplane ?? (options.nativeServiceExecutablePath
+      ? new NativeDataplaneController({
+          executablePath: options.nativeServiceExecutablePath,
+          onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message)
+        })
+      : undefined);
+    this.dataplaneJournalPath = path.join(options.pacDirectory ?? os.tmpdir(), TUN_ROUTING_JOURNAL_FILE);
+    this.protectedAddressResolver = options.protectedAddressResolver ?? resolveProtectedAddresses;
     this.localRoutingEnforcer = new LocalRoutingEnforcer(this.processAttribution);
     this.status = {
       ...initialStatus,
@@ -482,6 +502,9 @@ export class LiveSshServiceBridge implements ServiceBridge {
     });
     return this.enqueueMutation(async () => {
       await this.disconnectInternal(generation, "Application is quitting.");
+      // The dataplane goes last but must still go: an adapter left up on quit
+      // would keep capture routes pointing at a process that no longer exists.
+      await this.dataplane?.dispose().catch(() => undefined);
       await this.processAttribution?.dispose().catch(() => undefined);
     });
   }
@@ -705,6 +728,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
   private async stopRouting(): Promise<void> {
     this.stopProcessRoutingMonitor();
+    // The adapter owns the routing table, so it comes down before anything
+    // else: leaving capture routes pointing at a dead adapter takes the
+    // machine offline.
+    await this.stopTunRouting();
     this.localProcessEnforcement = false;
     this.localRoutingContext = undefined;
     this.clearProcessRoutingState();
@@ -734,6 +761,14 @@ export class LiveSshServiceBridge implements ServiceBridge {
     const generation = this.processRoutingGeneration;
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
     const hasProcessRouting = supportsDynamicProcessRouting(request);
+
+    // A TUN adapter is the only path that can hold a `process.name` rule
+    // against an application that ignores the Windows proxy setting, so it is
+    // tried first. Everything below is the fallback for a machine where it
+    // cannot come up.
+    if (await this.applyTunRouting(request, socksEndpoint, generation, allowConnecting)) {
+      return;
+    }
 
     // Per-process routing is enforced locally whenever the native helper can
     // attribute connections. Only when it cannot do we fall back to guessing an
@@ -854,6 +889,125 @@ export class LiveSshServiceBridge implements ServiceBridge {
    * selected domains, addresses and processes reach the tunnel. The configured
    * direct list is still honoured by the PAC itself and never reaches us.
    */
+  /**
+   * Puts the TUN adapter in front of the machine's traffic.
+   *
+   * Returns false, having changed nothing, whenever the adapter cannot be
+   * used. Falling back matters more than reporting: a machine that is not
+   * elevated still deserves the proxy path's partial protection rather than no
+   * routing at all.
+   */
+  private async applyTunRouting(
+    request: ConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number,
+    allowConnecting: boolean
+  ): Promise<boolean> {
+    const dataplane = this.dataplane;
+    if (!dataplane || request.tunDataplaneEnabled !== true || process.platform !== "win32") {
+      return false;
+    }
+
+    const availability = await dataplane.probe();
+    if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
+      return false;
+    }
+    if (!availability.available) {
+      this.appendDiagnostic(
+        "warning",
+        `TUN routing is unavailable, continuing on the Windows proxy path: ${availability.reason ?? "unknown reason"}`
+      );
+      return false;
+    }
+
+    // The helper must exclude the address this process actually reached the
+    // server on. The live socket's own peer address is authoritative: a fresh
+    // lookup of a multi-record hostname can answer differently and would leave
+    // the connection in use unprotected, which routes the tunnel into itself.
+    const connectedAddress = this.client?.serverAddress;
+    const resolved = await this.protectedAddressResolver(request.config.host);
+    const protectedAddresses = connectedAddress
+      ? [connectedAddress, ...resolved.filter((address) => address !== connectedAddress)]
+      : resolved;
+    if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
+      return false;
+    }
+    if (protectedAddresses.length === 0) {
+      // Capturing the default route without excluding the server would reset
+      // the transport's own connection the moment the routes go in, and leave
+      // the adapter black-holing everything it was meant to protect.
+      this.appendDiagnostic(
+        "warning",
+        `TUN routing is unavailable: no address could be resolved for ${request.config.host} to keep off the adapter. Continuing on the Windows proxy path.`
+      );
+      return false;
+    }
+
+    try {
+      await dataplane.start({
+        routingMode: request.routingMode,
+        routingRules: request.routingRules,
+        routingProxyDomains: request.routingProxyDomains,
+        routingDirectDomains: request.routingDirectDomains,
+        tunnelProxyEndpoint: `${socksEndpoint.host}:${socksEndpoint.port}`,
+        protectedAddresses,
+        protectedPort: request.config.port,
+        // The SSH connection protocol has no datagram channel, so a selected
+        // application's UDP is dropped by the helper rather than leaked. QUIC
+        // clients fall back to TCP, which is carried.
+        udpSupported: false,
+        enforceIpv6: true,
+        adapterName: TUN_ADAPTER_NAME,
+        journalPath: this.dataplaneJournalPath
+      });
+    } catch (error) {
+      this.appendDiagnostic(
+        "warning",
+        `TUN routing could not start, continuing on the Windows proxy path: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return false;
+    }
+
+    // With the adapter carrying traffic the Windows proxy setting must go:
+    // leaving it would hand proxy-aware applications a second, redundant path
+    // into the same listener, with different rules applied on the way.
+    try {
+      await this.systemProxy.restore();
+    } catch (error) {
+      this.appendDiagnostic(
+        "warning",
+        `Windows proxy restore after enabling TUN routing failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    this.tunRoutingActive = true;
+    // The local listener now only receives traffic the helper already decided
+    // to tunnel, so a second policy pass here would double-count the rules.
+    this.localProcessEnforcement = false;
+    this.localRoutingContext = undefined;
+    this.clearProcessRoutingState();
+    this.appendDiagnostic(
+      "info",
+      "TUN routing is active: every selected application's traffic is captured at the adapter, including UDP, which this transport drops rather than leaks."
+    );
+    return true;
+  }
+
+  private async stopTunRouting(): Promise<void> {
+    if (!this.dataplane || !this.tunRoutingActive) {
+      return;
+    }
+    this.tunRoutingActive = false;
+    try {
+      await this.dataplane.stop();
+    } catch (error) {
+      this.appendDiagnostic(
+        "error",
+        `TUN routing teardown failed; the machine may still be routing through a stale adapter: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
   private async applyLocallyEnforcedRouting(
     request: ConnectRequest,
     socksEndpoint: { host: string; port: number },
@@ -862,11 +1016,15 @@ export class LiveSshServiceBridge implements ServiceBridge {
     summary: RoutingMatcherSummary
   ): Promise<void> {
     this.clearProcessRoutingState();
+    // The direct list is deliberately withheld from the PAC here: the PAC runs
+    // before the listener and cannot see processes, so a direct-list entry
+    // there would carve holes in a selected application's traffic. It is
+    // applied per connection instead, after the process rule.
     const result = await this.systemProxy.apply({
       mode: "proxy-all",
       rules: request.routingRules,
       proxyDomains: request.routingProxyDomains,
-      directDomains: request.routingDirectDomains,
+      directDomains: [],
       socksHost: socksEndpoint.host,
       socksPort: socksEndpoint.port
     });
@@ -1551,6 +1709,7 @@ function buildLocalRoutingContext(request: ConnectRequest): LocalRoutingContext 
     routingMode: request.routingMode,
     routingRules: request.routingRules,
     routingProxyDomains: request.routingProxyDomains,
+    routingDirectDomains: request.routingDirectDomains,
     protectedEndpoint: { host: request.config.host, port: request.config.port }
   };
 }

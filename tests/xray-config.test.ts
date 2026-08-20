@@ -18,7 +18,9 @@ describe("xray config builder", () => {
 
     expect(config.inbounds[0]).toMatchObject({ protocol: "socks", port: 19080 });
     expect(config.inbounds[1]).toMatchObject({ protocol: "http", port: 19081 });
-    expect(config.inbounds[0]?.settings?.udp).toBe(false);
+    // Xray is the only transport with a datagram path, so its SOCKS inbound
+    // has to accept UDP ASSOCIATE for the TUN dataplane to forward QUIC.
+    expect(config.inbounds[0]?.settings?.udp).toBe(true);
     // PAC/SOCKS already supplies the destination and this client has a single
     // outbound, so protocol sniffing would only add per-connection DPI work.
     expect(config.inbounds.every((inbound) => inbound.sniffing === undefined)).toBe(true);

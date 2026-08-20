@@ -15,6 +15,14 @@ native/
     arm64/shadow-ssh-service
 ```
 
+Building requires a one-off dependency fetch, because the TUN dataplane pulls in a userspace
+network stack:
+
+```bash
+cd native/service-go && go mod download
+npm run native:build-service
+```
+
 The Electron main process resolves the active platform and architecture through `src/main/platform/targets.ts`.
 By default Electron uses the built-in live SSH service. Set `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1` to force Electron
 to start the matching native binary over `--stdio`.
@@ -22,7 +30,7 @@ to start the matching native binary over `--stdio`.
 Service contract:
 
 - local-only IPC endpoint;
-- commands: connect, disconnect, status, update config, update routing rules, check tunnel, open terminal, terminal input, list process connections;
+- commands: connect, disconnect, status, update config, update routing rules, check tunnel, open terminal, terminal input, list process connections, start dataplane, stop dataplane;
 - events: status changed, diagnostics appended, tunnel check result, terminal output, error;
 - privileged routing/core implementation per platform;
 - reusable custom SSH core shared by platform-specific service shells.

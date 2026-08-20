@@ -1,19 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import {
-  BoundedUtf8LineDecoder,
-  encodeWireMessage,
-  isNativeServiceHandshake,
-  MAX_SERVICE_STDERR_LINE_BYTES,
-  parseNativeProcessConnections,
-  requestTimeoutMs,
-  ServiceWireDecoder,
-  writeWithBackpressure,
-  type NativeServiceHandshake,
-  type ServiceCommand,
-  type ServiceResponsePayload,
-  type ServiceWireMessage
-} from "./local-ipc-protocol.js";
+import { NativeHelperClient } from "./native-helper-client.js";
 import { normalizeWindowsProcessName } from "../core/network/windows-process-connections.js";
 
 export interface ProcessAttribution {
@@ -64,7 +49,7 @@ export class NativeProcessAttribution implements ProcessAttribution {
   private queued: Promise<void> | undefined;
   private consecutiveFailures = 0;
   private disposed = false;
-  private helper: NativeAttributionHelper | undefined;
+  private helper: NativeHelperClient | undefined;
 
   constructor(private readonly options: NativeProcessAttributionOptions) {}
 
@@ -177,7 +162,7 @@ export class NativeProcessAttribution implements ProcessAttribution {
   }
 
   private async nativeSnapshot(): Promise<Map<number, string>> {
-    this.helper ??= await NativeAttributionHelper.start(this.options.executablePath);
+    this.helper ??= await startAttributionHelper(this.options.executablePath);
     const rows = await this.helper.listProcessConnections();
     const snapshot = new Map<number, string>();
     for (const row of rows) {
@@ -191,148 +176,19 @@ export class NativeProcessAttribution implements ProcessAttribution {
   }
 }
 
-/** Minimal stdio client for the native helper's read-only commands. */
-class NativeAttributionHelper {
-  private readonly decoder = new ServiceWireDecoder();
-  private readonly stderrDecoder = new BoundedUtf8LineDecoder(MAX_SERVICE_STDERR_LINE_BYTES, "Native helper stderr line");
-  private readonly pending = new Map<string, { resolve: (payload: ServiceResponsePayload | undefined) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
-  private writeQueue: Promise<void> = Promise.resolve();
-  private failed = false;
-  private disposed = false;
-
-  private constructor(private readonly child: ChildProcessWithoutNullStreams) {
-    this.child.stdout.on("data", (chunk: Buffer) => this.handleData(chunk));
-    // stderr is drained but discarded: the helper is advisory here, and its
-    // diagnostics must not be mistaken for tunnel diagnostics.
-    this.child.stderr.on("data", (chunk: Buffer) => {
-      try {
-        this.stderrDecoder.push(chunk);
-      } catch {
-        this.fail(new Error("Native helper stderr overflowed."));
-      }
-    });
-    this.child.stdin.on("error", (error: Error) => this.fail(error));
-    this.child.on("error", (error: Error) => this.fail(error));
-    this.child.on("exit", (code, signal) => this.fail(new Error(`Native helper exited (${signal ?? code ?? "unknown"}).`)));
+/**
+ * Starts a helper dedicated to attribution and checks that it can actually
+ * answer. A binary that starts but does not support the TCP table must not be
+ * reported as usable: routing would then send every connection to a listener
+ * that recognises no process at all.
+ */
+async function startAttributionHelper(executablePath: string): Promise<NativeHelperClient> {
+  const client = await NativeHelperClient.start(executablePath);
+  if (!client.handshake?.capabilities.processConnectionAttribution) {
+    await client.dispose();
+    throw new Error("Native helper does not support process connection attribution.");
   }
-
-  static async start(executablePath: string): Promise<NativeAttributionHelper> {
-    const child = spawn(executablePath, ["--stdio"], { env: process.env, stdio: "pipe", windowsHide: true });
-    const helper = new NativeAttributionHelper(child);
-    try {
-      const handshake = await helper.send<NativeServiceHandshake>({ id: randomUUID(), type: "get-capabilities" });
-      if (!isNativeServiceHandshake(handshake)) {
-        throw new Error("Native helper did not return a compatible capability handshake.");
-      }
-      if (!handshake.capabilities.processConnectionAttribution) {
-        throw new Error("Native helper does not support process connection attribution.");
-      }
-      return helper;
-    } catch (error) {
-      await helper.dispose();
-      throw error;
-    }
-  }
-
-  async listProcessConnections(): Promise<ReturnType<typeof parseNativeProcessConnections>> {
-    const payload = await this.send({ id: randomUUID(), type: "list-process-connections" });
-    return parseNativeProcessConnections(payload);
-  }
-
-  async dispose(): Promise<void> {
-    if (this.disposed) {
-      return;
-    }
-    this.disposed = true;
-    this.rejectAll(new Error("Native helper disposed."));
-    this.child.stdin.end();
-    if (this.child.exitCode === null && !this.child.killed) {
-      this.child.kill();
-    }
-  }
-
-  private send<TPayload extends ServiceResponsePayload>(command: ServiceCommand): Promise<TPayload | undefined> {
-    if (this.disposed || this.failed || this.child.exitCode !== null || this.child.killed) {
-      return Promise.reject(new Error("Native helper process is not running."));
-    }
-    const encoded = encodeWireMessage(authenticated(command));
-    return new Promise<TPayload | undefined>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.rejectPending(command.id, new Error(`Native helper ${command.type} request timed out.`));
-      }, requestTimeoutMs(command.type));
-      timer.unref();
-      this.pending.set(command.id, {
-        resolve: (payload) => resolve(payload as TPayload | undefined),
-        reject,
-        timer
-      });
-      const write = this.writeQueue.then(() => writeWithBackpressure(this.child.stdin, encoded));
-      this.writeQueue = write.catch(() => undefined);
-      void write.catch((error: unknown) => {
-        this.rejectPending(command.id, error instanceof Error ? error : new Error(String(error)));
-      });
-    });
-  }
-
-  private handleData(chunk: Buffer): void {
-    let messages: ServiceWireMessage[];
-    try {
-      messages = this.decoder.push(chunk);
-    } catch (error) {
-      this.fail(error instanceof Error ? error : new Error(String(error)));
-      return;
-    }
-    for (const message of messages) {
-      if (!("kind" in message) || message.kind !== "response") {
-        continue;
-      }
-      const pending = this.pending.get(message.id);
-      if (!pending) {
-        continue;
-      }
-      this.pending.delete(message.id);
-      clearTimeout(pending.timer);
-      if (message.ok) {
-        pending.resolve(message.payload);
-      } else {
-        pending.reject(new Error(message.error));
-      }
-    }
-  }
-
-  private fail(error: Error): void {
-    if (this.failed) {
-      return;
-    }
-    this.failed = true;
-    this.rejectAll(error);
-    if (this.child.exitCode === null && !this.child.killed) {
-      this.child.kill();
-    }
-  }
-
-  private rejectPending(id: string, error: Error): void {
-    const pending = this.pending.get(id);
-    if (!pending) {
-      return;
-    }
-    this.pending.delete(id);
-    clearTimeout(pending.timer);
-    pending.reject(error);
-  }
-
-  private rejectAll(error: Error): void {
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(error);
-    }
-    this.pending.clear();
-  }
-}
-
-function authenticated(command: ServiceCommand): ServiceCommand {
-  const authToken = process.env.SHADOW_SSH_SERVICE_TOKEN;
-  return authToken ? { ...command, authToken } : command;
+  return client;
 }
 
 function errorMessage(error: unknown): string {

@@ -9,7 +9,7 @@ import {
 } from "../shared/diagnostics-history.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import { utf8ByteLength } from "../shared/terminal-history.js";
-import type { ConnectRequest, PlatformTarget, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TunnelCheckResult } from "../shared/types.js";
+import type { ConnectRequest, PlatformTarget, RoutingMode, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TunnelCheckResult } from "../shared/types.js";
 
 export const SERVICE_PROTOCOL_VERSION = 1;
 export const MAX_SERVICE_WIRE_BYTES = 8 * 1024 * 1024;
@@ -22,6 +22,13 @@ export const MAX_SERVICE_AUTH_TOKEN_LENGTH = 1024;
 export const SERVICE_CONNECT_TIMEOUT_MS = 5_000;
 export const SERVICE_DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const SERVICE_LONG_REQUEST_TIMEOUT_MS = 90_000;
+/**
+ * Bringing the TUN dataplane up creates an adapter and rewrites the routing
+ * table through several `netsh` calls, any one of which can take seconds on a
+ * busy network stack. The default request timeout would abort a start that was
+ * about to succeed and leave the adapter half-configured.
+ */
+export const SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS = 60_000;
 
 export interface NativeServiceCapabilities {
   target: PlatformTarget;
@@ -61,6 +68,37 @@ export interface NativeProcessConnectionsPayload {
 
 export const MAX_NATIVE_PROCESS_CONNECTIONS = 20_000;
 
+/**
+ * Everything the native helper needs to put a TUN adapter in front of the
+ * machine's traffic.
+ *
+ * The transport itself stays in this process; the helper only intercepts. That
+ * is why the endpoint of the loopback proxy and the addresses of the server it
+ * is already connected to both have to be told to it: the helper must send
+ * selected traffic somewhere, and must keep the transport's own connection off
+ * the adapter it would otherwise be routed into.
+ */
+export interface DataplaneStartRequest {
+  routingMode: RoutingMode;
+  routingRules: RoutingRule[];
+  routingProxyDomains: string[];
+  routingDirectDomains: string[];
+  /** The transport's loopback SOCKS5 inbound, as `127.0.0.1:<port>`. */
+  tunnelProxyEndpoint: string;
+  /**
+   * The addresses this process actually connected the transport to. Resolving
+   * the hostname again inside the helper could produce a different answer and
+   * leave the live connection unprotected.
+   */
+  protectedAddresses: string[];
+  protectedPort: number;
+  /** Whether the active transport can carry datagrams at all. */
+  udpSupported: boolean;
+  enforceIpv6: boolean;
+  adapterName: string;
+  journalPath: string;
+}
+
 type VersionedWireMessage = { protocolVersion?: number };
 
 const SERVICE_COMMAND_TYPES = new Set([
@@ -76,6 +114,8 @@ const SERVICE_COMMAND_TYPES = new Set([
   "update-routing-rules",
   "update-routing",
   "list-process-connections",
+  "start-dataplane",
+  "stop-dataplane",
   "shutdown"
 ]);
 const SERVICE_EVENT_TYPES = new Set([
@@ -103,6 +143,8 @@ export type ServiceCommand = VersionedWireMessage & { id: string; authToken?: st
   | { type: "update-routing-rules"; payload: { rules: RoutingRule[] } }
   | { type: "update-routing"; payload: RoutingUpdateRequest }
   | { type: "list-process-connections" }
+  | { type: "start-dataplane"; payload: DataplaneStartRequest }
+  | { type: "stop-dataplane" }
   | { type: "shutdown" }
 );
 
@@ -260,6 +302,9 @@ export class ServiceWireDecoder {
 export function requestTimeoutMs(commandType: ServiceCommand["type"]): number {
   if (commandType === "connect") {
     return SERVICE_LONG_REQUEST_TIMEOUT_MS;
+  }
+  if (commandType === "start-dataplane" || commandType === "stop-dataplane") {
+    return SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS;
   }
   return commandType === "get-status" || commandType === "get-capabilities"
     ? SERVICE_CONNECT_TIMEOUT_MS

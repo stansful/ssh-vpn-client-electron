@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"shadowssh/service/internal/dataplane"
 	"shadowssh/service/internal/platform"
 	"shadowssh/service/internal/protocol"
 	"shadowssh/service/internal/routing"
@@ -18,6 +20,9 @@ type Options struct {
 	AuthToken string
 	Driver    platform.Driver
 	Transport string
+	// LogDiagnostic receives dataplane progress and failures. Defaults to
+	// stderr, which the Electron side already surfaces as diagnostics.
+	LogDiagnostic func(level string, message string)
 }
 
 type App struct {
@@ -32,6 +37,15 @@ type App struct {
 	routingDirectDomains []string
 	checkEndpoint        string
 	shuttingDown         bool
+
+	// The dataplane has its own mutex: bringing an adapter up takes seconds of
+	// netsh calls, and holding the state lock across that would block status
+	// reads the UI polls throughout.
+	dataplaneMu        sync.Mutex
+	dataplane          *dataplane.Runner
+	dataplanePolicy    *dataplane.Policy
+	dataplaneSignature string
+	logDiagnostic      func(level string, message string)
 }
 
 func New(options Options) *App {
@@ -54,11 +68,22 @@ func New(options Options) *App {
 		RealTunnelAvailable: false,
 	}
 
+	logDiagnostic := options.LogDiagnostic
+	if logDiagnostic == nil {
+		// Every line the helper writes to stderr is turned into a warning
+		// diagnostic by the Electron side, so an unconfigured sink still
+		// reaches the user rather than disappearing.
+		logDiagnostic = func(level string, message string) {
+			fmt.Fprintf(os.Stderr, "dataplane %s: %s\n", level, message)
+		}
+	}
+
 	return &App{
-		authToken:   options.AuthToken,
-		driver:      driver,
-		status:      status,
-		routingMode: routing.ModeSelectedRules,
+		authToken:     options.AuthToken,
+		driver:        driver,
+		status:        status,
+		routingMode:   routing.ModeSelectedRules,
+		logDiagnostic: logDiagnostic,
 	}
 }
 
@@ -107,6 +132,10 @@ func (a *App) HandleCommand(ctx context.Context, command protocol.Command) proto
 		return a.handleUpdateRoutingRules(command)
 	case "update-routing":
 		return a.handleUpdateRouting(command)
+	case "start-dataplane":
+		return a.handleStartDataplane(ctx, command)
+	case "stop-dataplane":
+		return a.handleStopDataplane(ctx, command)
 	case "list-process-connections":
 		return a.handleListProcessConnections(ctx, command)
 	case "shutdown":
@@ -119,6 +148,13 @@ func (a *App) HandleCommand(ctx context.Context, command protocol.Command) proto
 func (a *App) Shutdown(ctx context.Context) error {
 	a.mutationMu.Lock()
 	defer a.mutationMu.Unlock()
+	// The dataplane owns routing-table changes, so it comes down before
+	// anything else: leaving capture routes behind would take the machine
+	// offline.
+	if err := a.stopDataplane(ctx); err != nil {
+		a.setRoutingCleanupError(err)
+		return err
+	}
 	if err := a.clearRoutingAndSetDisconnected(ctx, "Native service stopped."); err != nil {
 		a.setRoutingCleanupError(err)
 		return err
@@ -192,6 +228,13 @@ func (a *App) handleConnect(ctx context.Context, command protocol.Command) proto
 }
 
 func (a *App) handleDisconnect(ctx context.Context, command protocol.Command) protocol.CommandResult {
+	if err := a.stopDataplane(ctx); err != nil {
+		status := a.setRoutingCleanupError(err)
+		return protocol.CommandResult{
+			Response: protocol.Error(command.ID, fmt.Errorf("stop dataplane: %w", err)),
+			Events:   []any{statusChanged(status), diagnostic("error", "TUN dataplane teardown failed: "+err.Error())},
+		}
+	}
 	if err := a.clearRoutingAndSetDisconnected(ctx, "Disconnected."); err != nil {
 		status := a.setRoutingCleanupError(err)
 		return protocol.CommandResult{
@@ -205,6 +248,17 @@ func (a *App) handleDisconnect(ctx context.Context, command protocol.Command) pr
 }
 
 func (a *App) handleShutdown(command protocol.Command) protocol.CommandResult {
+	// The dataplane owns the routing table. Skipping it here - as an earlier
+	// version did - meant a client-initiated shutdown left the transport's host
+	// route and the journal behind, and main.go then suppressed the deferred
+	// Shutdown that would have cleaned them up.
+	if err := a.stopDataplane(context.Background()); err != nil {
+		status := a.setRoutingCleanupError(err)
+		return protocol.CommandResult{
+			Response: protocol.Error(command.ID, fmt.Errorf("stop dataplane before shutdown: %w", err)),
+			Events:   []any{statusChanged(status), diagnostic("error", "Native service shutdown refused because the TUN dataplane did not stop: "+err.Error())},
+		}
+	}
 	if err := a.clearRoutingAndSetDisconnected(context.Background(), "Native service stopped."); err != nil {
 		status := a.setRoutingCleanupError(err)
 		return protocol.CommandResult{
@@ -383,7 +437,7 @@ func cleanupContext(parent context.Context) (context.Context, context.CancelFunc
 
 func isStateChangingCommand(commandType string) bool {
 	switch commandType {
-	case "connect", "disconnect", "open-terminal", "close-terminal", "terminal-input", "update-config", "update-routing-rules", "update-routing", "shutdown":
+	case "connect", "disconnect", "open-terminal", "close-terminal", "terminal-input", "update-config", "update-routing-rules", "update-routing", "start-dataplane", "stop-dataplane", "shutdown":
 		return true
 	default:
 		return false

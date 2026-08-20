@@ -135,6 +135,11 @@ export class SshLiveClient {
     this.transport.onEvent((event) => this.handleTransportEvent(event));
   }
 
+  /** The address this session's TCP socket is connected to. */
+  get serverAddress(): string | undefined {
+    return this.transport.remoteAddress;
+  }
+
   static async connect(options: SshLiveClientOptions): Promise<SshLiveClient> {
     let transport: SshSocketTransport | undefined;
     try {

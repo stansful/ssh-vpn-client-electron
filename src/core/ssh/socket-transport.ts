@@ -119,6 +119,18 @@ export class SshSocketTransport {
     return new SshSocketTransport(socket, limits);
   }
 
+  /**
+   * The address the socket actually connected to.
+   *
+   * A hostname with several records resolves differently from one attempt to
+   * the next, so anything that has to exclude "the server we are talking to" -
+   * the TUN dataplane's host route above all - needs the address in use rather
+   * than a fresh lookup that may answer differently.
+   */
+  get remoteAddress(): string | undefined {
+    return this.socket.remoteAddress ?? undefined;
+  }
+
   onEvent(listener: (event: SshPacketTransportEvent) => void): () => void {
     this.events.on("event", listener);
     return () => this.events.off("event", listener);

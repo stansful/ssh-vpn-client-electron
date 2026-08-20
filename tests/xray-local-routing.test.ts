@@ -5,8 +5,11 @@ import { XrayServiceBridge } from "../src/service/xray-service.js";
 import type { ProcessAttribution } from "../src/service/process-attribution.js";
 import type { ProxyConnectRequest, RoutingRule, RuntimeStatus } from "../src/shared/types.js";
 
-const TARGET_APP_PORT = 41_001;
-const OTHER_APP_PORT = 41_002;
+// Each connection binds an explicit source port so it can be attributed, and a
+// port cannot be rebound while its previous socket lingers in TIME_WAIT - so
+// every case gets its own.
+const TARGET_APP_PORTS = [41_001, 41_003, 41_005];
+const OTHER_APP_PORTS = [41_002, 41_004, 41_006];
 const VIA_TUNNEL = "VIA-TUNNEL";
 const DIRECT_EXIT = "DIRECT-EXIT";
 
@@ -97,16 +100,21 @@ describe("Xray transport with local per-process routing", () => {
         const listener = { host: applied!.socksHost, port: applied!.socksPort };
 
         // A domain rule applies whichever process opened the connection.
-        await expect(connectThrough(listener, "www.youtube.com", 443, OTHER_APP_PORT)).resolves.toContain(VIA_TUNNEL);
+        await expect(connectThrough(listener, "www.youtube.com", 443, OTHER_APP_PORTS[0])).resolves.toContain(VIA_TUNNEL);
         expect(upstreamTargets).toContain("www.youtube.com:443");
 
         // A process rule covers a host that no rule names and no DNS cache
         // could have revealed - previously impossible on this transport.
-        await expect(connectThrough(listener, "cdn.telegram-cdn.test", 443, TARGET_APP_PORT)).resolves.toContain(VIA_TUNNEL);
+        await expect(connectThrough(listener, "cdn.telegram-cdn.test", 443, TARGET_APP_PORTS[0])).resolves.toContain(VIA_TUNNEL);
         expect(upstreamTargets).toContain("cdn.telegram-cdn.test:443");
 
+        // A process rule means "everything this application sends", so even a
+        // host on the curated direct list must still be tunnelled.
+        await expect(connectThrough(listener, "lk.gosuslugi.ru", 443, TARGET_APP_PORTS[1])).resolves.toContain(VIA_TUNNEL);
+        expect(upstreamTargets).toContain("lk.gosuslugi.ru:443");
+
         const tunnelledBefore = upstreamTargets.length;
-        await expect(connectThrough(listener, "127.0.0.1", directPort, OTHER_APP_PORT)).resolves.toContain(DIRECT_EXIT);
+        await expect(connectThrough(listener, "127.0.0.1", directPort, OTHER_APP_PORTS[1])).resolves.toContain(DIRECT_EXIT);
         expect(upstreamTargets).toHaveLength(tunnelledBefore);
       } finally {
         await service.dispose();
@@ -139,7 +147,7 @@ function createService(
 ): XrayServiceBridge {
   const attribution: ProcessAttribution = {
     isAvailable: async () => attributionAvailable,
-    resolveProcessName: async (localPort) => (localPort === TARGET_APP_PORT ? "telegram.exe" : "chrome.exe"),
+    resolveProcessName: async (localPort) => (TARGET_APP_PORTS.includes(localPort) ? "telegram.exe" : "chrome.exe"),
     dispose: async () => undefined
   };
   return new XrayServiceBridge(initialStatus(), {
@@ -285,7 +293,7 @@ function connectRequest(): ProxyConnectRequest {
     routingMode: "selected-rules",
     routingRules: routingRules(),
     routingProxyDomains: [],
-    routingDirectDomains: [],
+    routingDirectDomains: ["gosuslugi.ru"],
     checkEndpoint: "example.com:443",
     secrets: {} as ProxyConnectRequest["secrets"]
   };

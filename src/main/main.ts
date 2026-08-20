@@ -874,6 +874,7 @@ async function connect(expectedGeneration?: number): Promise<boolean> {
     routingProxyDomains: activeRoutingProxyDomains(),
     routingDirectDomains: activeRoutingDirectDomains(),
     checkEndpoint: store.settings.checkEndpoint,
+    tunDataplaneEnabled: store.settings.tunDataplaneEnabled,
     secrets: storage.resolveServiceSecrets(config)
   };
   return requestTransportIntent(async (generation) => {
@@ -917,6 +918,7 @@ async function connectProxy(expectedGeneration?: number): Promise<boolean> {
     routingProxyDomains: activeRoutingProxyDomains(),
     routingDirectDomains: activeRoutingDirectDomains(),
     checkEndpoint: store.settings.checkEndpoint,
+    tunDataplaneEnabled: store.settings.tunDataplaneEnabled,
     secrets: storage.resolveProxySecrets(profile)
   };
   return requestTransportIntent(async (generation) => {
@@ -1054,7 +1056,8 @@ async function applyRoutingConfigurationAfterMutation(): Promise<void> {
       routingRules: store.routingRules,
       routingProxyDomains: activeRoutingProxyDomains(),
       routingDirectDomains: activeRoutingDirectDomains(),
-      checkEndpoint: store.settings.checkEndpoint
+      checkEndpoint: store.settings.checkEndpoint,
+      tunDataplaneEnabled: store.settings.tunDataplaneEnabled
     });
   });
 }

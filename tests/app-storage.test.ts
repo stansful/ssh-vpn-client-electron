@@ -190,6 +190,50 @@ describe("AppStorage persistence", () => {
     }
   });
 
+  it("turns tunnel-adapter capture on for stores written before the setting worked", async () => {
+    // The build that first shipped the setting persisted it as `false` and
+    // could never act on it - the native helper crashed at start-up - so that
+    // stored value records nothing the user chose. Everything else in the old
+    // store must survive.
+    const dir = await makeTempDir(cleanupDirs);
+    const legacy = createDefaultStore();
+    await writeFile(
+      path.join(dir, "app-store.v1.json"),
+      JSON.stringify({
+        ...legacy,
+        schemaVersion: 1,
+        settings: { ...legacy.settings, tunDataplaneEnabled: false, checkEndpoint: "example.com:443" }
+      }),
+      "utf8"
+    );
+
+    const storage = new AppStorage(dir);
+    await storage.init();
+
+    expect(storage.getSettings().tunDataplaneEnabled).toBe(true);
+    expect(storage.getSettings().checkEndpoint).toBe("example.com:443");
+    expect(storage.getStore().schemaVersion).toBe(2);
+  });
+
+  it("keeps a tunnel-adapter choice made after the migration", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const current = createDefaultStore();
+    await writeFile(
+      path.join(dir, "app-store.v1.json"),
+      JSON.stringify({
+        ...current,
+        schemaVersion: 2,
+        settings: { ...current.settings, tunDataplaneEnabled: false }
+      }),
+      "utf8"
+    );
+
+    const storage = new AppStorage(dir);
+    await storage.init();
+
+    expect(storage.getSettings().tunDataplaneEnabled).toBe(false);
+  });
+
   it("does not atomically rewrite unchanged stores on subsequent startup", async () => {
     const dir = await makeTempDir(cleanupDirs);
     const first = new AppStorage(dir);

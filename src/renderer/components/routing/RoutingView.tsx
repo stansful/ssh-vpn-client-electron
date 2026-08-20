@@ -1,4 +1,4 @@
-import { Copy, Download, ExternalLink, FileText, ListFilter, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
+import { Copy, Download, ExternalLink, FileText, Info, ListFilter, Plus, RefreshCw, Route, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
 import { useEffect, useMemo, useState, type ChangeEvent, type Dispatch, type SetStateAction } from "react";
 import { placeholderForRule, routingSaveLabel } from "../../lib/labels.js";
 import { nextRenderPageCount, sliceRenderPage } from "../../lib/render-page.js";
@@ -20,6 +20,9 @@ export function RoutingView({
   directList,
   processSearch,
   enabledCount,
+  tunDataplaneEnabled,
+  tunDataplaneSupported,
+  onTunDataplaneEnabledChange,
   onRuleTabChange,
   onRuleSearchChange,
   onRuleValueChange,
@@ -47,6 +50,9 @@ export function RoutingView({
   directList: RoutingDirectList;
   processSearch: string;
   enabledCount: number;
+  tunDataplaneEnabled: boolean;
+  tunDataplaneSupported: boolean;
+  onTunDataplaneEnabledChange: (enabled: boolean) => void;
   onRuleTabChange: Dispatch<SetStateAction<RoutingRuleType>>;
   onRuleSearchChange: Dispatch<SetStateAction<string>>;
   onRuleValueChange: Dispatch<SetStateAction<string>>;
@@ -207,6 +213,40 @@ export function RoutingView({
           <button type="button" className="primary-button" onClick={onAddRule}><Plus size={16} /> Add</button>
         </div>
         {ruleError && <div className="inline-error" role="alert">{ruleError}</div>}
+
+        {ruleTab === "process.name" && tunDataplaneSupported && (
+          <div className="routing-capture">
+            <label className="switch-row">
+              <input
+                type="checkbox"
+                checked={tunDataplaneEnabled}
+                onChange={(event) => onTunDataplaneEnabledChange(event.target.checked)}
+              />
+              <span>Capture traffic with a tunnel adapter (TUN)</span>
+            </label>
+            <p>
+              The Windows proxy setting is advisory and TCP-only, so an application with its own proxy stack or a
+              QUIC socket - Telegram, Discord voice, a browser reaching Google over QUIC - connects directly no
+              matter which process rule selects it. A tunnel adapter owns the routes instead, so the system hands
+              over its packets either way.
+            </p>
+            <p>
+              Needs <strong>wintun.dll</strong> next to the app and the app started <strong>as administrator</strong>.
+              Without either, the connection falls back to the proxy path and says so in Diagnostics.
+            </p>
+          </div>
+        )}
+
+        {ruleTab === "process.name" && (
+          <p className="routing-note" role="note">
+            <Info size={16} aria-hidden="true" />
+            <span>
+              A process rule routes every TCP connection that application makes. UDP is different per transport:
+              Xray carries it, SSH has no datagram channel and cannot. QUIC clients fall back to TCP when UDP is
+              unavailable, so their traffic still enters the tunnel.
+            </span>
+          </p>
+        )}
 
         {ruleTab === "process.name" && (
           <div className="process-picker">

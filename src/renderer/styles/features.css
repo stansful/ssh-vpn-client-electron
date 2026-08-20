@@ -696,6 +696,51 @@
   max-width: 560px;
 }
 
+.routing-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-alt);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.routing-note svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* The capture toggle sits with the process rules it changes, not in Settings:
+   a rule that cannot reach its application is the problem it solves, and the
+   two are read together. */
+.routing-capture {
+  margin: 12px 0 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-alt);
+}
+
+.routing-capture .switch-row {
+  margin: 0;
+}
+
+.routing-capture p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.routing-capture p + p {
+  margin-top: 6px;
+}
+
 .process-picker {
   margin: 12px 0;
   padding: 14px;

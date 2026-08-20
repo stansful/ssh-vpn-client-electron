@@ -30,3 +30,8 @@ func (unsupportedDriver) ClearRouting(context.Context) error {
 func (unsupportedDriver) ListProcessConnections(context.Context) ([]ProcessConnection, error) {
 	return nil, ErrUnsupportedPlatform
 }
+
+// ListConnections is unavailable off Windows.
+func ListConnections() ([]ProcessConnection, error) {
+	return nil, ErrUnsupportedPlatform
+}

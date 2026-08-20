@@ -1,6 +1,12 @@
 import type { AppSettings, AppStore, CustomTheme, PlatformTarget, RuntimeStatus } from "./types.js";
 
-export const STORE_SCHEMA_VERSION = 1;
+/**
+ * Version 2 turns tunnel-adapter capture on for stores written before it
+ * existed. The first build to ship the setting wrote it as `false` and could
+ * never act on it - the native helper crashed at start-up - so a stored `false`
+ * from that build records nothing the user decided.
+ */
+export const STORE_SCHEMA_VERSION = 2;
 export const RUSSIA_INSIDE_PROXY_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst";
 export const RUSSIA_OUTSIDE_DIRECT_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst";
 
@@ -33,7 +39,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   lastConnectedTransport: "ssh",
   xrayConsentAccepted: false,
   showXrayWarningOnEnter: true,
-  xrayRiskBannerExpanded: true
+  xrayRiskBannerExpanded: true,
+  tunDataplaneEnabled: true
 };
 
 export function createDefaultStore(): AppStore {

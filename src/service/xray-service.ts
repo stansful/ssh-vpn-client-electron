@@ -24,6 +24,8 @@ import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/
 import { Socks5Proxy } from "../core/network/socks5-proxy.js";
 import { openSocks5UpstreamChannel } from "../core/network/socks5-upstream.js";
 import { LocalRoutingEnforcer, type LocalRoutingContext } from "./local-routing-enforcement.js";
+import { NativeDataplaneController, type DataplaneController } from "./native-dataplane.js";
+import { resolveProtectedAddresses, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { buildXrayConfig } from "../core/proxy/xray-config.js";
 import type { ServiceEvent } from "../shared/ipc.js";
@@ -49,6 +51,10 @@ export interface XrayServiceBridgeOptions {
   nativeServiceExecutablePath?: string;
   /** Injection seam for tests; defaults to the native helper when a path is set. */
   processAttribution?: ProcessAttribution;
+  /** Injection seam for tests; defaults to the native helper when a path is set. */
+  dataplane?: DataplaneController;
+  /** Injection seam for tests; defaults to a DNS lookup of the profile host. */
+  protectedAddressResolver?: (host: string) => Promise<string[]>;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
@@ -99,6 +105,10 @@ export class XrayServiceBridge {
   private processRoutingDnsWarningEmitted = false;
   private processRoutingDiscoveryStep = 0;
   private readonly processAttribution: ProcessAttribution | undefined;
+  private readonly dataplane: DataplaneController | undefined;
+  private readonly dataplaneJournalPath: string;
+  private readonly protectedAddressResolver: (host: string) => Promise<string[]>;
+  private tunRoutingActive = false;
   private readonly localRoutingEnforcer: LocalRoutingEnforcer;
   private localRoutingContext: LocalRoutingContext | undefined;
   private localProxy: Socks5Proxy | undefined;
@@ -122,6 +132,14 @@ export class XrayServiceBridge {
           onDiagnostic: (level, message) => this.appendDiagnostic(level, message)
         })
       : undefined);
+    this.dataplane = options.dataplane ?? (options.nativeServiceExecutablePath
+      ? new NativeDataplaneController({
+          executablePath: options.nativeServiceExecutablePath,
+          onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message)
+        })
+      : undefined);
+    this.dataplaneJournalPath = path.join(options.pacDirectory ?? options.runtimeDirectory, TUN_ROUTING_JOURNAL_FILE);
+    this.protectedAddressResolver = options.protectedAddressResolver ?? resolveProtectedAddresses;
     this.localRoutingEnforcer = new LocalRoutingEnforcer(this.processAttribution);
     this.runtimeDirectory = options.runtimeDirectory;
     this.configPath = path.join(this.runtimeDirectory, "xray-config.json");
@@ -370,7 +388,13 @@ export class XrayServiceBridge {
       realTunnelAvailable: false,
       message: "Disconnecting Xray transport."
     });
-    return this.enqueueMutation(() => this.disconnectInternal(generation));
+    return this.enqueueMutation(async () => {
+      await this.disconnectInternal(generation);
+      // An adapter left up on quit would keep capture routes pointing at a
+      // process that no longer exists.
+      await this.dataplane?.dispose().catch(() => undefined);
+      await this.processAttribution?.dispose().catch(() => undefined);
+    });
   }
 
   private async disconnectInternal(generation: number): Promise<void> {
@@ -557,8 +581,118 @@ export class XrayServiceBridge {
     this.processRoutingDnsWarningEmitted = false;
   }
 
+  /**
+   * Puts the TUN adapter in front of the machine's traffic.
+   *
+   * Unlike the SSH transport, the helper is pointed straight at Xray's own
+   * SOCKS inbound: it speaks `UDP ASSOCIATE`, so a selected application's
+   * datagrams - Discord voice, QUIC - are carried rather than dropped, and no
+   * listener of ours needs to sit in between.
+   *
+   * Returns false, having changed nothing, when the adapter cannot be used.
+   */
+  private async applyTunRouting(
+    request: ProxyConnectRequest,
+    socksEndpoint: { host: string; port: number },
+    generation: number
+  ): Promise<boolean> {
+    const dataplane = this.dataplane;
+    if (!dataplane || request.tunDataplaneEnabled !== true || process.platform !== "win32") {
+      return false;
+    }
+
+    const availability = await dataplane.probe();
+    if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+      return false;
+    }
+    if (!availability.available) {
+      this.appendDiagnostic(
+        "warning",
+        `TUN routing is unavailable, continuing on the Windows proxy path: ${availability.reason ?? "unknown reason"}`
+      );
+      return false;
+    }
+
+    // Xray opens its own outbound socket, so this process cannot observe the
+    // address in use; every address the name resolves to is excluded instead.
+    const protectedAddresses = await this.protectedAddressResolver(request.profile.host);
+    if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
+      return false;
+    }
+    if (protectedAddresses.length === 0) {
+      this.appendDiagnostic(
+        "warning",
+        `TUN routing is unavailable: no address could be resolved for ${request.profile.host} to keep off the adapter. Continuing on the Windows proxy path.`
+      );
+      return false;
+    }
+
+    try {
+      await dataplane.start({
+        routingMode: request.routingMode,
+        routingRules: request.routingRules,
+        routingProxyDomains: request.routingProxyDomains,
+        routingDirectDomains: request.routingDirectDomains,
+        tunnelProxyEndpoint: `${socksEndpoint.host}:${socksEndpoint.port}`,
+        protectedAddresses,
+        protectedPort: request.profile.port,
+        udpSupported: true,
+        enforceIpv6: true,
+        adapterName: TUN_ADAPTER_NAME,
+        journalPath: this.dataplaneJournalPath
+      });
+    } catch (error) {
+      this.appendDiagnostic(
+        "warning",
+        `TUN routing could not start, continuing on the Windows proxy path: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return false;
+    }
+
+    // Our own listener and the Windows proxy setting are both redundant now
+    // and would apply the rules a second time on a path the adapter already
+    // decided.
+    await this.stopLocalProxy();
+    try {
+      await this.systemProxy.restore();
+    } catch (error) {
+      this.appendDiagnostic(
+        "warning",
+        `Windows proxy restore after enabling TUN routing failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    this.tunRoutingActive = true;
+    this.localRoutingContext = undefined;
+    this.clearProcessRoutingState();
+    this.appendDiagnostic(
+      "info",
+      "TUN routing is active: every selected application's traffic is captured at the adapter, including UDP."
+    );
+    return true;
+  }
+
+  private async stopTunRouting(): Promise<void> {
+    if (!this.dataplane || !this.tunRoutingActive) {
+      return;
+    }
+    this.tunRoutingActive = false;
+    try {
+      await this.dataplane.stop();
+    } catch (error) {
+      this.appendDiagnostic(
+        "error",
+        `TUN routing teardown failed; the machine may still be routing through a stale adapter: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
   private async stopRouting(): Promise<void> {
     this.stopProcessRoutingMonitor();
+    // The adapter owns the routing table, so it comes down before anything
+    // else: leaving capture routes pointing at a dead adapter takes the
+    // machine offline.
+    await this.stopTunRouting();
     await this.stopLocalProxy();
     this.clearProcessRoutingState();
     try {
@@ -690,8 +824,16 @@ export class XrayServiceBridge {
     const context: LocalRoutingContext = {
       routingMode: request.routingMode,
       routingRules: request.routingRules,
-      routingProxyDomains: request.routingProxyDomains
+      routingProxyDomains: request.routingProxyDomains,
+      routingDirectDomains: request.routingDirectDomains
     };
+    // The adapter is tried first: it is the only path that holds a
+    // `process.name` rule against an application that ignores the Windows
+    // proxy setting, and the only one that can carry that application's UDP.
+    if (await this.applyTunRouting(request, socksEndpoint, generation)) {
+      return;
+    }
+
     if (await this.localRoutingEnforcer.isEnforceable(context)) {
       if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
         return;
@@ -817,11 +959,15 @@ export class XrayServiceBridge {
       return;
     }
 
+    // The direct list is deliberately withheld from the PAC here: the PAC runs
+    // before the listener and cannot see processes, so a direct-list entry
+    // there would carve holes in a selected application's traffic. It is
+    // applied per connection instead, after the process rule.
     const result = await this.systemProxy.apply({
       mode: "proxy-all",
       rules: request.routingRules,
       proxyDomains: request.routingProxyDomains,
-      directDomains: request.routingDirectDomains,
+      directDomains: [],
       socksHost: endpoint.host,
       socksPort: endpoint.port
     });

@@ -128,6 +128,17 @@ export interface AppSettings {
   xrayConsentAccepted: boolean;
   showXrayWarningOnEnter: boolean;
   xrayRiskBannerExpanded: boolean;
+  /**
+   * Routes traffic through a TUN adapter instead of the Windows user proxy.
+   *
+   * The proxy setting is advisory and TCP-only, so an application that ignores
+   * it - Telegram, Discord voice, anything speaking QUIC - leaves directly no
+   * matter what a `process.name` rule says. The adapter owns the routes, so the
+   * OS hands the packets over regardless. It needs administrator rights, which
+   * a portable build only has if the user started it that way, so this stays
+   * opt-in and falls back to the proxy path when it cannot come up.
+   */
+  tunDataplaneEnabled: boolean;
   updateCheckCache?: AppUpdateCheckCache;
 }
 
@@ -284,6 +295,8 @@ export interface ConnectRequest {
   routingProxyDomains: string[];
   routingDirectDomains: string[];
   checkEndpoint: string;
+  /** Mirrors `AppSettings.tunDataplaneEnabled` for this connection. */
+  tunDataplaneEnabled?: boolean;
   secrets?: SshServiceSecrets;
 }
 
@@ -291,6 +304,8 @@ export interface ProxyConnectRequest {
   profile: ProxyProfile;
   routingMode: RoutingMode;
   routingRules: RoutingRule[];
+  /** Mirrors `AppSettings.tunDataplaneEnabled` for this connection. */
+  tunDataplaneEnabled?: boolean;
   routingProxyDomains: string[];
   routingDirectDomains: string[];
   checkEndpoint: string;
@@ -303,6 +318,7 @@ export interface RoutingUpdateRequest {
   routingProxyDomains: string[];
   routingDirectDomains: string[];
   checkEndpoint: string;
+  tunDataplaneEnabled?: boolean;
 }
 
 export interface ProxyServiceSecrets {

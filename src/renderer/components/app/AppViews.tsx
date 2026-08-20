@@ -188,6 +188,9 @@ export function AppViews({
         directList={store.routingDirectList}
         processSearch={routing.processSearch}
         enabledCount={routing.enabledCount}
+        tunDataplaneEnabled={store.settings.tunDataplaneEnabled}
+        tunDataplaneSupported={runtime?.platformTarget.platform === "windows"}
+        onTunDataplaneEnabledChange={(tunDataplaneEnabled) => updateSettings({ tunDataplaneEnabled })}
         onRuleTabChange={routing.setRuleTab}
         onRuleSearchChange={routing.setRuleSearch}
         onRuleValueChange={routing.setRuleValue}

@@ -16,6 +16,11 @@ export interface LocalRoutingContext {
   routingRules: RoutingRule[];
   routingProxyDomains?: string[];
   /**
+   * Evaluated locally rather than in the PAC, so that it cannot pre-empt an
+   * explicit process rule. See {@link LocalRoutingEnforcer.decide}.
+   */
+  routingDirectDomains?: string[];
+  /**
    * The transport's own server endpoint. It must never be routed back into the
    * tunnel it carries, which would deadlock the transport.
    */
@@ -44,7 +49,9 @@ export class LocalRoutingEnforcer {
   private policyCache: {
     context: LocalRoutingContext;
     policy: TrafficPolicy;
+    processNames: ReadonlySet<string>;
     proxyListSuffixes: ReadonlySet<string>;
+    directListSuffixes: ReadonlySet<string>;
   } | undefined;
 
   constructor(private readonly attribution: ProcessAttribution | undefined) {}
@@ -65,13 +72,25 @@ export class LocalRoutingEnforcer {
     return (await this.attribution?.isAvailable()) === true;
   }
 
+  /**
+   * Order matters here.
+   *
+   * A `process.name` rule means "route everything this application sends", so
+   * it is evaluated before the direct list and cannot be pre-empted by it. That
+   * is also why the direct list is applied here instead of in the PAC: the PAC
+   * runs before the listener and has no process context, so a direct-list entry
+   * there would silently carve holes in a selected application's traffic.
+   *
+   * The transport's own endpoint stays excluded regardless, because routing it
+   * into the tunnel it carries would deadlock the transport.
+   */
   async decide(
     context: LocalRoutingContext,
     target: DirectTcpIpTarget,
     originator: { address: string; port: number }
   ): Promise<LocalRoutingDecision> {
     const processName = await this.attribution?.resolveProcessName(originator.port);
-    const { policy, proxyListSuffixes } = this.compile(context);
+    const { policy, processNames, proxyListSuffixes, directListSuffixes } = this.compile(context);
     const destination = describeDestination(target.host);
     const decision = policy.decide("tcp", {
       ...destination,
@@ -81,6 +100,9 @@ export class LocalRoutingEnforcer {
 
     if (decision.blockedReason) {
       return { shouldProxy: false, reason: decision.blockedReason, processName };
+    }
+    if (processName && processNames.has(normalizeWindowsProcessName(processName))) {
+      return { shouldProxy: true, reason: "process.name", processName };
     }
     if (decision.shouldProxy) {
       return { shouldProxy: true, reason: decision.reason, processName };
@@ -93,6 +115,12 @@ export class LocalRoutingEnforcer {
       isDomainCoveredByDirectDomainSuffixes(destination.destinationDomain, proxyListSuffixes)
     ) {
       return { shouldProxy: true, reason: "proxy-list", processName };
+    }
+    if (
+      destination.destinationDomain !== undefined &&
+      isDomainCoveredByDirectDomainSuffixes(destination.destinationDomain, directListSuffixes)
+    ) {
+      return { shouldProxy: false, reason: "direct-list", processName };
     }
     return { shouldProxy: false, reason: decision.reason, processName };
   }
@@ -122,7 +150,9 @@ export class LocalRoutingEnforcer {
    */
   private compile(context: LocalRoutingContext): {
     policy: TrafficPolicy;
+    processNames: ReadonlySet<string>;
     proxyListSuffixes: ReadonlySet<string>;
+    directListSuffixes: ReadonlySet<string>;
   } {
     if (this.policyCache?.context !== context) {
       this.policyCache = {
@@ -130,7 +160,9 @@ export class LocalRoutingEnforcer {
         policy: new TrafficPolicy(context.routingMode, context.routingRules, {
           protectedSshEndpoint: context.protectedEndpoint
         }),
-        proxyListSuffixes: normalizeProcessRouteDirectDomains(context.routingProxyDomains ?? [])
+        processNames: enabledProcessRuleNames(context.routingRules),
+        proxyListSuffixes: normalizeProcessRouteDirectDomains(context.routingProxyDomains ?? []),
+        directListSuffixes: normalizeProcessRouteDirectDomains(context.routingDirectDomains ?? [])
       };
     }
     return this.policyCache;

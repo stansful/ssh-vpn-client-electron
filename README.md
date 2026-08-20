@@ -401,7 +401,11 @@ Disconnect/app quit:
   actually known. While this path is active the system proxy points all proxy-aware TCP at a local listener, and the
   listener evaluates domain, IP and process rules together per connection: matching traffic enters the tunnel
   (SSH `direct-tcpip`, or Xray's SOCKS inbound when the Xray transport is active) and everything else leaves the machine
-  directly, exactly as it would with the tunnel off. Domain and process rules therefore apply simultaneously, and a
+  directly, exactly as it would with the tunnel off. A `process.name` rule means *every* TCP destination that
+  application reaches, so it is evaluated ahead of the curated direct list and the direct list is applied on the
+  listener rather than in the PAC - a PAC entry would run before the listener and silently carve holes in the selected
+  application's traffic. Only the transport's own server endpoint stays excluded, because routing it into the tunnel it
+  carries would deadlock the transport. Domain and process rules therefore apply simultaneously, and a
   selected application is covered completely - including hosts no rule names, DoH clients that never populate the
   Windows DNS cache, and destinations discovered after connect. The helper is read-only and never carries traffic.
 - Process-name rules (fallback when the native helper is unavailable): Windows PAC/system proxy has no process context, so the portable backend watches Windows TCP
