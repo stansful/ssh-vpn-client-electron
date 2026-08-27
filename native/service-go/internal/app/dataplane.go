@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"shadowssh/service/internal/dataplane"
 	"shadowssh/service/internal/protocol"
@@ -79,7 +80,7 @@ func (a *App) handleStartDataplane(ctx context.Context, command protocol.Command
 		a.dataplane = nil
 		a.dataplanePolicy = nil
 		a.dataplaneSignature = ""
-		teardownCtx, cancel := cleanupContext(ctx)
+		teardownCtx, cancel := dataplaneTeardownContext(ctx)
 		defer cancel()
 		if err := runner.Close(teardownCtx); err != nil {
 			return protocol.CommandResult{
@@ -131,6 +132,12 @@ func (a *App) handleStopDataplane(ctx context.Context, command protocol.Command)
 // routinely already cancelled - the client went away, the service is being
 // signalled - and every `netsh` undo would then fail instantly, leaving the
 // machine captured with nothing forwarding.
+//
+// The budget is its own, too. cleanupContext allows five seconds, which is
+// right for the no-op ClearRouting it was written for and far too short here: a
+// teardown shells out to netsh once per route it installed, and a rollback cut
+// off half way is what leaves the next connect unable to bring the adapter back
+// up at all.
 func (a *App) stopDataplane(ctx context.Context) error {
 	a.dataplaneMu.Lock()
 	runner := a.dataplane
@@ -141,9 +148,18 @@ func (a *App) stopDataplane(ctx context.Context) error {
 	if runner == nil {
 		return nil
 	}
-	teardownCtx, cancel := cleanupContext(ctx)
+	teardownCtx, cancel := dataplaneTeardownContext(ctx)
 	defer cancel()
 	return runner.Close(teardownCtx)
+}
+
+// dataplaneTeardownTimeout bounds a whole dataplane teardown: a routing
+// rollback plus closing the adapter.
+const dataplaneTeardownTimeout = 3 * time.Minute
+
+func dataplaneTeardownContext(parent context.Context) (context.Context, context.CancelFunc) {
+	_ = parent
+	return context.WithTimeout(context.Background(), dataplaneTeardownTimeout)
 }
 
 func (p DataplaneStartPayload) infrastructureSignature() string {

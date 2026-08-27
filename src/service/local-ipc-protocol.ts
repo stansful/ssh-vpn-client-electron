@@ -44,6 +44,12 @@ export interface NativeServiceCapabilities {
   ipv6RouteEnforcement: boolean;
   udpForwarding: boolean;
   sshCoreLinked: boolean;
+  /**
+   * Why `tunDevice` is false, when the helper knows. Creating an adapter needs
+   * two unrelated things - `wintun.dll` and an elevated process - and the app
+   * cannot tell which is missing on its own.
+   */
+  tunUnavailableReason?: string;
 }
 
 export interface NativeServiceHandshake {

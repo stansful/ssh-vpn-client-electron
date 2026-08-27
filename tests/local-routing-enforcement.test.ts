@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { LocalRoutingEnforcer, type LocalRoutingContext } from "../src/service/local-routing-enforcement.js";
+import {
+  LocalRoutingEnforcer,
+  MAX_LOGGED_DECISIONS_PER_DIRECTION,
+  RoutingDecisionLog,
+  describeRoutingDecision,
+  type LocalRoutingContext
+} from "../src/service/local-routing-enforcement.js";
 import type { ProcessAttribution } from "../src/service/process-attribution.js";
 import type { RoutingRule } from "../src/shared/types.js";
 
@@ -59,6 +65,48 @@ describe("local routing enforcement", () => {
     // The PAC-learning fallback stays in charge where attribution cannot run.
     await expect(createEnforcer().isEnforceable(createContext(), "darwin")).resolves.toBe(false);
     await expect(createEnforcer({ available: false }).isEnforceable(createContext(), "win32")).resolves.toBe(false);
+  });
+});
+
+describe("routing decision log", () => {
+  const target = { host: "youtube.com", port: 443 };
+
+  it("names both directions, so a log can tell an unmatched rule from a dead tunnel", () => {
+    expect(describeRoutingDecision(target, { shouldProxy: true, reason: "process.name", processName: "Telegram.exe" }))
+      .toBe("Tunnel egress for youtube.com:443 from Telegram.exe (process.name).");
+    expect(describeRoutingDecision(target, { shouldProxy: false, reason: "no-match" }))
+      .toBe("Direct egress for youtube.com:443 (no-match).");
+  });
+
+  // The budgets are separate on purpose: a browser opens hundreds of unmatched
+  // sockets a minute, and a shared budget would spend itself on those before a
+  // single tunnelled decision was ever written.
+  it("does not let one direction spend the other's budget", () => {
+    const messages: string[] = [];
+    const log = new RoutingDecisionLog((message) => messages.push(message));
+    for (let index = 0; index < MAX_LOGGED_DECISIONS_PER_DIRECTION * 2; index += 1) {
+      log.record(target, { shouldProxy: false, reason: "no-match" });
+    }
+    const afterDirect = messages.length;
+    log.record(target, { shouldProxy: true, reason: "domain" });
+
+    expect(afterDirect).toBe(MAX_LOGGED_DECISIONS_PER_DIRECTION);
+    expect(messages[afterDirect - 1]).toBe("Further direct routing decisions are suppressed for this session.");
+    expect(messages[afterDirect]).toBe("Tunnel egress for youtube.com:443 (domain).");
+  });
+
+  // A long-lived process used to go permanently silent after one busy session.
+  it("restores both budgets on reset", () => {
+    const messages: string[] = [];
+    const log = new RoutingDecisionLog((message) => messages.push(message), 2);
+    log.record(target, { shouldProxy: true, reason: "domain" });
+    log.record(target, { shouldProxy: true, reason: "domain" });
+    log.record(target, { shouldProxy: true, reason: "domain" });
+    expect(messages).toHaveLength(2);
+
+    log.reset();
+    log.record(target, { shouldProxy: true, reason: "domain" });
+    expect(messages).toHaveLength(3);
   });
 });
 

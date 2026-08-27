@@ -5,8 +5,10 @@ package tun
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -17,6 +19,12 @@ const (
 	// buffer is allocated once and reused, so sizing it at the maximum costs
 	// 64 KiB for the life of the adapter.
 	maxPacketBytes = 0xFFFF
+	// createAttempts and createRetryDelay cover an adapter that the previous
+	// run has closed but Windows has not finished removing. Reconnecting a
+	// tunnel destroys and recreates the adapter within a second or two, which
+	// is exactly the window where the old device node can still be present.
+	createAttempts   = 6
+	createRetryDelay = 400 * time.Millisecond
 	// Ring reads park on the adapter's event; a bounded wait lets Close()
 	// unblock the reader without relying on the driver signalling first.
 	readWaitMs = 250
@@ -54,10 +62,22 @@ func loadWintun() error {
 		return nil
 	}
 
-	wintun = syscall.NewLazyDLL("wintun.dll")
-	if err := wintun.Load(); err != nil {
-		return fmt.Errorf("load wintun.dll: %w", err)
+	// Every candidate is an absolute path rather than a bare name: it keeps the
+	// error able to list exactly where it looked, and avoids the default DLL
+	// search order picking up a wintun.dll from somewhere unrelated.
+	candidates := searchPaths()
+	var loaded *syscall.LazyDLL
+	for _, candidate := range candidates {
+		dll := syscall.NewLazyDLL(candidate)
+		if err := dll.Load(); err == nil {
+			loaded = dll
+			break
+		}
 	}
+	if loaded == nil {
+		return fmt.Errorf("%s was not found in any of: %s", wintunDLL, strings.Join(candidates, ", "))
+	}
+	wintun = loaded
 	procCreateAdapter = wintun.NewProc("WintunCreateAdapter")
 	procCloseAdapter = wintun.NewProc("WintunCloseAdapter")
 	procGetAdapterLUID = wintun.NewProc("WintunGetAdapterLUID")
@@ -131,11 +151,7 @@ func Open(config Config) (Adapter, error) {
 		return nil, fmt.Errorf("tunnel type: %w", err)
 	}
 
-	handle, _, callErr := procCreateAdapter.Call(
-		uintptr(unsafe.Pointer(name)),
-		uintptr(unsafe.Pointer(tunnelType)),
-		0,
-	)
+	handle, callErr := createAdapter(name, tunnelType)
 	if handle == 0 {
 		return nil, fmt.Errorf("create adapter %q: %w", config.Name, callErr)
 	}
@@ -153,6 +169,48 @@ func Open(config Config) (Adapter, error) {
 	event, _, _ := procGetReadWaitEvent.Call(session)
 	adapter.readEvent = event
 	return adapter, nil
+}
+
+// createAdapter retries a failed creation for a short while.
+//
+// Removing an adapter is asynchronous on the Windows side: WintunCloseAdapter
+// returns before the device node is gone. A tunnel that is switched off and
+// straight back on therefore meets its own leftover adapter, and a single
+// attempt turns that into "TUN is unavailable" for the rest of the session -
+// with the app silently back on the proxy path, where process rules do not
+// hold.
+func createAdapter(name *uint16, tunnelType *uint16) (uintptr, error) {
+	var lastErr error
+	for attempt := 0; attempt < createAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(createRetryDelay)
+		}
+		handle, _, callErr := procCreateAdapter.Call(
+			uintptr(unsafe.Pointer(name)),
+			uintptr(unsafe.Pointer(tunnelType)),
+			0,
+		)
+		if handle != 0 {
+			return handle, nil
+		}
+		lastErr = createAdapterError(callErr)
+	}
+	return 0, lastErr
+}
+
+// createAdapterError keeps a failure from reporting itself as "Success".
+//
+// LazyProc.Call always hands back the thread's last error, which is zero when
+// the DLL returned NULL without setting one - so the obvious wording turns a
+// failure into a line that reads like everything worked.
+func createAdapterError(callErr error) error {
+	if errno, ok := callErr.(syscall.Errno); ok && errno == 0 {
+		return errors.New("the driver returned no adapter and reported no error; check that wintun.dll is the signed WireGuard build and matches this executable's architecture")
+	}
+	if callErr == nil {
+		return errors.New("the driver returned no adapter")
+	}
+	return callErr
 }
 
 func (a *windowsAdapter) LUID() uint64 {

@@ -154,6 +154,35 @@ The dataplane falls back rather than failing:
 first on every routing apply and return `false`, having changed nothing, whenever it cannot be
 used.
 
+## Turning the tunnel off and on again
+
+Reconnecting destroys the adapter and builds a new one within a second or two,
+which is the hardest thing this dataplane does. Four rules keep it survivable,
+each of which was a bug first:
+
+- **The rollback is never abandoned.** `winroute` runs its undo pass on its own
+  context with a two-minute budget, ignoring the caller's. Teardown is routinely
+  reached with a context that is already cancelled, and honouring it aborted
+  every remaining `netsh` call instantly - leaving capture routes behind and the
+  next connect unable to come up at all.
+- **Adapter creation retries.** `WintunCloseAdapter` returns before Windows has
+  finished removing the device node, so a fast reconnect meets its own leftover
+  adapter. `tun.Open` retries for a couple of seconds before giving up.
+- **A stale physical route is refused, not used.** If the interface the routing
+  table calls "the way to the internet" no longer exists, or is the adapter just
+  created, the dataplane refuses to start rather than pinning every direct flow
+  to a dead interface. Being unable to *check* is not the same as failing the
+  check, and only the second refuses.
+- **Falling back is loud and not permanent.** A failed start is retried once,
+  and the diagnostic says what it costs: the tunnel keeps working for domain and
+  IP rules, so nothing looks wrong until someone notices that process rules
+  stopped reaching the applications that ignore the Windows proxy setting.
+
+The same shape applies one level up: `NativeProcessAttribution` pauses for
+twenty seconds after repeated helper failures instead of disabling itself for
+the life of the application, which used to mean process rules stayed dead until
+the app was quit entirely.
+
 ## What has been executed, and where
 
 The pure logic - policy order, DNS parsing, the routing plan and its journal, the SOCKS5 wire

@@ -14,9 +14,16 @@ import (
 // package cannot drive.
 var ErrNotSupported = errors.New("routing changes are only implemented on Windows")
 
-// commandTimeout bounds one netsh invocation. netsh occasionally blocks on a
-// busy network stack, and a stuck apply must not hold the connect path open.
-const commandTimeout = 20 * time.Second
+const (
+	// commandTimeout bounds one netsh invocation. netsh occasionally blocks on
+	// a busy network stack, and a stuck apply must not hold the connect path
+	// open.
+	commandTimeout = 20 * time.Second
+	// rollbackBudget bounds a whole undo pass. A plan is a handful of netsh
+	// calls, each of which can take a second or more on a busy machine, so the
+	// budget has to be a multiple of commandTimeout rather than of one call.
+	rollbackBudget = 2 * time.Minute
+)
 
 // Runner executes one command. It exists so the manager's sequencing can be
 // tested without touching a routing table.
@@ -48,6 +55,9 @@ func NewManager(journalPath string, run Runner, log func(level string, message s
 func (m *Manager) Recover(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	ctx, cancel := rollbackContext(ctx)
+	defer cancel()
 
 	entries, err := m.journal.Read()
 	if err != nil {
@@ -113,6 +123,8 @@ func (m *Manager) Restore(ctx context.Context) error {
 	if len(m.applied) == 0 {
 		return m.journal.Clear()
 	}
+	ctx, cancel := rollbackContext(ctx)
+	defer cancel()
 	failures := m.undoLocked(ctx, UndoOrder(m.applied))
 	if failures > 0 {
 		// The journal is deliberately kept: an undo that failed is exactly the
@@ -146,6 +158,19 @@ func (m *Manager) runOne(ctx context.Context, argv []string) error {
 	commandCtx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
 	return m.run(commandCtx, argv)
+}
+
+// rollbackContext detaches an undo pass from the caller's context.
+//
+// Undo is the one thing that must not be abandoned: half-removed capture routes
+// leave the machine pointing at an adapter that is about to disappear. Callers
+// routinely hand in a context that is already cancelled - the IPC client went
+// away, the service is being signalled - and honouring it would abort every
+// remaining command instantly. Only the total budget applies here, so a hung
+// netsh still cannot wedge shutdown.
+func rollbackContext(parent context.Context) (context.Context, context.CancelFunc) {
+	_ = parent
+	return context.WithTimeout(context.Background(), rollbackBudget)
 }
 
 func execRunner(ctx context.Context, argv []string) error {

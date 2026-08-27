@@ -1,4 +1,5 @@
 import { NativeHelperClient } from "./native-helper-client.js";
+import { WINTUN_SEARCH_DIRECTORIES_ENV, wintunSearchDirectories } from "./tun-routing.js";
 import type { DataplaneStartRequest } from "./local-ipc-protocol.js";
 
 /**
@@ -19,6 +20,12 @@ import type { DataplaneStartRequest } from "./local-ipc-protocol.js";
 export interface NativeDataplaneOptions {
   executablePath: string;
   onDiagnostic?: (level: "info" | "warning" | "error", message: string) => void;
+  /**
+   * The application's own data folder. Included in the helper's search for
+   * `wintun.dll`, because it is somewhere a user can reliably put a file - the
+   * packaged resources folder of a portable build is not.
+   */
+  userDataDirectory?: string;
 }
 
 /**
@@ -71,9 +78,15 @@ export class NativeDataplaneController implements DataplaneController {
     }
     const capabilities = client.handshake?.capabilities;
     if (!capabilities?.tunDevice || !capabilities.routeManipulation) {
+      // The helper knows exactly which prerequisite is missing; repeating a
+      // generic "start as administrator" here sent a user who had already done
+      // that chasing the wrong thing for days.
+      const reason = capabilities?.tunUnavailableReason?.trim();
       return {
         available: false,
-        reason: "The native helper cannot create a tunnel adapter. Start the application as administrator to use TUN routing."
+        reason: reason
+          ? `The native helper cannot create a tunnel adapter: ${reason}.`
+          : "The native helper cannot create a tunnel adapter. It needs wintun.dll beside the service binary and an elevated process."
       };
     }
     return { available: true };
@@ -139,6 +152,9 @@ export class NativeDataplaneController implements DataplaneController {
       return this.client;
     }
     this.client = await NativeHelperClient.start(this.options.executablePath, {
+      env: {
+        [WINTUN_SEARCH_DIRECTORIES_ENV]: wintunSearchDirectories(this.options.userDataDirectory).join(";")
+      },
       // The helper reports dataplane progress on stderr, which is the same
       // channel the rest of the app already surfaces as diagnostics.
       onStderrLine: (line) => this.options.onDiagnostic?.("warning", line),

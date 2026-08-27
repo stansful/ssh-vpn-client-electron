@@ -21,10 +21,12 @@ import {
   type ProcessRouteSessionEvidence
 } from "../core/routing/process-route-domains.js";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/local-tcp-proxy.js";
-import { LocalRoutingEnforcer, type LocalRoutingContext } from "./local-routing-enforcement.js";
+import { parseEndpoint } from "../core/network/socks5-check.js";
+import { probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
+import { LocalRoutingEnforcer, RoutingDecisionLog, type LocalRoutingContext } from "./local-routing-enforcement.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { NativeDataplaneController, type DataplaneController } from "./native-dataplane.js";
-import { resolveProtectedAddresses, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
+import { errorText, resolveProtectedAddresses, startDataplaneWithRetry, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
@@ -39,6 +41,13 @@ export interface LiveSshServiceBridgeOptions {
   processDnsEntriesProvider?: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
   /** Path to the native helper used for per-connection process attribution. */
   nativeServiceExecutablePath?: string;
+  /**
+   * The application's data folder. It is where the TUN routing journal lives,
+   * and one of the places the helper is told to look for `wintun.dll` - a
+   * portable build's own resources folder is recreated in `%TEMP%` at every
+   * launch, so nothing a user puts there survives.
+   */
+  userDataDirectory?: string;
   /** Injection seam for tests; defaults to the native helper when a path is set. */
   processAttribution?: ProcessAttribution;
   /** Injection seam for tests; defaults to the native helper when a path is set. */
@@ -71,6 +80,12 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private readonly processDnsEntriesProvider: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
   private proxyInfoDiagnostics = 0;
   private proxyWarningDiagnostics = 0;
+  /**
+   * Both directions of every routing decision, so the log can tell "no rule
+   * matched" apart from "the rules matched and the tunnel behind them is
+   * dead". See {@link RoutingDecisionLog}.
+   */
+  private readonly routingDecisions = new RoutingDecisionLog((message) => this.appendDiagnostic("info", message));
   private processRoutingMonitor: NodeJS.Timeout | undefined;
   private processRoutingGeneration = 0;
   private processRoutingIps = new Map<string, number>();
@@ -117,10 +132,14 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.dataplane = options.dataplane ?? (options.nativeServiceExecutablePath
       ? new NativeDataplaneController({
           executablePath: options.nativeServiceExecutablePath,
+          // The PAC directory lives inside the application's data folder, which
+          // is a place the user can actually put wintun.dll - unlike the
+          // packaged resources of a portable build.
+          userDataDirectory: options.userDataDirectory,
           onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message)
         })
       : undefined);
-    this.dataplaneJournalPath = path.join(options.pacDirectory ?? os.tmpdir(), TUN_ROUTING_JOURNAL_FILE);
+    this.dataplaneJournalPath = path.join(options.userDataDirectory ?? options.pacDirectory ?? os.tmpdir(), TUN_ROUTING_JOURNAL_FILE);
     this.protectedAddressResolver = options.protectedAddressResolver ?? resolveProtectedAddresses;
     this.localRoutingEnforcer = new LocalRoutingEnforcer(this.processAttribution);
     this.status = {
@@ -254,6 +273,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
     this.proxyInfoDiagnostics = 0;
     this.proxyWarningDiagnostics = 0;
+    this.routingDecisions.reset();
     this.processRoutingIps.clear();
     this.processRoutingHintDomains.clear();
     this.processRoutingDomains.clear();
@@ -424,9 +444,23 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
     try {
       this.appendDiagnostic("info", `Tunnel check requested for ${endpoint}.`);
-      await client.checkTunnel(endpoint);
-      const result = { endpoint, ok: true, at, message: `SSH direct-tcpip check succeeded for ${endpoint}.` };
-      this.appendDiagnostic("info", result.message);
+      const startedAt = Date.now();
+      const target = parseEndpoint(endpoint);
+      // Opening the channel only proves the server could connect; the probe
+      // also proves bytes cross it, which is the same evidence the Xray check
+      // collects. The two transports must not disagree about what a passing
+      // tunnel check means.
+      const probe = await probeTunnelEndpoint(
+        (signal) => client.openDirectTcpIpChannel(target, { address: "127.0.0.1", port: 0 }, signal),
+        target
+      );
+      const result = {
+        endpoint,
+        ok: true,
+        at,
+        message: `Tunnel check succeeded for ${endpoint} in ${Date.now() - startedAt} ms: ${probe.detail}.`
+      };
+      this.appendDiagnostic(probe.outcome === "unverified" ? "warning" : "info", result.message);
       this.emit({ type: "tunnel-check-result", result });
       return result;
     } catch (error) {
@@ -655,12 +689,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
       () => client.openDirectTcpIpChannel(target, originator, signal),
       signal
     );
-    if (!decision.shouldProxy) {
-      this.appendProxyDiagnostic(
-        "info",
-        `Direct egress for ${target.host}:${target.port}${decision.processName ? ` from ${decision.processName}` : ""} (${decision.reason}).`
-      );
-    }
+    this.routingDecisions.record(target, decision);
     return channel;
   }
 
@@ -774,7 +803,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // attribute connections. Only when it cannot do we fall back to guessing an
     // application's destinations and feeding them to PAC.
     const context = buildLocalRoutingContext(request);
-    this.localProcessEnforcement = await this.localRoutingEnforcer.isEnforceable(context);
+    const enforceability = await this.localRoutingEnforcer.describeEnforceability(context);
+    this.localProcessEnforcement = enforceability.enforceable;
     if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
       return;
     }
@@ -782,6 +812,15 @@ export class LiveSshServiceBridge implements ServiceBridge {
       this.localRoutingContext = context;
       await this.applyLocallyEnforcedRouting(request, socksEndpoint, generation, allowConnecting, summary);
       return;
+    }
+    if (enforceability.reason && hasProcessRouting) {
+      // Naming the cause matters because the tunnel keeps working: domain and
+      // IP rules are unaffected, so the only visible symptom is that selected
+      // applications quietly stop being selected.
+      this.appendDiagnostic(
+        "warning",
+        `Per-process enforcement is unavailable, so process rules fall back to PAC guessing - ${enforceability.reason}.`
+      );
     }
     this.localRoutingContext = undefined;
 
@@ -944,7 +983,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
 
     try {
-      await dataplane.start({
+      await startDataplaneWithRetry(dataplane, {
         routingMode: request.routingMode,
         routingRules: request.routingRules,
         routingProxyDomains: request.routingProxyDomains,
@@ -959,11 +998,20 @@ export class LiveSshServiceBridge implements ServiceBridge {
         enforceIpv6: true,
         adapterName: TUN_ADAPTER_NAME,
         journalPath: this.dataplaneJournalPath
+      }, {
+        onRetry: (attempt, attempts, error) =>
+          this.appendDiagnostic(
+            "warning",
+            `TUN routing did not start on attempt ${attempt} of ${attempts}, retrying: ${errorText(error)}`
+          )
       });
     } catch (error) {
+      // Worth spelling out: the fallback still routes domains and IP ranges, so
+      // the tunnel looks healthy while process rules quietly stop reaching the
+      // applications that ignore the Windows proxy setting.
       this.appendDiagnostic(
         "warning",
-        `TUN routing could not start, continuing on the Windows proxy path: ${error instanceof Error ? error.message : String(error)}`
+        `TUN routing could not start, continuing on the Windows proxy path - process rules will not reach applications that ignore the Windows proxy setting: ${errorText(error)}`
       );
       return false;
     }

@@ -231,8 +231,10 @@ export function RoutingView({
               over its packets either way.
             </p>
             <p>
-              Needs <strong>wintun.dll</strong> next to the app and the app started <strong>as administrator</strong>.
-              Without either, the connection falls back to the proxy path and says so in Diagnostics.
+              Needs <strong>wintun.dll</strong> - put it beside the app&apos;s <code>.exe</code> or in the app data
+              folder next to the logs - and the app started with <strong>Run as administrator</strong>; being signed
+              in as an administrator is not the same thing. Without either, the connection falls back to the proxy
+              path and Diagnostics names which one is missing, listing every folder it looked in.
             </p>
           </div>
         )}

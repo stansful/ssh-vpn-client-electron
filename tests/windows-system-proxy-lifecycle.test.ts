@@ -471,6 +471,26 @@ describe("WindowsSystemProxyManager lifecycle", () => {
     }
   });
 
+  // Chrome and Firefox read a bare `socks=` entry as SOCKS4, and Chrome picks
+  // it ahead of the http/https entries for ws:// and wss:// (RFC 6455 4.1.3).
+  // Advertising it therefore sent every WebSocket handshake - conferencing
+  // signalling, Electron app gateways - into a SOCKS4 greeting, which the mixed
+  // listener could not answer, whether or not the destination was routed.
+  it("never advertises a SOCKS entry for the mixed HTTP/SOCKS5 listener", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-static-scheme-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+
+      const proxyServer = registry.get("ProxyServer") ?? "";
+      expect(proxyServer).toBe("http=127.0.0.1:1080;https=127.0.0.1:1080");
+      expect(proxyServer).not.toContain("socks=");
+    } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     "<local>",
     "*;<local>;legacy-corporate.example"
@@ -482,9 +502,7 @@ describe("WindowsSystemProxyManager lifecycle", () => {
       await manager.apply(staticRequest());
 
       expect(registry.get("ProxyEnable")).toBe("1");
-      expect(registry.get("ProxyServer")).toBe(
-        "http=127.0.0.1:1080;https=127.0.0.1:1080;socks=127.0.0.1:1080"
-      );
+      expect(registry.get("ProxyServer")).toBe("http=127.0.0.1:1080;https=127.0.0.1:1080");
       expect(registry.has("ProxyOverride")).toBe(false);
 
       await manager.restore();

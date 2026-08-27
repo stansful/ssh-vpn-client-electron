@@ -73,6 +73,41 @@ describe("native process attribution", () => {
     await attribution.dispose();
   });
 
+  it("comes back after the pause instead of staying disabled for the session", async () => {
+    // A helper that dies once - a transport reconnect, a helper restart - used
+    // to disable per-process routing until the whole application was quit,
+    // while domain rules carried on working. That is the failure this pause
+    // must not reproduce.
+    let broken = true;
+    let clock = 1_000;
+    const attribution = new NativeProcessAttribution({
+      executablePath: "unused",
+      snapshotProvider: async () => {
+        if (broken) {
+          throw new Error("helper is missing");
+        }
+        return new Map([[41001, "telegram.exe"]]);
+      },
+      now: () => clock
+    });
+
+    await expect(attribution.isAvailable()).resolves.toBe(false);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await attribution.resolveProcessName(41001);
+    }
+    await expect(attribution.isAvailable()).resolves.toBe(false);
+
+    broken = false;
+    // Still inside the pause: the point of it is not to re-spawn a broken
+    // helper on the hot path of every accepted socket.
+    await expect(attribution.isAvailable()).resolves.toBe(false);
+
+    clock += 21_000;
+    await expect(attribution.isAvailable()).resolves.toBe(true);
+    await expect(attribution.resolveProcessName(41001)).resolves.toBe("telegram.exe");
+    await attribution.dispose();
+  });
+
   it("reports itself unavailable and stops retrying once snapshots keep failing", async () => {
     const diagnostics: string[] = [];
     const snapshotProvider = vi.fn(async () => {
@@ -93,6 +128,7 @@ describe("native process attribution", () => {
 
     expect(snapshotProvider.mock.calls.length).toBeLessThanOrEqual(5);
     expect(diagnostics.some((message) => message.includes("helper is missing"))).toBe(true);
+    expect(diagnostics.some((message) => message.includes("paused"))).toBe(true);
     await attribution.dispose();
   });
 

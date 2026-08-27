@@ -119,6 +119,19 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 	if egress6Err != nil {
 		internetIndex6 = 0
 	}
+	// A route left over from a previous run can name an interface that has
+	// since been removed - the adapter this dataplane created and closed. Every
+	// direct flow would then be pinned to an interface that does not exist, and
+	// the transport's own server would be given a host route through it.
+	if present, known := interfaceExists(internetEgress.InterfaceIndex); known && !present {
+		return nil, fmt.Errorf(
+			"the physical route to the internet names interface %d, which no longer exists; routing from a previous run was not fully removed",
+			internetEgress.InterfaceIndex)
+	} else if !known {
+		// Not being able to enumerate interfaces is not evidence of anything.
+		// Refusing here would turn a diagnostic aid into an outage.
+		log("warning", "Could not verify the physical interface before capturing traffic; continuing.")
+	}
 
 	protectedRoutes, enforceIPv6, err := protectedRoutePlan(options.ProtectedAddresses, options.EnforceIPv6, log)
 	if err != nil {
@@ -138,6 +151,16 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 	if err != nil {
 		adapter.Close()
 		return nil, fmt.Errorf("resolve the tunnel interface index: %w", err)
+	}
+	if interfaceIndex == internetEgress.InterfaceIndex {
+		// Windows reuses interface indices. If the index the routing table
+		// called "the way to the internet" is the one it just handed this
+		// adapter, that lookup described a leftover adapter and every direct
+		// flow would be pinned straight back into this stack.
+		adapter.Close()
+		return nil, fmt.Errorf(
+			"the tunnel adapter was given interface %d, which the routing table already names as the physical path to the internet; routing from a previous run was not fully removed",
+			interfaceIndex)
 	}
 
 	plan := winroute.Plan{
@@ -268,6 +291,22 @@ func windowsOwnerSnapshot() ([]OwnerRow, error) {
 		})
 	}
 	return rows, nil
+}
+
+// interfaceExists reports whether an interface index is present, and whether
+// the answer is trustworthy at all. Enumeration itself can fail, and "I could
+// not look" must not be confused with "it is gone".
+func interfaceExists(index uint32) (present bool, known bool) {
+	interfaces, err := net.Interfaces()
+	if err != nil || len(interfaces) == 0 {
+		return false, false
+	}
+	for _, candidate := range interfaces {
+		if candidate.Index == int(index) {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 func enabledLabel(value bool) string {

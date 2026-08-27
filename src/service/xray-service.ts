@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import { access, chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { checkSocks5Connect, parseEndpoint } from "../core/network/socks5-check.js";
+import { parseEndpoint } from "../core/network/socks5-check.js";
+import { probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
 import { RoutingMatcher, type RoutingMatcherSummary } from "../core/routing/routing-matcher.js";
 import {
   isAutoLearnableRemoteAddress,
@@ -23,9 +24,9 @@ import {
 import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
 import { Socks5Proxy } from "../core/network/socks5-proxy.js";
 import { openSocks5UpstreamChannel } from "../core/network/socks5-upstream.js";
-import { LocalRoutingEnforcer, type LocalRoutingContext } from "./local-routing-enforcement.js";
+import { LocalRoutingEnforcer, RoutingDecisionLog, type LocalRoutingContext } from "./local-routing-enforcement.js";
 import { NativeDataplaneController, type DataplaneController } from "./native-dataplane.js";
-import { resolveProtectedAddresses, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
+import { errorText, resolveProtectedAddresses, startDataplaneWithRetry, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { buildXrayConfig } from "../core/proxy/xray-config.js";
 import type { ServiceEvent } from "../shared/ipc.js";
@@ -49,6 +50,13 @@ export interface XrayServiceBridgeOptions {
   processDnsEntriesProvider?: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
   /** Path to the native helper used for per-connection process attribution. */
   nativeServiceExecutablePath?: string;
+  /**
+   * The application's data folder. It is where the TUN routing journal lives,
+   * and one of the places the helper is told to look for `wintun.dll` - a
+   * portable build's own resources folder is recreated in `%TEMP%` at every
+   * launch, so nothing a user puts there survives.
+   */
+  userDataDirectory?: string;
   /** Injection seam for tests; defaults to the native helper when a path is set. */
   processAttribution?: ProcessAttribution;
   /** Injection seam for tests; defaults to the native helper when a path is set. */
@@ -64,7 +72,17 @@ const PROCESS_ROUTE_DNS_REFRESH_MS = 5 * 60 * 1000;
 const PROCESS_ROUTE_DNS_MIN_REFRESH_MS = 1_000;
 const PROCESS_ROUTE_DNS_RETRY_BASE_MS = 10_000;
 const MAX_LOCAL_PROXY_DIAGNOSTICS = 80;
-const MAX_XRAY_PROCESS_LOG_LINES = 80;
+/**
+ * Xray writes one `[Info] ... accepted ...` line per connection, and a client
+ * like Telegram opens hundreds in a minute. A single shared budget therefore
+ * spent itself on chatter within seconds and then detached the stream
+ * altogether, so the `[Warning]` explaining why the outbound was failing never
+ * reached the log - the one line anyone actually needed.
+ *
+ * Warnings and errors get their own budget that the chatter cannot touch.
+ */
+const MAX_XRAY_IMPORTANT_LOG_LINES = 200;
+const MAX_XRAY_ROUTINE_LOG_LINES = 40;
 const MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS = 64 * 1024;
 const MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS = 4096;
 
@@ -113,7 +131,14 @@ export class XrayServiceBridge {
   private localRoutingContext: LocalRoutingContext | undefined;
   private localProxy: Socks5Proxy | undefined;
   private proxyDiagnostics = 0;
-  private processLogLines = 0;
+  /**
+   * Both directions of every routing decision, so the log can tell "no rule
+   * matched" apart from "the rules matched and the tunnel behind them is
+   * dead". See {@link RoutingDecisionLog}.
+   */
+  private readonly routingDecisions = new RoutingDecisionLog((message) => this.appendDiagnostic("info", message));
+  private importantProcessLogLines = 0;
+  private routineProcessLogLines = 0;
   private readonly processLogDrainers = new WeakMap<XrayProcess, () => void>();
   private mutationTail: Promise<void> = Promise.resolve();
   private lifecycleGeneration = 0;
@@ -135,10 +160,14 @@ export class XrayServiceBridge {
     this.dataplane = options.dataplane ?? (options.nativeServiceExecutablePath
       ? new NativeDataplaneController({
           executablePath: options.nativeServiceExecutablePath,
+          // The PAC directory lives inside the application's data folder, which
+          // is a place the user can actually put wintun.dll - unlike the
+          // packaged resources of a portable build.
+          userDataDirectory: options.userDataDirectory,
           onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message)
         })
       : undefined);
-    this.dataplaneJournalPath = path.join(options.pacDirectory ?? options.runtimeDirectory, TUN_ROUTING_JOURNAL_FILE);
+    this.dataplaneJournalPath = path.join(options.userDataDirectory ?? options.pacDirectory ?? options.runtimeDirectory, TUN_ROUTING_JOURNAL_FILE);
     this.protectedAddressResolver = options.protectedAddressResolver ?? resolveProtectedAddresses;
     this.localRoutingEnforcer = new LocalRoutingEnforcer(this.processAttribution);
     this.runtimeDirectory = options.runtimeDirectory;
@@ -259,7 +288,12 @@ export class XrayServiceBridge {
     if (!this.isCurrentLifecycle(generation)) {
       return;
     }
-    this.processLogLines = 0;
+    this.importantProcessLogLines = 0;
+    this.routineProcessLogLines = 0;
+    // Both budgets are per connection attempt. Left unreset, a long-lived
+    // process went permanently silent after its first busy session.
+    this.proxyDiagnostics = 0;
+    this.routingDecisions.reset();
     this.processRoutingIps.clear();
     this.processRoutingHintDomains.clear();
     this.processRoutingDomains.clear();
@@ -388,13 +422,12 @@ export class XrayServiceBridge {
       realTunnelAvailable: false,
       message: "Disconnecting Xray transport."
     });
-    return this.enqueueMutation(async () => {
-      await this.disconnectInternal(generation);
-      // An adapter left up on quit would keep capture routes pointing at a
-      // process that no longer exists.
-      await this.dataplane?.dispose().catch(() => undefined);
-      await this.processAttribution?.dispose().catch(() => undefined);
-    });
+    // Only the tunnel comes down here. The dataplane controller and the
+    // attribution helper survive: disposing them is permanent, and doing it on
+    // an ordinary disconnect left every later connect reporting "the dataplane
+    // controller is disposed" and quietly falling back to the proxy path, where
+    // domain rules keep working and process rules do not.
+    return this.enqueueMutation(() => this.disconnectInternal(generation));
   }
 
   private async disconnectInternal(generation: number): Promise<void> {
@@ -428,12 +461,27 @@ export class XrayServiceBridge {
       return result;
     }
 
+    // Captured before the probe: the property can be replaced by a concurrent
+    // reconnect, and a check must report on the tunnel it started against.
+    const socksEndpoint = this.socksEndpoint;
     try {
       this.appendDiagnostic("info", `Xray tunnel check requested for ${endpoint}.`);
       const startedAt = Date.now();
-      await checkSocks5Connect(this.socksEndpoint, parseEndpoint(endpoint));
-      const result = { endpoint, ok: true, at, message: `SOCKS tunnel check succeeded for ${endpoint} in ${Date.now() - startedAt} ms.` };
-      this.appendDiagnostic("info", result.message);
+      const target = parseEndpoint(endpoint);
+      // Not just the SOCKS reply: Xray answers that as soon as it has chosen an
+      // outbound, so a dead VMess outbound used to pass this check while every
+      // real connection through it hung.
+      const probe = await probeTunnelEndpoint(
+        (signal) => openSocks5UpstreamChannel(socksEndpoint, target, { signal }),
+        target
+      );
+      const result = {
+        endpoint,
+        ok: true,
+        at,
+        message: `Tunnel check succeeded for ${endpoint} in ${Date.now() - startedAt} ms: ${probe.detail}.`
+      };
+      this.appendDiagnostic(probe.outcome === "unverified" ? "warning" : "info", result.message);
       this.emit({ type: "tunnel-check-result", result });
       return result;
     } catch (error) {
@@ -476,7 +524,13 @@ export class XrayServiceBridge {
       realTunnelAvailable: false,
       message: "Stopping Xray service."
     });
-    return this.enqueueMutation(() => this.disconnectInternal(generation));
+    return this.enqueueMutation(async () => {
+      await this.disconnectInternal(generation);
+      // An adapter left up on quit would keep capture routes pointing at a
+      // process that no longer exists.
+      await this.dataplane?.dispose().catch(() => undefined);
+      await this.processAttribution?.dispose().catch(() => undefined);
+    });
   }
 
   private async requireExecutablePath(): Promise<string> {
@@ -628,7 +682,7 @@ export class XrayServiceBridge {
     }
 
     try {
-      await dataplane.start({
+      await startDataplaneWithRetry(dataplane, {
         routingMode: request.routingMode,
         routingRules: request.routingRules,
         routingProxyDomains: request.routingProxyDomains,
@@ -640,11 +694,20 @@ export class XrayServiceBridge {
         enforceIpv6: true,
         adapterName: TUN_ADAPTER_NAME,
         journalPath: this.dataplaneJournalPath
+      }, {
+        onRetry: (attempt, attempts, error) =>
+          this.appendDiagnostic(
+            "warning",
+            `TUN routing did not start on attempt ${attempt} of ${attempts}, retrying: ${errorText(error)}`
+          )
       });
     } catch (error) {
+      // Worth spelling out: the fallback still routes domains and IP ranges, so
+      // the tunnel looks healthy while process rules quietly stop reaching the
+      // applications that ignore the Windows proxy setting.
       this.appendDiagnostic(
         "warning",
-        `TUN routing could not start, continuing on the Windows proxy path: ${error instanceof Error ? error.message : String(error)}`
+        `TUN routing could not start, continuing on the Windows proxy path - process rules will not reach applications that ignore the Windows proxy setting: ${errorText(error)}`
       );
       return false;
     }
@@ -825,7 +888,13 @@ export class XrayServiceBridge {
       routingMode: request.routingMode,
       routingRules: request.routingRules,
       routingProxyDomains: request.routingProxyDomains,
-      routingDirectDomains: request.routingDirectDomains
+      routingDirectDomains: request.routingDirectDomains,
+      // The SSH transport has always excluded its own server here. Xray did
+      // not, so a rule broad enough to cover the profile's own host - a
+      // `process.name` rule above all, which routes everything an application
+      // sends - handed that connection back to Xray's inbound and asked it to
+      // dial itself through itself.
+      protectedEndpoint: { host: request.profile.host, port: request.profile.port }
     };
     // The adapter is tried first: it is the only path that holds a
     // `process.name` rule against an application that ignores the Windows
@@ -834,12 +903,22 @@ export class XrayServiceBridge {
       return;
     }
 
-    if (await this.localRoutingEnforcer.isEnforceable(context)) {
+    const enforceability = await this.localRoutingEnforcer.describeEnforceability(context);
+    if (enforceability.enforceable) {
       if (generation !== this.processRoutingGeneration || !this.isRoutingApplicable()) {
         return;
       }
       await this.applyLocallyEnforcedRouting(request, socksEndpoint, context, generation, summary);
       return;
+    }
+    if (enforceability.reason && hasProcessRouting) {
+      // Naming the cause matters because the tunnel keeps working: domain and
+      // IP rules are unaffected, so the only visible symptom is that selected
+      // applications quietly stop being selected.
+      this.appendDiagnostic(
+        "warning",
+        `Per-process enforcement is unavailable, so process rules fall back to PAC guessing - ${enforceability.reason}.`
+      );
     }
     await this.stopLocalProxy();
 
@@ -1006,12 +1085,7 @@ export class XrayServiceBridge {
           () => openSocks5UpstreamChannel(xraySocksEndpoint, target, { signal }),
           signal
         );
-        if (!decision.shouldProxy) {
-          this.appendBoundedProxyDiagnostic(
-            "info",
-            `Direct egress for ${target.host}:${target.port}${decision.processName ? ` from ${decision.processName}` : ""} (${decision.reason}).`
-          );
-        }
+        this.routingDecisions.record(target, decision);
         return channel;
       }
     });
@@ -1590,8 +1664,8 @@ export class XrayServiceBridge {
     return Math.max(PROCESS_ROUTE_TTL_MS, this.currentProcessRoutingRefreshIntervalMs() * 3);
   }
 
-  private appendProcessLog(level: DiagnosticsEntry["level"], chunk: string): boolean {
-    if (this.processLogLines >= MAX_XRAY_PROCESS_LOG_LINES) {
+  private appendProcessLog(streamLevel: DiagnosticsEntry["level"], chunk: string): boolean {
+    if (this.importantProcessLogLines >= MAX_XRAY_IMPORTANT_LOG_LINES) {
       return false;
     }
     const boundedChunk = chunk.length > MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS
@@ -1602,10 +1676,25 @@ export class XrayServiceBridge {
       if (!line) {
         continue;
       }
-      this.processLogLines += 1;
-      if (this.processLogLines === MAX_XRAY_PROCESS_LOG_LINES) {
-        this.appendDiagnostic("info", "Further Xray runtime diagnostics are suppressed for this session.");
-        return false;
+      const level = classifyXrayLogLevel(line, streamLevel);
+      if (level === "info") {
+        if (this.routineProcessLogLines >= MAX_XRAY_ROUTINE_LOG_LINES) {
+          continue;
+        }
+        this.routineProcessLogLines += 1;
+        if (this.routineProcessLogLines === MAX_XRAY_ROUTINE_LOG_LINES) {
+          this.appendDiagnostic(
+            "info",
+            "Further Xray connection notices are suppressed for this session. Warnings and errors are still recorded."
+          );
+          continue;
+        }
+      } else {
+        this.importantProcessLogLines += 1;
+        if (this.importantProcessLogLines === MAX_XRAY_IMPORTANT_LOG_LINES) {
+          this.appendDiagnostic("warning", "Further Xray warnings are suppressed for this session.");
+          return false;
+        }
       }
       const boundedLine = line.length > MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS
         ? `${line.slice(0, MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS)}…`
@@ -1731,4 +1820,25 @@ function enabledProcessRuleNames(rules: RoutingRule[]): Set<string> {
 
 function redactSecrets(message: string): string {
   return message.replace(/(password|passphrase|private key|proxy uri|uri)\s*[:=]\s*\S+/giu, "$1=<redacted>");
+}
+
+/**
+ * Reads Xray's own severity marker, which is what separates a connection
+ * notice from the failure that explains it. Xray writes both to stdout, so the
+ * stream a line arrived on says nothing useful on its own.
+ */
+export function classifyXrayLogLevel(
+  line: string,
+  streamLevel: DiagnosticsEntry["level"]
+): DiagnosticsEntry["level"] {
+  if (/\[Error\]/u.test(line)) {
+    return "error";
+  }
+  if (/\[Warning\]/u.test(line)) {
+    return "warning";
+  }
+  if (/\[Info\]|\[Debug\]/u.test(line)) {
+    return "info";
+  }
+  return streamLevel;
 }

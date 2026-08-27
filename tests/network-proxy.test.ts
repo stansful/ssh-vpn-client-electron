@@ -184,6 +184,90 @@ describe("SOCKS5 proxy", () => {
     });
   });
 
+  // Windows can only spell one SOCKS endpoint in its proxy settings, and every
+  // major client reads it as SOCKS4. Rejecting the greeting at the first byte
+  // dropped whole applications, so both SOCKS4 forms are parsed here.
+  it("parses SOCKS4 CONNECT requests to a literal address", async () => {
+    const socket = new FakeSocket() as unknown as Socket;
+    const request = readProxyConnectRequest(socket);
+    const fake = socket as unknown as FakeSocket;
+
+    fake.pushInput(Buffer.from([0x04, 0x01, 0x01, 0xbb, 93, 184, 216, 34, 0x00]));
+
+    await expect(request).resolves.toEqual({
+      protocol: "socks4",
+      target: { host: "93.184.216.34", port: 443 }
+    });
+  });
+
+  it("parses SOCKS4a CONNECT requests carrying a host name after the user id", async () => {
+    const socket = new FakeSocket() as unknown as Socket;
+    const request = readProxyConnectRequest(socket);
+    const fake = socket as unknown as FakeSocket;
+
+    fake.pushInput(Buffer.concat([
+      Buffer.from([0x04, 0x01, 0x01, 0xbb, 0, 0, 0, 1]),
+      Buffer.from("shadow\u0000", "latin1"),
+      Buffer.from("it-is.ktalk.ru\u0000", "latin1")
+    ]));
+
+    await expect(request).resolves.toEqual({
+      protocol: "socks4",
+      target: { host: "it-is.ktalk.ru", port: 443 }
+    });
+  });
+
+  it("preserves early bytes sent with a SOCKS4 CONNECT request", async () => {
+    const socket = new FakeSocket() as unknown as Socket;
+    const request = readProxyConnectRequest(socket);
+    const fake = socket as unknown as FakeSocket;
+    const early = Buffer.from("TLS-CLIENT-HELLO", "utf8");
+
+    fake.pushInput(Buffer.concat([
+      Buffer.from([0x04, 0x01, 0x01, 0xbb, 127, 0, 0, 1, 0x00]),
+      early
+    ]));
+
+    await expect(request).resolves.toEqual({
+      protocol: "socks4",
+      target: { host: "127.0.0.1", port: 443 },
+      initialData: early
+    });
+  });
+
+  it("answers a SOCKS4 CONNECT with a granted reply and its failure code", async () => {
+    const channel = new MemoryDirectTcpIpChannel();
+    const granted = new Socks5Proxy({ listenPort: 0, connectChannel: async () => channel });
+    const grantedSocket = new FlowingFakeSocket() as unknown as Socket;
+    const grantedHandling = (granted as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(grantedSocket);
+    (grantedSocket as unknown as FlowingFakeSocket).pushInput(
+      Buffer.from([0x04, 0x01, 0x01, 0xbb, 93, 184, 216, 34, 0x00])
+    );
+    await waitForParser();
+    expect(Buffer.concat((grantedSocket as unknown as FlowingFakeSocket).writes)).toEqual(
+      Buffer.from([0x00, 0x5a, 0, 0, 0, 0, 0, 0])
+    );
+
+    const refused = new Socks5Proxy({
+      listenPort: 0,
+      connectChannel: async () => {
+        throw new Error("Connection refused");
+      }
+    });
+    const refusedSocket = new FlowingFakeSocket() as unknown as Socket;
+    const refusedHandling = (refused as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(refusedSocket);
+    (refusedSocket as unknown as FlowingFakeSocket).pushInput(
+      Buffer.from([0x04, 0x01, 0x01, 0xbb, 93, 184, 216, 34, 0x00])
+    );
+    await refusedHandling;
+    expect(Buffer.concat((refusedSocket as unknown as FlowingFakeSocket).writes)).toEqual(
+      Buffer.from([0x00, 0x5b, 0, 0, 0, 0, 0, 0])
+    );
+
+    grantedSocket.destroy();
+    await grantedHandling;
+  });
+
   it("parses SOCKS5 CONNECT requests delivered in one TCP chunk", async () => {
     const socket = new FakeSocket() as unknown as Socket;
     const request = readProxyConnectRequest(socket);

@@ -771,15 +771,34 @@ describe("Xray service lifecycle", () => {
     await service.connect(proxyRequest("logs"));
 
     processHandle.stdout.emit("data", `${"x".repeat(10_000)}\n`);
-    processHandle.stderr.emit(
+    // Xray writes one of these per connection; a busy client produces hundreds
+    // in a minute.
+    processHandle.stdout.emit(
       "data",
-      Array.from({ length: 100 }, (_, index) => `warning-${index}`).join("\n")
+      Array.from({ length: 400 }, (_, index) => `2026/08/28 [Info] proxy: accepted tcp:1.1.1.1:443 #${index}`).join("\n")
     );
+
+    expect(diagnostics.filter((message) => message.includes("connection notices are suppressed"))).toHaveLength(1);
+    const noticeCount = diagnostics.filter((message) => message.includes("accepted tcp:")).length;
+    expect(noticeCount).toBeLessThan(60);
+
+    // The whole point: a warning arriving after the chatter was capped still
+    // reaches the log. Sharing one budget meant the line explaining a failed
+    // outbound was thrown away with the noise that caused it.
+    processHandle.stdout.emit("data", "2026/08/28 [Warning] core: failed to process outbound traffic\n");
+    expect(diagnostics.some((message) => message.includes("failed to process outbound traffic"))).toBe(true);
+    expect(processHandle.stdout.listenerCount("data")).toBe(1);
 
     const xrayLines = diagnostics.filter((message) => message.startsWith("Xray: "));
     expect(xrayLines[0]?.length).toBeLessThanOrEqual(4103);
-    expect(xrayLines).toHaveLength(79);
-    expect(diagnostics.filter((message) => message.includes("Further Xray runtime diagnostics"))).toHaveLength(1);
+
+    // Warnings are bounded too, and exhausting that budget is what finally
+    // detaches the pipes - which must then keep draining on their own.
+    processHandle.stderr.emit(
+      "data",
+      Array.from({ length: 400 }, (_, index) => `warning-${index}`).join("\n")
+    );
+    expect(diagnostics.filter((message) => message.includes("Further Xray warnings are suppressed"))).toHaveLength(1);
     expect(processHandle.stdout.listenerCount("data")).toBe(0);
     expect(processHandle.stderr.listenerCount("data")).toBe(0);
     expect(processHandle.stdout.resume).toHaveBeenCalled();

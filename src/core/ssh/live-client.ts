@@ -339,12 +339,6 @@ export class SshLiveClient {
     }
   }
 
-  async checkTunnel(endpoint: string): Promise<void> {
-    const target = parseEndpoint(endpoint);
-    const channel = await this.openDirectTcpIpChannel(target, { address: "127.0.0.1", port: 0 });
-    await channel.close();
-  }
-
   sendKeepalive(): Promise<void> {
     if (this.keepalivePromise) {
       return this.keepalivePromise;
@@ -1343,21 +1337,6 @@ function isChannelMessage(number: number): boolean {
     number === SSH_MSG_CHANNEL_FAILURE ||
     number === SSH_MSG_CHANNEL_REQUEST
   );
-}
-
-function parseEndpoint(endpoint: string): DirectTcpIpTarget {
-  const trimmed = endpoint.trim();
-  if (!trimmed) {
-    throw new Error("Endpoint is required.");
-  }
-
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//iu.test(trimmed) ? trimmed : `tcp://${trimmed}`;
-  const url = new URL(withScheme);
-  const port = Number(url.port);
-  if (!url.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`Malformed endpoint ${endpoint}. Use host:port.`);
-  }
-  return { host: url.hostname.replace(/^\[(.*)\]$/u, "$1"), port };
 }
 
 async function settlesSuccessfullyWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {

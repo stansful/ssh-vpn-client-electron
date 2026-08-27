@@ -173,3 +173,59 @@ func TestJournalIsWrittenBeforeTheFirstChange(t *testing.T) {
 		t.Fatalf("expected the journal to be cleared after restore, got %v (%v)", entries, err)
 	}
 }
+
+func TestRestoreRunsEveryUndoEvenWhenTheCallerGaveUp(t *testing.T) {
+	// Teardown is routinely reached with a context that is already cancelled -
+	// the IPC client went away, or the service is being signalled. Honouring it
+	// would abort every remaining undo instantly and leave the machine with
+	// capture routes pointing at an adapter that is about to disappear, which
+	// is what makes the next connect unable to bring the tunnel back up.
+	var executed []string
+	manager := NewManager(filepath.Join(t.TempDir(), "routing.json"), func(ctx context.Context, argv []string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		executed = append(executed, strings.Join(argv, " "))
+		return nil
+	}, nil)
+
+	if err := manager.Apply(context.Background(), basePlan()); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	applied := len(executed)
+	executed = nil
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Restore(cancelled); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if len(executed) != applied {
+		t.Fatalf("expected all %d undo commands to run, got %d", applied, len(executed))
+	}
+}
+
+func TestRecoverAlsoIgnoresACancelledCaller(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routing.json")
+	if err := NewJournalFile(path).Write([]Operation{{Description: "left over", Undo: []string{"netsh", "undo"}}}); err != nil {
+		t.Fatalf("write journal: %v", err)
+	}
+
+	var executed []string
+	manager := NewManager(path, func(ctx context.Context, argv []string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		executed = append(executed, strings.Join(argv, " "))
+		return nil
+	}, nil)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Recover(cancelled); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if len(executed) != 1 {
+		t.Fatalf("expected the journalled undo to run, got %v", executed)
+	}
+}

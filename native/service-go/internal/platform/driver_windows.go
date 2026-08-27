@@ -20,7 +20,7 @@ func (windowsDriver) Capabilities() Capabilities {
 	// table are out of reach unless the user started it as administrator.
 	// Reporting the capability honestly is what lets the app choose the
 	// system-proxy path up front instead of failing at connect time.
-	dataplaneReady := winnet.IsElevated() && tun.Available() == nil
+	dataplaneReady, unavailableReason := tunReadiness()
 	return Capabilities{
 		Target:                       CurrentTarget(),
 		IPC:                          "named-pipe-or-stdio",
@@ -37,9 +37,15 @@ func (windowsDriver) Capabilities() Capabilities {
 		// Whether datagrams can actually be carried depends on the transport,
 		// not on this process; the flag reports that the dataplane can forward
 		// them when the transport accepts them.
-		UDPForwarding: dataplaneReady,
-		SSHCoreLinked: false,
+		UDPForwarding:        dataplaneReady,
+		SSHCoreLinked:        false,
+		TUNUnavailableReason: unavailableReason,
 	}
+}
+
+// tunReadiness answers whether an adapter can be created on this machine.
+func tunReadiness() (bool, string) {
+	return describeTUNReadiness(winnet.IsElevated(), tun.Available())
 }
 
 func (windowsDriver) ApplyRouting(context.Context, RoutingConfig) error {

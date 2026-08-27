@@ -232,6 +232,7 @@ const xrayService = new XrayServiceBridge(
     nativeServiceExecutablePath: nativeServiceExists(projectRoot, platformTarget)
       ? resolveNativeServicePath(projectRoot, platformTarget)
       : undefined,
+    userDataDirectory: explicitUserDataPath,
     runtimeDirectory: xrayRuntimeDataPath,
     executablePath: resolveXrayExecutablePath({
       packaged: app.isPackaged,
@@ -833,7 +834,8 @@ async function createServiceBridge(initialRuntime: RuntimeStatus): Promise<{ ser
       // per-connection process attribution; it never carries tunnel traffic.
       nativeServiceExecutablePath: nativeBinaryAvailable
         ? resolveNativeServicePath(projectRoot, platformTarget)
-        : undefined
+        : undefined,
+      userDataDirectory: explicitUserDataPath
     })
   };
 }

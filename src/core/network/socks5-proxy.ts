@@ -31,7 +31,9 @@ export interface Socks5ProxyEvent {
   message: string;
 }
 
-export type ProxyProtocol = "socks5" | "http-connect" | "http-forward";
+export type ProxyProtocol = "socks5" | "socks4" | "http-connect" | "http-forward";
+
+type ProxyFailureProtocol = "http" | "socks5" | "socks4";
 
 export interface ProxyConnectRequest {
   protocol: ProxyProtocol;
@@ -183,7 +185,7 @@ export class Socks5Proxy {
         const limit = this.options.maxPendingChannelOpens ?? this.options.maxConnections ?? 512;
         throw new ProxyHandshakeError(
           `SOCKS/HTTP proxy pending SSH channel-open limit ${limit} reached.`,
-          request.protocol === "socks5" ? "socks5" : "http"
+          proxyFailureProtocol(request.protocol)
         );
       }
       let channel: DirectTcpIpChannel;
@@ -265,6 +267,9 @@ export class Socks5Proxy {
 
       if (request.protocol === "socks5") {
         socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        proxyReplySent = true;
+      } else if (request.protocol === "socks4") {
+        socket.write(Buffer.from([0x00, 0x5a, 0, 0, 0, 0, 0, 0]));
         proxyReplySent = true;
       } else if (request.protocol === "http-connect") {
         socket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow SSH\r\n\r\n", "utf8");
@@ -354,8 +359,8 @@ export class Socks5Proxy {
       const responseAlreadySent = proxyReplySent || (error instanceof ProxyHandshakeError && error.responseAlreadySent);
       if (!responseAlreadySent) {
         const failureProtocol = request
-          ? request.protocol === "socks5" ? "socks5" : "http"
-          : isHttpHandshakeError(error) ? "http" : "socks5";
+          ? proxyFailureProtocol(request.protocol)
+          : handshakeFailureProtocol(error);
         writeProxyFailure(socket, failureProtocol);
       }
       if (!socket.destroyed) {
@@ -410,6 +415,15 @@ export async function readProxyConnectRequest(socket: net.Socket): Promise<Proxy
     const rest = reader.takeBuffered();
     return {
       protocol: "socks5",
+      target,
+      initialData: rest.length > 0 ? rest : undefined
+    };
+  }
+  if (firstByte === 0x04) {
+    const target = await readSocks4ConnectRequestFromReader(reader);
+    const rest = reader.takeBuffered();
+    return {
+      protocol: "socks4",
       target,
       initialData: rest.length > 0 ? rest : undefined
     };
@@ -473,6 +487,48 @@ async function readSocksConnectRequestFromReader(reader: ProxySocketReader, firs
     throw new Error("SOCKS5 target port must be between 1 and 65535.");
   }
   return { host, port };
+}
+
+// Windows publishes a single `socks=host:port` entry in its proxy settings and
+// every major client - Chrome, Firefox, WinINet - reads that entry as SOCKS4,
+// not SOCKS5. A listener that answered SOCKS5 only dropped those clients at the
+// first byte, so SOCKS4 (and its SOCKS4a host-name form) is parsed here as well.
+async function readSocks4ConnectRequestFromReader(reader: ProxySocketReader): Promise<DirectTcpIpTarget> {
+  const header = await reader.read(7);
+  if (header[0] !== 0x01) {
+    throw new ProxyHandshakeError("Only SOCKS4 CONNECT requests are supported.", "socks4");
+  }
+  const port = header.readUInt16BE(1);
+  if (port === 0) {
+    throw new ProxyHandshakeError("SOCKS4 target port must be between 1 and 65535.", "socks4");
+  }
+  const address = header.subarray(3, 7);
+  await readSocks4Field(reader, 255, "user id");
+  // SOCKS4a signals "the host name follows the user id" with an otherwise
+  // invalid 0.0.0.x destination address.
+  const carriesHostName = address[0] === 0 && address[1] === 0 && address[2] === 0 && address[3] !== 0;
+  if (!carriesHostName) {
+    return { host: Array.from(address).join("."), port };
+  }
+  const host = await readSocks4Field(reader, 255, "host name");
+  if (host.length === 0) {
+    throw new ProxyHandshakeError("SOCKS4a target host is empty.", "socks4");
+  }
+  return { host, port };
+}
+
+async function readSocks4Field(reader: ProxySocketReader, maxLength: number, description: string): Promise<string> {
+  const bytes: number[] = [];
+  for (;;) {
+    const byte = (await reader.read(1))[0];
+    if (byte === 0) {
+      return Buffer.from(bytes).toString("utf8");
+    }
+    if (bytes.length >= maxLength) {
+      throw new ProxyHandshakeError(`SOCKS4 ${description} is too long.`, "socks4");
+    }
+    bytes.push(byte);
+  }
 }
 
 async function readHttpProxyRequest(reader: ProxySocketReader, firstByte: number): Promise<ProxyConnectRequest> {
@@ -601,14 +657,32 @@ function readHttpHeader(reader: ProxySocketReader, initial: Buffer): Promise<{ h
   return reader.readHttpHeader(initial, maxHeaderBytes);
 }
 
-function writeProxyFailure(socket: net.Socket, protocol: "http" | "socks5"): void {
+function writeProxyFailure(socket: net.Socket, protocol: ProxyFailureProtocol): void {
   if (!socket.destroyed) {
     if (protocol === "http") {
       socket.write("HTTP/1.1 502 Bad Gateway\r\nProxy-Agent: Shadow SSH\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", "utf8");
       return;
     }
+    if (protocol === "socks4") {
+      socket.write(Buffer.from([0x00, 0x5b, 0, 0, 0, 0, 0, 0]));
+      return;
+    }
     socket.write(Buffer.from([0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
   }
+}
+
+function proxyFailureProtocol(protocol: ProxyProtocol): ProxyFailureProtocol {
+  if (protocol === "socks5" || protocol === "socks4") {
+    return protocol;
+  }
+  return "http";
+}
+
+function handshakeFailureProtocol(error: unknown): ProxyFailureProtocol {
+  if (error instanceof ProxyHandshakeError && (error.protocol === "http" || error.protocol === "socks4")) {
+    return error.protocol;
+  }
+  return "socks5";
 }
 
 function formatIpv6(bytes: Buffer): string {
@@ -626,6 +700,9 @@ function normalizeListenAddress(address: string): string {
 function formatProtocol(protocol: ProxyProtocol): string {
   if (protocol === "socks5") {
     return "SOCKS5 CONNECT";
+  }
+  if (protocol === "socks4") {
+    return "SOCKS4 CONNECT";
   }
   if (protocol === "http-connect") {
     return "HTTP CONNECT";
@@ -803,10 +880,6 @@ function parsePort(value: string): number {
   return port;
 }
 
-function isHttpHandshakeError(error: unknown): boolean {
-  return error instanceof ProxyHandshakeError && error.protocol === "http";
-}
-
 class HttpForwardBodyGate {
   private readonly mode: "none" | "content-length" | "chunked" | "stream";
   private remainingContentBytes: number;
@@ -917,7 +990,7 @@ class HttpForwardBodyGate {
 class ProxyHandshakeError extends Error {
   constructor(
     message: string,
-    readonly protocol: "http" | "socks5" | "unknown",
+    readonly protocol: ProxyFailureProtocol | "unknown",
     readonly responseAlreadySent = false
   ) {
     super(message);

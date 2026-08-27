@@ -13,6 +13,14 @@ export interface ProcessAttribution {
    * when the owner cannot be determined.
    */
   resolveProcessName(localPort: number): Promise<string | undefined>;
+  /**
+   * Explains the last `isAvailable()` refusal, when there is something to say.
+   *
+   * Routing silently changes shape on that answer, so without this the user
+   * sees per-process rules stop working with nothing in the log naming the
+   * cause.
+   */
+  unavailableReason?(): string | undefined;
   dispose(): Promise<void>;
 }
 
@@ -21,12 +29,25 @@ export interface NativeProcessAttributionOptions {
   /** Injection seam for tests; defaults to spawning the native helper. */
   snapshotProvider?: () => Promise<Map<number, string>>;
   onDiagnostic?: (level: "info" | "warning", message: string) => void;
+  /** Injection seam for tests; defaults to the monotonic clock. */
+  now?: () => number;
 }
 
-/** Consecutive snapshot failures after which attribution stops being retried. */
+/** Consecutive snapshot failures after which attribution pauses. */
 const MAX_SNAPSHOT_FAILURES = 5;
 /** Bounds the retry loop inside a single resolve call. */
 const MAX_SNAPSHOT_ATTEMPTS = 2;
+/**
+ * How long attribution stays paused after it gives up.
+ *
+ * The pause exists so a broken helper is not re-spawned on the hot path of
+ * every accepted socket. It must not be permanent: the helper dying once - a
+ * transport reconnect, a helper restart - would otherwise disable per-process
+ * routing for the rest of the application's life, and the only cure the user
+ * could find was quitting the app entirely. Domain rules kept working the whole
+ * time, which is what made it look like process rules alone were broken.
+ */
+const SNAPSHOT_RETRY_AFTER_MS = 20_000;
 
 /**
  * Resolves the owning process of a loopback connection through the native
@@ -48,13 +69,18 @@ export class NativeProcessAttribution implements ProcessAttribution {
   private running: { startedAt: bigint; promise: Promise<void> } | undefined;
   private queued: Promise<void> | undefined;
   private consecutiveFailures = 0;
+  private pausedAt = 0;
+  private lastFailure = "";
   private disposed = false;
   private helper: NativeHelperClient | undefined;
+  private readonly now: () => number;
 
-  constructor(private readonly options: NativeProcessAttributionOptions) {}
+  constructor(private readonly options: NativeProcessAttributionOptions) {
+    this.now = options.now ?? (() => Date.now());
+  }
 
   async isAvailable(): Promise<boolean> {
-    if (this.disposed || this.consecutiveFailures >= MAX_SNAPSHOT_FAILURES) {
+    if (this.disposed || this.isPaused()) {
       return false;
     }
     // Take a real snapshot rather than only starting the helper: a binary that
@@ -69,7 +95,7 @@ export class NativeProcessAttribution implements ProcessAttribution {
     if (this.disposed || !Number.isInteger(localPort) || localPort <= 0 || localPort > 65_535) {
       return undefined;
     }
-    if (this.consecutiveFailures >= MAX_SNAPSHOT_FAILURES) {
+    if (this.isPaused()) {
       return undefined;
     }
 
@@ -84,6 +110,36 @@ export class NativeProcessAttribution implements ProcessAttribution {
       }
     }
     return this.snapshot.get(localPort);
+  }
+
+  /**
+   * Reports whether attribution is currently standing down, and lets the pause
+   * lapse once it has served its purpose.
+   */
+  private isPaused(): boolean {
+    if (this.consecutiveFailures < MAX_SNAPSHOT_FAILURES) {
+      return false;
+    }
+    if (this.now() - this.pausedAt < SNAPSHOT_RETRY_AFTER_MS) {
+      return true;
+    }
+    this.consecutiveFailures = 0;
+    this.pausedAt = 0;
+    return false;
+  }
+
+  /** Implements {@link ProcessAttribution.unavailableReason}. */
+  unavailableReason(): string | undefined {
+    if (this.disposed) {
+      return "the attribution helper has been shut down";
+    }
+    if (this.consecutiveFailures >= MAX_SNAPSHOT_FAILURES) {
+      return `the native helper failed ${MAX_SNAPSHOT_FAILURES} snapshots in a row and is paused for ${Math.round(SNAPSHOT_RETRY_AFTER_MS / 1000)}s${this.lastFailure ? `: ${this.lastFailure}` : ""}`;
+    }
+    if (this.consecutiveFailures > 0 && this.lastFailure) {
+      return `the native helper could not read the process table: ${this.lastFailure}`;
+    }
+    return undefined;
   }
 
   async dispose(): Promise<void> {
@@ -140,14 +196,17 @@ export class NativeProcessAttribution implements ProcessAttribution {
       }
       this.snapshot = snapshot;
       this.consecutiveFailures = 0;
+      this.lastFailure = "";
     } catch (error) {
       this.consecutiveFailures += 1;
+      this.lastFailure = errorMessage(error);
       // Advance the timestamp even on failure so the caller's bounded retry loop
       // terminates instead of spinning on an unreachable helper.
       if (this.consecutiveFailures === MAX_SNAPSHOT_FAILURES) {
+        this.pausedAt = this.now();
         this.options.onDiagnostic?.(
           "warning",
-          `Process attribution is disabled after ${MAX_SNAPSHOT_FAILURES} failed native snapshots: ${errorMessage(error)}`
+          `Process attribution is paused for ${Math.round(SNAPSHOT_RETRY_AFTER_MS / 1000)}s after ${MAX_SNAPSHOT_FAILURES} failed native snapshots: ${errorMessage(error)}`
         );
       } else if (this.consecutiveFailures === 1) {
         this.options.onDiagnostic?.("warning", `Native process attribution snapshot failed: ${errorMessage(error)}`);

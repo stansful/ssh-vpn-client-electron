@@ -63,13 +63,40 @@ export class LocalRoutingEnforcer {
    * disable the tunnel.
    */
   async isEnforceable(context: LocalRoutingContext, platform: NodeJS.Platform = process.platform): Promise<boolean> {
-    if (platform !== "win32" || context.routingMode !== "selected-rules") {
-      return false;
+    return (await this.describeEnforceability(context, platform)).enforceable;
+  }
+
+  /**
+   * The same answer with the reason attached.
+   *
+   * Falling back to the PAC path changes what a `process.name` rule can reach,
+   * and it happens for several unrelated causes. Reporting only the fallback -
+   * as this did - leaves the user watching per-process routing stop working
+   * with nothing in the log to act on.
+   */
+  async describeEnforceability(
+    context: LocalRoutingContext,
+    platform: NodeJS.Platform = process.platform
+  ): Promise<{ enforceable: boolean; reason?: string }> {
+    if (platform !== "win32") {
+      return { enforceable: false, reason: "per-process enforcement is only implemented on Windows" };
+    }
+    if (context.routingMode !== "selected-rules") {
+      return { enforceable: false };
     }
     if (!hasEnabledProcessRule(context.routingRules)) {
-      return false;
+      return { enforceable: false };
     }
-    return (await this.attribution?.isAvailable()) === true;
+    if (!this.attribution) {
+      return { enforceable: false, reason: "the native helper is not configured for this build" };
+    }
+    if (await this.attribution.isAvailable()) {
+      return { enforceable: true };
+    }
+    return {
+      enforceable: false,
+      reason: this.attribution.unavailableReason?.() ?? "the native helper could not read the process table"
+    };
   }
 
   /**
@@ -166,6 +193,63 @@ export class LocalRoutingEnforcer {
       };
     }
     return this.policyCache;
+  }
+}
+
+/** How many per-connection decisions of each direction reach the log. */
+export const MAX_LOGGED_DECISIONS_PER_DIRECTION = 60;
+
+/** Renders one routing decision for the diagnostics log. */
+export function describeRoutingDecision(target: DirectTcpIpTarget, decision: LocalRoutingDecision): string {
+  const origin = decision.processName ? ` from ${decision.processName}` : "";
+  const egress = decision.shouldProxy ? "Tunnel" : "Direct";
+  return `${egress} egress for ${target.host}:${target.port}${origin} (${decision.reason}).`;
+}
+
+/**
+ * Caps how many per-connection decisions reach the log, counting each
+ * direction separately.
+ *
+ * The separate budgets are the point. Only the direct branch used to be
+ * logged, so a log full of `Direct egress` lines could not distinguish "no
+ * rule matched this traffic" from "every rule matched and the tunnel behind
+ * them is dead" - which is the question every routing complaint actually turns
+ * on. Logging both directions from one shared budget would have reintroduced
+ * the same blindness by a different route, because a browser opens hundreds of
+ * unmatched sockets a minute and would spend the whole budget before a single
+ * tunnelled line was written.
+ *
+ * Both transports share this so their diagnostics cannot drift apart.
+ */
+export class RoutingDecisionLog {
+  private tunnelled = 0;
+  private direct = 0;
+
+  constructor(
+    private readonly emit: (message: string) => void,
+    private readonly limit: number = MAX_LOGGED_DECISIONS_PER_DIRECTION
+  ) {}
+
+  /** Starts a fresh budget, so a reconnect is not silenced by the last session. */
+  reset(): void {
+    this.tunnelled = 0;
+    this.direct = 0;
+  }
+
+  record(target: DirectTcpIpTarget, decision: LocalRoutingDecision): void {
+    const count = decision.shouldProxy ? (this.tunnelled += 1) : (this.direct += 1);
+    if (count > this.limit) {
+      return;
+    }
+    if (count === this.limit) {
+      this.emit(
+        decision.shouldProxy
+          ? "Further tunnelled routing decisions are suppressed for this session."
+          : "Further direct routing decisions are suppressed for this session."
+      );
+      return;
+    }
+    this.emit(describeRoutingDecision(target, decision));
   }
 }
 

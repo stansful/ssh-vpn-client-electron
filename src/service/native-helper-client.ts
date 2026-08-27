@@ -32,6 +32,8 @@ export interface NativeHelperClientOptions {
   onStderrLine?: (line: string) => void;
   /** Called once when the helper stops answering, for any reason. */
   onClosed?: (error: Error) => void;
+  /** Extra environment for the spawned helper, merged over this process's own. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export class NativeHelperClient {
@@ -63,7 +65,11 @@ export class NativeHelperClient {
    * than as usable-with-surprises.
    */
   static async start(executablePath: string, options: NativeHelperClientOptions = {}): Promise<NativeHelperClient> {
-    const child = spawn(executablePath, ["--stdio"], { env: process.env, stdio: "pipe", windowsHide: true });
+    const child = spawn(executablePath, ["--stdio"], {
+      env: options.env ? { ...process.env, ...options.env } : process.env,
+      stdio: "pipe",
+      windowsHide: true
+    });
     const client = new NativeHelperClient(child, options);
     try {
       const handshake = await client.send<NativeServiceHandshake>({ id: randomUUID(), type: "get-capabilities" });

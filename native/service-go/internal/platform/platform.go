@@ -32,6 +32,11 @@ type Capabilities struct {
 	IPv6RouteEnforcement         bool   `json:"ipv6RouteEnforcement"`
 	UDPForwarding                bool   `json:"udpForwarding"`
 	SSHCoreLinked                bool   `json:"sshCoreLinked"`
+	// TUNUnavailableReason says why TUNDevice is false, in terms the user can
+	// act on. Creating an adapter needs two unrelated things - the DLL and
+	// administrator rights - and a single "cannot create a tunnel adapter"
+	// sent people chasing the wrong one.
+	TUNUnavailableReason string `json:"tunUnavailableReason,omitempty"`
 }
 
 type RoutingRule struct {

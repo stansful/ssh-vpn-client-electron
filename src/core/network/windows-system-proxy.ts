@@ -155,7 +155,7 @@ export class WindowsSystemProxyManager {
       // pointing at a listener we already stopped.
       await this.stopPacServer();
       this.registeredPacUrl = undefined;
-      return { applied: true, message: `Windows system HTTP/SOCKS proxy enabled at ${request.socksHost}:${request.socksPort}.` };
+      return { applied: true, message: `Windows system proxy enabled at ${request.socksHost}:${request.socksPort}.` };
     }
 
     const pac = buildProxyPac(request.rules, request.socksHost, request.socksPort, request.proxyProtocol ?? "mixed", {
@@ -822,13 +822,18 @@ function defaultPacDirectory(): string {
 
 function buildWindowsProxyServer(host: string, port: number, proxyProtocol: "mixed" | "http" | "socks"): string {
   const endpoint = formatProxyEndpoint(host, port);
-  if (proxyProtocol === "http") {
-    return `http=${endpoint};https=${endpoint}`;
-  }
   if (proxyProtocol === "socks") {
     return `socks=${endpoint}`;
   }
-  return `http=${endpoint};https=${endpoint};socks=${endpoint}`;
+  // WinINet cannot spell "SOCKS5" in this string: Chrome and Firefox both read
+  // a bare `socks=` entry as SOCKS4. Chrome then prefers that entry over the
+  // http/https ones for ws:// and wss:// (RFC 6455 4.1.3), so advertising it
+  // turned every WebSocket handshake into a SOCKS4 greeting - which the mixed
+  // listener rejected at the first byte, breaking WebSocket applications
+  // (conferencing signalling above all) whether or not they were routed.
+  // The mixed listener answers HTTP CONNECT for every scheme, and CONNECT also
+  // preserves the host name that domain and process rules are matched on.
+  return `http=${endpoint};https=${endpoint}`;
 }
 
 function buildPacProxyReturn(host: string, port: number, proxyProtocol: "mixed" | "http" | "socks"): string {

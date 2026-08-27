@@ -138,24 +138,35 @@ describe("TUN routing", () => {
 
 interface FakeDataplane extends DataplaneController {
   started: DataplaneStartRequest[];
+  startAttempts: number;
   stopped: number;
   probes: number;
+  disposals: number;
 }
 
 function fakeDataplane({
   availability = { available: true } as DataplaneAvailability,
-  startError
-}: { availability?: DataplaneAvailability; startError?: Error } = {}): FakeDataplane {
+  startError,
+  failFirstStarts = 0
+}: { availability?: DataplaneAvailability; startError?: Error; failFirstStarts?: number } = {}): FakeDataplane {
+  let remainingFailures = failFirstStarts;
   const controller: FakeDataplane = {
     started: [],
+    startAttempts: 0,
     stopped: 0,
     probes: 0,
+    disposals: 0,
     isActive: false,
     probe: async () => {
       controller.probes += 1;
       return availability;
     },
     start: async (request) => {
+      controller.startAttempts += 1;
+      if (remainingFailures > 0) {
+        remainingFailures -= 1;
+        throw new Error("adapter is still being removed");
+      }
       if (startError) {
         throw startError;
       }
@@ -164,9 +175,28 @@ function fakeDataplane({
     stop: async () => {
       controller.stopped += 1;
     },
-    dispose: async () => undefined
+    dispose: async () => {
+      controller.disposals += 1;
+    }
   };
   return controller;
+}
+
+/**
+ * Attribution that answers, so the locally enforced path is taken - and that
+ * latches off once disposed, exactly as the real one does. Without the latch
+ * this fake would hide the bug it is here to catch.
+ */
+function workingAttribution(): ProcessAttribution {
+  let disposed = false;
+  return {
+    isAvailable: async () => !disposed,
+    resolveProcessName: async () => (disposed ? undefined : "telegram.exe"),
+    unavailableReason: () => (disposed ? "the attribution helper has been shut down" : undefined),
+    dispose: async () => {
+      disposed = true;
+    }
+  };
 }
 
 function attribution(): ProcessAttribution {
@@ -294,6 +324,281 @@ async function withWin32(run: () => Promise<void>): Promise<void> {
     }
   }
 }
+
+describe("TUN routing across a reconnect", () => {
+  it("retries a start that loses the race with the previous adapter being removed", async () => {
+    // Toggling the tunnel off and straight back on is the normal case, and it
+    // is exactly when Windows has not finished removing the old adapter. One
+    // attempt turned that race into a silent session-long fallback to the
+    // proxy path, where domain rules keep working and process rules do not -
+    // which is what the bug looked like from the outside.
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane({ failFirstStarts: 1 });
+      const service = createSshService(applies, dataplane);
+      const internals = service as unknown as SshInternals;
+      const messages: string[] = [];
+      service.onEvent((event) => {
+        if (event.type === "diagnostics-appended") {
+          messages.push(event.entry.message);
+        }
+      });
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+
+      expect(dataplane.startAttempts).toBe(2);
+      expect(dataplane.started).toHaveLength(1);
+      expect(applies).toHaveLength(0);
+      expect(messages.some((message) => message.includes("retrying"))).toBe(true);
+    });
+  });
+
+  it("says what a permanent failure costs instead of falling back silently", async () => {
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane({ startError: new Error("wintun.dll is missing") });
+      const service = createSshService(applies, dataplane);
+      const internals = service as unknown as SshInternals;
+      const messages: string[] = [];
+      service.onEvent((event) => {
+        if (event.type === "diagnostics-appended") {
+          messages.push(event.entry.message);
+        }
+      });
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+
+      expect(applies.length).toBeGreaterThan(0);
+      const fallback = messages.find((message) => message.includes("continuing on the Windows proxy path"));
+      expect(fallback).toContain("wintun.dll is missing");
+      // The tunnel still looks healthy on the fallback path, so the diagnostic
+      // has to name what stopped working.
+      expect(fallback).toContain("process rules will not reach");
+    });
+  });
+
+  it("brings the adapter back up on a second connect after a clean stop", async () => {
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane();
+      const service = createSshService(applies, dataplane);
+      const internals = service as unknown as SshInternals;
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const first = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = first;
+      await internals.applySystemRouting(first, { host: "127.0.0.1", port: 51_234 }, true);
+      await internals.stopRouting();
+
+      // The listener gets a fresh ephemeral port on every connect, so the
+      // helper has to be told where to send captured traffic again.
+      internals.status = { ...internals.status, state: "Connected" };
+      await internals.applySystemRouting(first, { host: "127.0.0.1", port: 51_999 }, true);
+
+      expect(dataplane.stopped).toBe(1);
+      expect(dataplane.started).toHaveLength(2);
+      expect(dataplane.started[1].tunnelProxyEndpoint).toBe("127.0.0.1:51999");
+      expect(applies).toHaveLength(0);
+    });
+  });
+});
+
+describe("Per-process enforcement across an Xray reconnect", () => {
+  // The Xray bridge used to dispose its attribution helper on an ordinary
+  // disconnect, so the second connect fell back to PAC guessing: domain rules
+  // kept working and process rules stopped reaching anything. SSH never had
+  // that bug, which is exactly how the asymmetry showed up in the field.
+  it("still enforces locally on the second connect", async () => {
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const service = new XrayServiceBridge(initialStatus(), {
+        runtimeDirectory: "/tmp/shadow-ssh-xray-reconnect",
+        systemProxy: systemProxy(applies),
+        processConnectionsProvider: async () => [],
+        processDnsEntriesProvider: async () => [],
+        processAttribution: workingAttribution(),
+        dataplane: fakeDataplane({ availability: { available: false, reason: "no adapter here" } }),
+        protectedAddressResolver: async () => ["203.0.113.9"]
+      });
+      const internals = service as unknown as XrayInternals;
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = xrayConnectRequest();
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+      // The enforced path points the system proxy at our own listener and
+      // takes over policy; the PAC fallback would publish "selected-rules".
+      expect(applies.at(-1)?.mode).toBe("proxy-all");
+
+      await service.disconnect();
+
+      internals.status = { ...internals.status, state: "Connected" };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_777 });
+      expect(applies.at(-1)?.mode).toBe("proxy-all");
+
+      await service.dispose();
+    });
+  });
+
+  it("names the cause when it has to fall back", async () => {
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const service = new XrayServiceBridge(initialStatus(), {
+        runtimeDirectory: "/tmp/shadow-ssh-xray-fallback",
+        systemProxy: systemProxy(applies),
+        processConnectionsProvider: async () => [],
+        processDnsEntriesProvider: async () => [],
+        processAttribution: {
+          isAvailable: async () => false,
+          resolveProcessName: async () => undefined,
+          unavailableReason: () => "the attribution helper has been shut down",
+          dispose: async () => undefined
+        },
+        dataplane: fakeDataplane({ availability: { available: false, reason: "no adapter here" } }),
+        protectedAddressResolver: async () => ["203.0.113.9"]
+      });
+      const internals = service as unknown as XrayInternals;
+      const messages: string[] = [];
+      service.onEvent((event) => {
+        if (event.type === "diagnostics-appended") {
+          messages.push(event.entry.message);
+        }
+      });
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = xrayConnectRequest();
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+
+      const warning = messages.find((message) => message.includes("Per-process enforcement is unavailable"));
+      expect(warning).toContain("the attribution helper has been shut down");
+      await service.dispose();
+    });
+  });
+});
+
+describe("Reporting why the tunnel adapter is unavailable", () => {
+  it("passes the helper's own reason through instead of guessing at elevation", async () => {
+    // "Start as administrator" is wrong advice for the user who already is one
+    // and whose wintun.dll is simply in the wrong folder - and there is no way
+    // for them to find that out from the app.
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane({
+        availability: {
+          available: false,
+          reason: String.raw`The native helper cannot create a tunnel adapter: wintun.dll was not found next to the service binary in C:\App
+esources
+ative\windowsd.`
+        }
+      });
+      const service = createSshService(applies, dataplane);
+      const internals = service as unknown as SshInternals;
+      const messages: string[] = [];
+      service.onEvent((event) => {
+        if (event.type === "diagnostics-appended") {
+          messages.push(event.entry.message);
+        }
+      });
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+
+      const warning = messages.find((message) => message.includes("TUN routing is unavailable"));
+      expect(warning).toContain("wintun.dll");
+      expect(warning).toContain(String.raw`C:\App
+esources
+ative\windowsd`);
+    });
+  });
+});
+
+describe("Disconnecting a transport must not end the helpers", () => {
+  // Disposal is permanent. Doing it on an ordinary disconnect made every later
+  // connect report "the dataplane controller is disposed" and fall back to the
+  // proxy path - where domain rules keep working and process rules do not, so
+  // the tunnel looked healthy while Telegram and Discord went direct.
+  it("keeps the Xray dataplane usable across disconnect and reconnect", async () => {
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane();
+      const attributionController = attribution();
+      let attributionDisposals = 0;
+      const service = new XrayServiceBridge(initialStatus(), {
+        runtimeDirectory: "/tmp/shadow-ssh-tun-routing-disconnect",
+        systemProxy: systemProxy(applies),
+        processConnectionsProvider: async () => [],
+        processDnsEntriesProvider: async () => [],
+        processAttribution: {
+          ...attributionController,
+          dispose: async () => {
+            attributionDisposals += 1;
+          }
+        },
+        dataplane,
+        protectedAddressResolver: async () => ["203.0.113.9"]
+      });
+      const internals = service as unknown as XrayInternals;
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...xrayConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+      expect(dataplane.started).toHaveLength(1);
+
+      await service.disconnect();
+      expect(dataplane.disposals).toBe(0);
+      expect(attributionDisposals).toBe(0);
+
+      internals.status = { ...internals.status, state: "Connected" };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_777 });
+
+      expect(dataplane.started).toHaveLength(2);
+      expect(dataplane.started[1].tunnelProxyEndpoint).toBe("127.0.0.1:52777");
+      expect(applies).toHaveLength(0);
+
+      // Quitting is the one moment that does end them.
+      await service.dispose();
+      expect(dataplane.disposals).toBe(1);
+      expect(attributionDisposals).toBe(1);
+    });
+  });
+
+  it("keeps the SSH dataplane usable across disconnect", async () => {
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane();
+      const service = createSshService(applies, dataplane);
+      const internals = service as unknown as SshInternals;
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+      expect(dataplane.started).toHaveLength(1);
+
+      await service.disconnect();
+      expect(dataplane.disposals).toBe(0);
+
+      internals.status = { ...internals.status, state: "Connected" };
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_888 }, true);
+      expect(dataplane.started).toHaveLength(2);
+
+      await service.dispose();
+      expect(dataplane.disposals).toBe(1);
+    });
+  });
+});
 
 describe("TUN routing refuses to capture without an exclusion", () => {
   it("stays on the proxy path when the transport server cannot be resolved", async () => {

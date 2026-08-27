@@ -12,43 +12,6 @@ export function parseEndpoint(endpoint: string): { host: string; port: number } 
   return { host, port };
 }
 
-export function checkSocks5Connect(proxy: { host: string; port: number }, target: { host: string; port: number }): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect(proxy.port, proxy.host);
-    const timeout = setTimeout(() => socket.destroy(new Error("SOCKS tunnel check timed out.")), 12_000);
-    timeout.unref();
-    let stage: "greeting" | "connect" = "greeting";
-
-    const fail = (error: Error): void => {
-      clearTimeout(timeout);
-      socket.destroy();
-      reject(error);
-    };
-    socket.once("error", fail);
-    socket.once("connect", () => {
-      socket.write(Buffer.from([0x05, 0x01, 0x00]));
-    });
-    socket.on("data", (data) => {
-      if (stage === "greeting") {
-        if (data.length < 2 || data[0] !== 0x05 || data[1] !== 0x00) {
-          fail(new Error("SOCKS proxy rejected no-auth handshake."));
-          return;
-        }
-        stage = "connect";
-        socket.write(buildSocks5ConnectRequest(target));
-        return;
-      }
-      if (data.length < 2 || data[1] !== 0x00) {
-        fail(new Error(`SOCKS proxy connect failed with code ${data[1] ?? "unknown"}.`));
-        return;
-      }
-      clearTimeout(timeout);
-      socket.end();
-      resolve();
-    });
-  });
-}
-
 export function buildSocks5ConnectRequest(target: { host: string; port: number }): Buffer {
   const host = target.host.trim();
   const port = Buffer.alloc(2);
