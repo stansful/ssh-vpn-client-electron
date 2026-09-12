@@ -107,6 +107,9 @@ let runtime: RuntimeStatus;
 let diagnostics: DiagnosticsEntry[] = [];
 let terminal: TerminalLine[] = [];
 let lastTunnelCheck: TunnelCheckResult | undefined;
+/** The connection whose tunnel has already been verified, so it is verified once. */
+let verifiedConnectionKey: string | undefined;
+let tunnelVerificationTimer: NodeJS.Timeout | undefined;
 let service: ServiceBridge;
 let serviceEventUnsubscribe: (() => void) | undefined;
 let diagnosticsLoggingEnabled = true;
@@ -1161,6 +1164,7 @@ function handleRuntimeEvent(source: "ssh" | "xray", event: ServiceEvent): void {
       return;
     }
     runtime = event.status;
+    scheduleTunnelVerification(source, event.status);
   }
   if (event.type === "diagnostics-appended") {
     const entry = normalizeDiagnosticEntry(event.entry);
@@ -1194,6 +1198,59 @@ function handleRuntimeEvent(source: "ssh" | "xray", event: ServiceEvent): void {
   if (isActive) {
     broadcast(event);
   }
+}
+
+/**
+ * How long a freshly connected transport is given before it is probed. An
+ * outbound with a handshake still to finish would otherwise be called dead for
+ * being slow.
+ */
+const TUNNEL_VERIFICATION_DELAY_MS = 1_500;
+
+/**
+ * Confirms once per connection that the tunnel actually carries data.
+ *
+ * A transport whose outbound is dead still accepts every connection the
+ * routing rules hand it, so what the user sees - selected traffic hangs,
+ * unselected traffic works - is indistinguishable from routing that stopped
+ * matching. The log could not tell them apart either: in selected-rules mode
+ * the transport's SOCKS inbound only relays bytes, so it never reads a
+ * response and has nothing to report, and the failure passed in silence. This
+ * probe is what puts the difference in writing, at the moment it matters.
+ */
+function scheduleTunnelVerification(source: "ssh" | "xray", status: RuntimeStatus): void {
+  if (status.state !== "Connected" || !status.connectedAt) {
+    cancelTunnelVerification();
+    return;
+  }
+  // Keyed on the moment of connection: a reconnect earns a fresh check, while
+  // the several status updates one connection emits do not.
+  const key = `${source}:${status.activeConfigId ?? ""}:${status.connectedAt}`;
+  if (verifiedConnectionKey === key) {
+    return;
+  }
+  cancelTunnelVerification();
+  verifiedConnectionKey = key;
+  tunnelVerificationTimer = setTimeout(() => {
+    tunnelVerificationTimer = undefined;
+    if (applicationQuitting || activeTransport !== source || verifiedConnectionKey !== key) {
+      return;
+    }
+    // The result reaches the renderer and `lastTunnelCheck` through the
+    // service's own `tunnel-check-result` event, exactly as a manual check does.
+    void (source === "xray" ? xrayService : service)
+      .checkTunnel(storage.getSettings().checkEndpoint)
+      .catch(() => undefined);
+  }, TUNNEL_VERIFICATION_DELAY_MS);
+  tunnelVerificationTimer.unref();
+}
+
+function cancelTunnelVerification(): void {
+  if (tunnelVerificationTimer) {
+    clearTimeout(tunnelVerificationTimer);
+    tunnelVerificationTimer = undefined;
+  }
+  verifiedConnectionKey = undefined;
 }
 
 function appendError(message: string): DiagnosticsEntry {

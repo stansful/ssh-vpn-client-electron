@@ -54,7 +54,7 @@ async function warnAboutMissingWintun() {
   console.warn(
     `\nwarning: TUN routing will be unavailable in this build - wintun.dll is missing:\n` +
       missing.map((entry) => `  ${entry}`).join("\n") +
-      `\nDownload it from https://www.wintun.net/ and place it there before packaging.\n` +
+      `\nRun \`npm run wintun:download\` before packaging; Windows packaging refuses to run without it.\n` +
       `Users of the built app can also drop it beside the portable .exe or in the app data folder.\n`
   );
 }

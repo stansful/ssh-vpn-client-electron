@@ -16,7 +16,8 @@ import { buildProxyPac } from "../src/core/network/windows-system-proxy.js";
 import { normalizeProxyDomain, parseDomainProxyList } from "../src/core/routing/domain-proxy-list.js";
 import {
   DEFAULT_PROXY_CONNECTION_QUEUE_BYTES,
-  DEFAULT_PROXY_TOTAL_QUEUE_BYTES
+  DEFAULT_PROXY_TOTAL_QUEUE_BYTES,
+  ESTABLISHED_TUNNEL_KEEPALIVE_DELAY_MS
 } from "../src/core/network/socket-io.js";
 
 describe("proxy memory policy", () => {
@@ -135,6 +136,46 @@ describe("SOCKS5 proxy", () => {
     expect(Buffer.concat(fake.writes).toString("latin1")).toBe(
       "HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow SSH\r\n\r\n"
     );
+  });
+
+  it("leaves an established tunnel without an inactivity deadline", async () => {
+    // A WebSocket, an MTProto session or an IRC chat is legitimately silent for
+    // long stretches. A deadline measured on silence would disconnect them
+    // mid-session, which is what a user sees as "the chat loaded and then
+    // stopped receiving messages". Liveness is TCP keepalive's job instead.
+    const channel = new MemoryDirectTcpIpChannel();
+    const proxy = new Socks5Proxy({ listenPort: 0, connectChannel: async () => channel });
+    const socket = new FlowingFakeSocket() as unknown as Socket;
+    const handling = (proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(socket);
+    const fake = socket as unknown as FlowingFakeSocket;
+
+    fake.pushInput(socksConnectRequest());
+    await waitFor(() => fake.writes.length > 0);
+
+    expect(fake.timeouts.filter((timeoutMs) => timeoutMs > 0)).toEqual([]);
+    expect(fake.keepAlives.at(-1)).toEqual({
+      enabled: true,
+      initialDelayMs: ESTABLISHED_TUNNEL_KEEPALIVE_DELAY_MS
+    });
+
+    fake.closeInput();
+    await handling;
+  });
+
+  it("still arms an inactivity deadline when a caller asks for one", async () => {
+    const channel = new MemoryDirectTcpIpChannel();
+    const proxy = new Socks5Proxy({ listenPort: 0, idleTimeoutMs: 90_000, connectChannel: async () => channel });
+    const socket = new FlowingFakeSocket() as unknown as Socket;
+    const handling = (proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(socket);
+    const fake = socket as unknown as FlowingFakeSocket;
+
+    fake.pushInput(socksConnectRequest());
+    await waitFor(() => fake.writes.length > 0);
+
+    expect(fake.timeouts).toContain(90_000);
+
+    fake.closeInput();
+    await handling;
   });
 
   it("rejects an oversized HTTP header even when its terminator is in the same chunk", async () => {
@@ -1241,7 +1282,11 @@ class FlowingFakeSocket extends EventEmitter {
     return this;
   }
 
-  setTimeout(): this {
+  readonly timeouts: number[] = [];
+  readonly keepAlives: { enabled: boolean; initialDelayMs?: number }[] = [];
+
+  setTimeout(timeoutMs: number): this {
+    this.timeouts.push(timeoutMs);
     return this;
   }
 
@@ -1249,7 +1294,8 @@ class FlowingFakeSocket extends EventEmitter {
     return this;
   }
 
-  setKeepAlive(): this {
+  setKeepAlive(enabled: boolean, initialDelayMs?: number): this {
+    this.keepAlives.push({ enabled, initialDelayMs });
     return this;
   }
 

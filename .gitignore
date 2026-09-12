@@ -5,3 +5,5 @@ dist
 node_modules
 release
 _to_delete
+# Third-party signed binary, fetched by `npm run wintun:download`.
+native/windows/*/wintun.dll

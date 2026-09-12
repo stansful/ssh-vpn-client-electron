@@ -39,6 +39,7 @@ import {
   recordBoundedProcessRouteIp
 } from "./live-ssh-service.js";
 import { reserveDistinctLocalTcpPorts, terminateProcess, waitForProcessStartup, type XrayProcess } from "./xray/process-utils.js";
+import { preferredLocalProxyPort, rememberLocalProxyPort } from "./local-proxy-port.js";
 
 export interface XrayServiceBridgeOptions {
   pacDirectory?: string;
@@ -1072,7 +1073,9 @@ export class XrayServiceBridge {
     this.localRoutingContext = context;
     const proxy = new Socks5Proxy({
       listenHost: "127.0.0.1",
-      idleTimeoutMs: 5 * 60 * 1000,
+      // Shared with the SSH transport, so switching between the two keeps the
+      // same local endpoint for clients that cannot follow the system proxy.
+      preferredListenPort: preferredLocalProxyPort(),
       connectChannel: async (target, originator, signal) => {
         const context = this.localRoutingContext;
         if (!context) {
@@ -1099,6 +1102,7 @@ export class XrayServiceBridge {
     });
     try {
       const endpoint = await proxy.start();
+      rememberLocalProxyPort(endpoint.port);
       this.localProxy = proxy;
       this.appendDiagnostic("info", `Local routing proxy is listening on ${endpoint.host}:${endpoint.port}.`);
       return endpoint;

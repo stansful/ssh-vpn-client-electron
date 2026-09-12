@@ -5,13 +5,25 @@ import {
   configureLowLatencySocket,
   DEFAULT_PROXY_CONNECTION_QUEUE_BYTES,
   DEFAULT_PROXY_TOTAL_QUEUE_BYTES,
+  ESTABLISHED_TUNNEL_KEEPALIVE_DELAY_MS,
   isSocketWritable,
   writeSocketWithBackpressure
 } from "./socket-io.js";
 
 export interface Socks5ProxyOptions {
   listenHost?: string;
+  /** Hard requirement: binding fails if this port is unavailable. */
   listenPort?: number;
+  /**
+   * Best-effort port, used to keep the proxy endpoint stable across restarts
+   * of the listener. Unlike {@link listenPort} it is abandoned for an
+   * ephemeral port when it cannot be bound.
+   */
+  preferredListenPort?: number;
+  /**
+   * Optional inactivity deadline for an established tunnel. Disabled by
+   * default; see {@link Socks5Proxy.configureEstablishedTunnelSocket}.
+   */
   idleTimeoutMs?: number;
   handshakeTimeoutMs?: number;
   socketWriteTimeoutMs?: number;
@@ -69,21 +81,34 @@ export class Socks5Proxy {
       throw new Error("SOCKS5 proxy is already started without a TCP address.");
     }
 
-    this.server = net.createServer({ allowHalfOpen: true }, (socket) => {
+    const server = net.createServer({ allowHalfOpen: true }, (socket) => {
       void this.handleSocket(socket);
     });
-    this.server.on("error", (error) => {
+    server.on("error", (error) => {
       this.events.emit("event", { type: "error", message: `SOCKS/HTTP proxy server error: ${error.message}` } satisfies Socks5ProxyEvent);
     });
+    this.server = server;
 
+    const listenHost = this.options.listenHost ?? "127.0.0.1";
+    const requiredPort = this.options.listenPort;
+    const preferredPort = requiredPort ?? this.options.preferredListenPort;
     try {
-      await new Promise<void>((resolve, reject) => {
-        this.server!.once("error", reject);
-        this.server!.listen(this.options.listenPort ?? 0, this.options.listenHost ?? "127.0.0.1", () => {
-          this.server!.off("error", reject);
-          resolve();
-        });
-      });
+      try {
+        await listenOnPort(server, preferredPort ?? 0, listenHost);
+      } catch (error) {
+        // A remembered port is only a preference: keeping the endpoint stable
+        // for manually configured clients must never cost the tunnel its
+        // listener, so anything already holding that port sends us to an
+        // ephemeral one instead of failing the connection.
+        if (requiredPort !== undefined || !preferredPort) {
+          throw error;
+        }
+        this.events.emit("event", {
+          type: "error",
+          message: `SOCKS/HTTP proxy could not reuse port ${preferredPort} (${error instanceof Error ? error.message : String(error)}); binding an ephemeral port instead.`
+        } satisfies Socks5ProxyEvent);
+        await listenOnPort(server, 0, listenHost);
+      }
     } catch (error) {
       this.server = undefined;
       throw error;
@@ -207,7 +232,7 @@ export class Socks5Proxy {
         type: "tunnel-opened",
         message: `${formatProtocol(request.protocol)} tunnel opened for ${request.target.host}:${request.target.port}.`
       } satisfies Socks5ProxyEvent);
-      this.configureIdleTimeout(socket);
+      this.configureEstablishedTunnelSocket(socket);
       socket.off("error", onHandshakeSocketError);
       let queuedSocketBytes = 0;
       let socketWriteQueue = Promise.resolve();
@@ -376,8 +401,25 @@ export class Socks5Proxy {
     }
   }
 
-  private configureIdleTimeout(socket: net.Socket): void {
-    const idleTimeoutMs = this.options.idleTimeoutMs ?? 5 * 60 * 1000;
+  /**
+   * Prepares an accepted socket for its established tunnel.
+   *
+   * An inactivity deadline is deliberately not the default here. WebSocket,
+   * MTProto and IRC connections are legitimately silent for long stretches -
+   * a quiet Twitch chat or an idle push socket sends nothing for many minutes
+   * - so a deadline measured on silence tears down healthy connections and
+   * leaves the client believing the tunnel is broken. Liveness is delegated to
+   * TCP keepalive instead, which probes the peer rather than guessing from its
+   * silence, and a local peer that disappears outright still closes its socket
+   * through the OS. `idleTimeoutMs` remains available for callers that
+   * explicitly want a deadline.
+   */
+  private configureEstablishedTunnelSocket(socket: net.Socket): void {
+    configureLowLatencySocket(socket, {
+      keepAlive: true,
+      keepAliveInitialDelayMs: ESTABLISHED_TUNNEL_KEEPALIVE_DELAY_MS
+    });
+    const idleTimeoutMs = this.options.idleTimeoutMs ?? 0;
     if (idleTimeoutMs <= 0) {
       return;
     }
@@ -405,6 +447,22 @@ export class Socks5Proxy {
       this.pendingChannelOpens = Math.max(0, this.pendingChannelOpens - 1);
     };
   }
+}
+
+function listenOnPort(server: net.Server, port: number, host: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
 }
 
 export async function readProxyConnectRequest(socket: net.Socket): Promise<ProxyConnectRequest> {

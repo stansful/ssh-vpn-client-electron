@@ -143,6 +143,9 @@ function verifyWindowsBundle(releaseRoot, unpackedDirectory, arch) {
     arch
   );
   verifyArchitecture(path.join(bundleRoot, "resources", "xray", "windows", arch, "xray.exe"), arch);
+  // TUN routing is unavailable without it, and the app fails over to the
+  // proxy path quietly enough that a build could ship this way unnoticed.
+  verifyArchitecture(path.join(bundleRoot, "resources", "native", "windows", arch, "wintun.dll"), arch);
 }
 
 function verifyMacBundle(releaseRoot, unpackedDirectory, arch) {

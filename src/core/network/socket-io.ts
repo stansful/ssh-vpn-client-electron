@@ -14,6 +14,16 @@ export interface SocketTuningOptions {
 export const DEFAULT_PROXY_CONNECTION_QUEUE_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_PROXY_TOTAL_QUEUE_BYTES = 64 * 1024 * 1024;
 
+/**
+ * Keepalive delay for an established tunnel's local socket.
+ *
+ * An established tunnel carries long-lived protocols that are legitimately
+ * silent, so liveness has to be probed rather than inferred from silence.
+ * Probes start after a minute of quiet, which is far below any timeout the
+ * proxy would otherwise need and costs one packet per idle connection.
+ */
+export const ESTABLISHED_TUNNEL_KEEPALIVE_DELAY_MS = 60_000;
+
 export function configureLowLatencySocket(socket: net.Socket, options: SocketTuningOptions = {}): void {
   socket.setNoDelay(true);
   // Loopback proxy sockets do not benefit from kernel keepalive probes: both

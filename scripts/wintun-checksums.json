@@ -1,0 +1,6 @@
+{
+  "comment": "SHA-256 of the wintun-<version>.zip published at https://www.wintun.net/builds/. Record a version once with `npm run wintun:download -- --trust-download`, verify it against the vendor's published value, and commit it so every later build is checked against it.",
+  "archives": {
+    "0.14.1": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+  }
+}

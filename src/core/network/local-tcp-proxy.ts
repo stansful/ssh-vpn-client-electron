@@ -4,6 +4,7 @@ import {
   configureLowLatencySocket,
   DEFAULT_PROXY_CONNECTION_QUEUE_BYTES,
   DEFAULT_PROXY_TOTAL_QUEUE_BYTES,
+  ESTABLISHED_TUNNEL_KEEPALIVE_DELAY_MS,
   isSocketWritable,
   writeSocketWithBackpressure
 } from "./socket-io.js";
@@ -29,6 +30,10 @@ export interface LocalTcpProxyOptions {
   listenPort: number;
   target: DirectTcpIpTarget;
   socketWriteTimeoutMs?: number;
+  /**
+   * Optional inactivity deadline for an established tunnel. Disabled by
+   * default; see {@link LocalTcpProxy.configureEstablishedTunnelSocket}.
+   */
   idleTimeoutMs?: number;
   maxQueuedSocketBytes?: number;
   maxTotalQueuedSocketBytes?: number;
@@ -159,7 +164,7 @@ export class LocalTcpProxy {
         return;
       }
       socket.off("close", onCloseWhileOpening);
-      this.configureIdleTimeout(socket);
+      this.configureEstablishedTunnelSocket(socket);
       let queuedSocketBytes = 0;
       let socketWriteQueue = Promise.resolve();
       // Match the default 16 MiB SSH receive window so a legitimate remote
@@ -260,8 +265,21 @@ export class LocalTcpProxy {
     }
   }
 
-  private configureIdleTimeout(socket: net.Socket): void {
-    const idleTimeoutMs = this.options.idleTimeoutMs ?? 5 * 60 * 1000;
+  /**
+   * Prepares an accepted socket for its established tunnel.
+   *
+   * As in {@link Socks5Proxy}, an inactivity deadline is not the default: the
+   * forwarded protocol may legitimately stay silent for long stretches, so a
+   * deadline measured on silence disconnects healthy connections. TCP keepalive
+   * probes the peer instead. `idleTimeoutMs` still enables a deadline for
+   * callers that want one.
+   */
+  private configureEstablishedTunnelSocket(socket: net.Socket): void {
+    configureLowLatencySocket(socket, {
+      keepAlive: true,
+      keepAliveInitialDelayMs: ESTABLISHED_TUNNEL_KEEPALIVE_DELAY_MS
+    });
+    const idleTimeoutMs = this.options.idleTimeoutMs ?? 0;
     if (idleTimeoutMs <= 0) {
       return;
     }

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -60,6 +60,24 @@ if (platformFlag && archFlag) {
         : "Run `npm run xray:download-all` or `npm run xray:download -- --target <platform>/<arch>` before packaging."
     ].join("\n"));
     process.exit(1);
+  }
+
+  // Wintun is checked here rather than left to a warning during the native
+  // build, because a Windows bundle without it is not visibly broken: the app
+  // connects and falls back to the Windows proxy path, where UDP never enters
+  // the tunnel and process rules cannot reach applications that ignore the
+  // proxy setting.
+  if (platformFlag === "--win") {
+    const wintunPath = path.join(root, "native", "windows", arch, "wintun.dll");
+    if (!existsSync(wintunPath) || statSync(wintunPath).size === 0) {
+      console.error([
+        `[electron-builder] wintun.dll is missing at ${path.relative(root, wintunPath)}.`,
+        "The packaged app would have no TUN routing: UDP would never enter the tunnel",
+        "and process rules would not reach applications that ignore the Windows proxy setting.",
+        "Run `npm run wintun:download` before packaging Windows artifacts."
+      ].join("\n"));
+      process.exit(1);
+    }
   }
 }
 

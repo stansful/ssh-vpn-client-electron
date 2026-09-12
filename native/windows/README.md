@@ -21,18 +21,29 @@ will work no matter what the app does.
 
 ## `wintun.dll` (required for TUN mode only)
 
-Download the signed release from <https://www.wintun.net/>. There are two ways
-to get it into place, and the difference matters.
+```bash
+npm run wintun:download
+```
 
-**Before packaging** - put it in the tree and it ships with the build:
+That fetches the signed release from <https://www.wintun.net/>, verifies it
+against `scripts/wintun-checksums.json` and installs both architectures:
 
 ```
 native/windows/x64/wintun.dll
 native/windows/arm64/wintun.dll
 ```
 
-No `package.json` change is needed; the folder is packaged wholesale.
-`npm run native:build-service` warns when it is missing.
+A version with no recorded checksum is downloaded but **not** installed: the
+script prints the SHA-256 it saw and stops, so a third-party binary is never
+installed unverified. Compare it against the vendor's published value, then
+record it with `npm run wintun:download -- --trust-download` and commit the
+result, so every later build is checked against it.
+
+No `package.json` change is needed; the folder is packaged wholesale. Windows
+packaging refuses to run without the DLL (`scripts/electron-builder-with-local-dist.mjs`),
+`npm run wintun:ensure` checks it on demand, and `npm run verify:prod-artifacts`
+confirms it reached the built bundle. It used to be only a console warning
+during the native build, which is how releases shipped without it.
 
 **After packaging** - the portable build unpacks itself into a fresh
 `%TEMP%\<random>\resources\...` folder at every launch and deletes it on exit,

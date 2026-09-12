@@ -24,6 +24,7 @@ import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/loca
 import { parseEndpoint } from "../core/network/socks5-check.js";
 import { probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
 import { LocalRoutingEnforcer, RoutingDecisionLog, type LocalRoutingContext } from "./local-routing-enforcement.js";
+import { preferredLocalProxyPort, rememberLocalProxyPort } from "./local-proxy-port.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { NativeDataplaneController, type DataplaneController } from "./native-dataplane.js";
 import { errorText, resolveProtectedAddresses, startDataplaneWithRetry, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
@@ -56,6 +57,12 @@ export interface LiveSshServiceBridgeOptions {
   protectedAddressResolver?: (host: string) => Promise<string[]>;
 }
 
+/**
+ * Upper bound for the reconnect backoff. See `scheduleReconnect`: while the
+ * tunnel is down every proxied application fails, so the retry cadence stays
+ * responsive instead of growing into minutes.
+ */
+const MAXIMUM_RECONNECT_DELAY_MS = 30_000;
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
 const PROCESS_ROUTE_REFRESH_INTERVAL_MS = 10 * 1000;
 const PROCESS_ROUTE_DISCOVERY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
@@ -601,7 +608,12 @@ export class LiveSshServiceBridge implements ServiceBridge {
       return;
     }
     const attempt = this.status.reconnectAttempt + 1;
-    const baseDelayMs = Math.min(5 * 60 * 1000, 1000 * 2 ** Math.min(attempt - 1, 8));
+    // The tunnel is the machine's egress while it is down, so every second of
+    // backoff is a second of failed connections for every proxied application.
+    // Backing off for minutes only turns a transient drop into an outage the
+    // user reads as "the client died"; half a minute is enough to stop
+    // hammering an unreachable host.
+    const baseDelayMs = Math.min(MAXIMUM_RECONNECT_DELAY_MS, 1000 * 2 ** Math.min(attempt - 1, 5));
     const jitterMs = Math.floor(Math.random() * Math.min(5000, baseDelayMs * 0.2));
     const delayMs = baseDelayMs + jitterMs;
     this.setStatus({
@@ -632,7 +644,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
   ): Promise<{ endpoint: { host: string; port: number }; proxy: Socks5Proxy }> {
     const proxy = new Socks5Proxy({
       listenHost: "127.0.0.1",
-      idleTimeoutMs: 5 * 60 * 1000,
+      // Reconnects and transport switches rebuild this listener; reusing the
+      // previous port keeps manually configured clients pointing at a live
+      // endpoint instead of a port that moved out from under them.
+      preferredListenPort: preferredLocalProxyPort(),
       connectChannel: (target, originator, signal) => this.openProxyChannel(client, target, originator, signal)
     });
     proxy.onEvent((event) => {
@@ -649,6 +664,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     });
     try {
       const endpoint = await proxy.start();
+      rememberLocalProxyPort(endpoint.port);
       this.appendDiagnostic("info", `Local HTTP/SOCKS proxy is listening on ${endpoint.host}:${endpoint.port}.`);
       return { endpoint, proxy };
     } catch (error) {
