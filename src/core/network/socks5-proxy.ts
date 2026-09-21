@@ -58,11 +58,42 @@ export interface ProxyConnectRequest {
   };
 }
 
+/**
+ * A point-in-time read of the listener's traffic, for a periodic heartbeat.
+ *
+ * The counters exist to make a data-plane stall diagnosable: when the browser
+ * freezes, the question is whether connections are still being accepted and,
+ * once open, whether bytes are actually crossing them. `active` climbing while
+ * `bytesToClient` stays flat is a tunnel that accepts connections and then
+ * carries nothing - which is invisible from the routing log alone.
+ */
+export interface ProxyActivityStats {
+  /** Sockets currently held, including those still in handshake. */
+  active: number;
+  /** Sockets accepted since start (monotonic). */
+  accepted: number;
+  /** Sockets whose tunnel was established since start (monotonic). */
+  established: number;
+  /** Tunnel errors observed since start (monotonic). */
+  errored: number;
+  /** Bytes written back to local clients since start (download). */
+  bytesToClient: number;
+  /** Bytes forwarded into the tunnel since start (upload). */
+  bytesToChannel: number;
+  /** Channel opens currently in flight. */
+  pendingChannelOpens: number;
+}
+
 export class Socks5Proxy {
   private readonly events = new EventEmitter();
   private readonly sockets = new Set<net.Socket>();
   private totalQueuedSocketBytes = 0;
   private pendingChannelOpens = 0;
+  private acceptedConnections = 0;
+  private establishedConnections = 0;
+  private erroredConnections = 0;
+  private bytesToClient = 0;
+  private bytesToChannel = 0;
   private server?: net.Server;
 
   constructor(private readonly options: Socks5ProxyOptions) {}
@@ -70,6 +101,19 @@ export class Socks5Proxy {
   onEvent(listener: (event: Socks5ProxyEvent) => void): () => void {
     this.events.on("event", listener);
     return () => this.events.off("event", listener);
+  }
+
+  /** A point-in-time read of listener traffic, for a periodic heartbeat. */
+  snapshotStats(): ProxyActivityStats {
+    return {
+      active: this.sockets.size,
+      accepted: this.acceptedConnections,
+      established: this.establishedConnections,
+      errored: this.erroredConnections,
+      bytesToClient: this.bytesToClient,
+      bytesToChannel: this.bytesToChannel,
+      pendingChannelOpens: this.pendingChannelOpens
+    };
   }
 
   async start(): Promise<{ host: string; port: number }> {
@@ -153,6 +197,7 @@ export class Socks5Proxy {
       return;
     }
     this.sockets.add(socket);
+    this.acceptedConnections += 1;
     configureLowLatencySocket(socket, { keepAlive: false });
     let request: ProxyConnectRequest | undefined;
     let proxyReplySent = false;
@@ -232,6 +277,7 @@ export class Socks5Proxy {
         type: "tunnel-opened",
         message: `${formatProtocol(request.protocol)} tunnel opened for ${request.target.host}:${request.target.port}.`
       } satisfies Socks5ProxyEvent);
+      this.establishedConnections += 1;
       this.configureEstablishedTunnelSocket(socket);
       socket.off("error", onHandshakeSocketError);
       let queuedSocketBytes = 0;
@@ -251,6 +297,7 @@ export class Socks5Proxy {
         }
         queuedSocketBytes += data.length;
         this.totalQueuedSocketBytes += data.length;
+        this.bytesToClient += data.length;
         socketWriteQueue = socketWriteQueue
           .then(async () => {
             if (!isSocketWritable(socket)) {
@@ -286,6 +333,7 @@ export class Socks5Proxy {
         endSocketAfterQueuedWrites();
       });
       const offError = channel.onError((error) => {
+        this.erroredConnections += 1;
         this.events.emit("event", { type: "error", message: formatProxyTunnelError(request, error.message) } satisfies Socks5ProxyEvent);
         socket.destroy();
       });
@@ -306,11 +354,13 @@ export class Socks5Proxy {
       const forwardClientData = async (data: Buffer): Promise<boolean> => {
         if (!httpBodyGate) {
           await channel.write(data);
+          this.bytesToChannel += data.length;
           return false;
         }
         const result = httpBodyGate.consume(data);
         if (result.forward.length > 0) {
           await channel.write(result.forward);
+          this.bytesToChannel += result.forward.length;
         }
         if (!result.complete) {
           return false;

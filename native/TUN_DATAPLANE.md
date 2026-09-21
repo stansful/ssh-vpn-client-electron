@@ -74,6 +74,29 @@ All six are implemented. What each one ended up doing, and where:
    to learn which name produced which address so domain rules and the curated lists still
    match a flow that only carries an IP. DNS is handled *before* the UDP drop rule, or a
    selected application on the SSH transport would lose name resolution entirely.
+7. **Names read from the flow itself** — `internal/dataplane/sniff.go` and `quic.go`. DNS
+   learning has a gap that shows up exactly when someone tests a domain rule: a browser that
+   resolved the name before the tunnel came up (Windows and Chromium both cache for the record
+   TTL), or one that resolves over DNS-over-HTTPS, never sends a query the adapter can see, so
+   its connections arrive as bare addresses and the domain rule does not match. Process rules
+   are unaffected, which is why this read as "domain routing is broken in browsers while
+   applications work". When a rule could turn on the name and the flow carries none, the
+   dataplane now holds it for its first bytes (at most 250 ms, paid in full only by a
+   server-speaks-first protocol) and reads the TLS ClientHello SNI, the HTTP/1 `Host`, or -
+   for UDP 443 - the ClientHello inside the QUIC Initial packet, whose protection keys are
+   derived from the packet itself (RFC 9001 §5.2). The bytes are forwarded untouched. A flow
+   that carries a hello is always judged by its own hello, never by the names its address was
+   learned under: one CDN address serves many sites, and the last name learned for it says
+   nothing about the next connection. Learned names - from DNS answers and from hellos, kept
+   together per address (newest first, at most eight) for ten minutes - remain the fallback for
+   a flow without a hello, and any selected name among them selects such a flow, so the error
+   that remains is over-inclusion rather than a leak. That fallback is what makes a QUIC
+   attempt to a site whose name was only ever seen in a TCP hello still refused on the SSH
+   transport instead of slipping out directly while its TCP twin is tunnelled. Flows a process
+   or address rule already selects are never held; a hello with Encrypted Client Hello shows
+   only the public name, which is a limitation. `sniff_test.go`, `quic_test.go` (including the
+   RFC 9001 Appendix A client Initial) and the packet-level `stack_test.go` (a second gVisor
+   stack standing in for the application) cover it.
 
 Not covered: ICMP is not terminated, so pings to a captured destination do not answer.
 

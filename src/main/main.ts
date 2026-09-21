@@ -184,9 +184,15 @@ powerMonitor.on("on-battery", () => systemEnergyPolicy.setOnBatteryPower(true));
 powerMonitor.on("on-ac", () => systemEnergyPolicy.setOnBatteryPower(false));
 powerMonitor.on("suspend", () => {
   systemSessionActive = false;
+  void writeMainLog("System suspend.");
 });
 powerMonitor.on("resume", () => {
   systemSessionActive = true;
+  void writeMainLog("System resume.");
+  // The SSH socket almost never survives a sleep: NAT mappings expire and the
+  // server may have closed the session unheard. Let the transports check now
+  // rather than discover it at the next keepalive.
+  wakeTransports("system resume");
 });
 if (process.platform === "darwin") {
   powerMonitor.on("thermal-state-change", ({ state }) => systemEnergyPolicy.setThermalState(state as ThermalState));
@@ -396,6 +402,19 @@ async function showOrCreateWindow(): Promise<void> {
     await createWindow();
   }
   trayController.showWindow();
+}
+
+function wakeTransports(reason: string): void {
+  try {
+    service.wake?.(reason);
+  } catch (error) {
+    void writeMainLog(`SSH service wake failed: ${formatError(error)}`);
+  }
+  try {
+    xrayService.wake(reason);
+  } catch (error) {
+    void writeMainLog(`Xray service wake failed: ${formatError(error)}`);
+  }
 }
 
 function currentProcessRoutingRefreshIntervalMs(): number {

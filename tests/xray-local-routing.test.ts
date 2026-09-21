@@ -43,7 +43,12 @@ beforeAll(async () => {
         }
         buffer = buffer.subarray(parsed.length);
         upstreamTargets.push(`${parsed.host}:${parsed.port}`);
-        socket.write(Buffer.concat([
+        // Close after answering, the way the direct stand-in does. The client
+        // helper below resolves on `close`, falling back to a 2s guard timer;
+        // a stand-in that answered and then held the socket open made every
+        // tunnelled case wait out that full guard, and three of them together
+        // overran the default test timeout.
+        socket.end(Buffer.concat([
           Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
           Buffer.from(VIA_TUNNEL)
         ]));

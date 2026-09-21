@@ -239,7 +239,20 @@ func NewDomainCache(maximum int) *DomainCache {
 	}
 }
 
+// domainCacheMaxNames bounds how many names one address keeps. A CDN address
+// answers for many sites; the most recently seen names are the ones the next
+// flow is most likely to be for.
+const domainCacheMaxNames = 8
+
 // Record remembers every address in a DNS response.
+//
+// Names accumulate per address rather than replace each other: one CDN
+// address serves many sites, and a rule naming any of them must keep matching
+// a flow to that address after another site on it was resolved. Selection
+// only ever grows with more names, so remembering more can never unselect a
+// flow that a single name would have selected; the trade is that a flow with
+// no name of its own to a shared address is tunnelled when any remembered
+// name is selected, which is the safe direction.
 func (c *DomainCache) Record(records []dnsRecord) {
 	if len(records) == 0 {
 		return
@@ -251,9 +264,42 @@ func (c *DomainCache) Record(records []dnsRecord) {
 		if len(record.Names) == 0 || !record.Address.IsValid() {
 			continue
 		}
-		c.entries[record.Address.Unmap()] = domainCacheEntry{names: record.Names, expiresAt: now.Add(record.TTL)}
+		address := record.Address.Unmap()
+		expiresAt := now.Add(record.TTL)
+		existing, ok := c.entries[address]
+		if !ok || now.After(existing.expiresAt) {
+			c.entries[address] = domainCacheEntry{names: boundedNames(record.Names, nil), expiresAt: expiresAt}
+			continue
+		}
+		if existing.expiresAt.After(expiresAt) {
+			expiresAt = existing.expiresAt
+		}
+		c.entries[address] = domainCacheEntry{names: boundedNames(record.Names, existing.names), expiresAt: expiresAt}
 	}
 	c.evictLocked(now)
+}
+
+// boundedNames puts the newest names first, drops duplicates and keeps the
+// list within domainCacheMaxNames.
+func boundedNames(newest []string, older []string) []string {
+	merged := make([]string, 0, min(len(newest)+len(older), domainCacheMaxNames))
+	seen := make(map[string]struct{}, len(newest)+len(older))
+	for _, list := range [][]string{newest, older} {
+		for _, name := range list {
+			if name == "" {
+				continue
+			}
+			if _, duplicate := seen[name]; duplicate {
+				continue
+			}
+			if len(merged) >= domainCacheMaxNames {
+				return merged
+			}
+			seen[name] = struct{}{}
+			merged = append(merged, name)
+		}
+	}
+	return merged
 }
 
 // Lookup returns the names an address was last resolved from, queried name

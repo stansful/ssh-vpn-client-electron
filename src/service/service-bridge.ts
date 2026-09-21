@@ -13,5 +13,11 @@ export interface ServiceBridge {
   openTerminal(): Promise<void>;
   closeTerminal(): Promise<void>;
   terminalInput(input: string): Promise<void>;
+  /**
+   * Tells the service that the machine resumed, changed networks or was
+   * otherwise frozen, so it can re-check a live session and bring a waiting
+   * reconnect forward. Optional: simulators and remote services ignore it.
+   */
+  wake?(reason: string): void;
   dispose?(): Promise<void>;
 }

@@ -311,7 +311,8 @@ throttle tunnel throughput. Only low-priority UI and process-routing discovery w
   successful discovery cycle and only decays after discovery itself has been failing for a full 5-minute TTL.
   The compatibility snapshot then refreshes every 10 seconds on AC or battery;
 - SSH keepalive and time-based rekey share one deadline timer, while byte-based rekey is checked on active traffic and
-  causes no idle polling;
+  causes no idle polling; while a session is wanted, one 5-second tick additionally watches for a clock jump and for
+  interface changes (see below);
 - accepted SSH upload frames are pipelined through a bounded 4 MiB socket buffer instead of waiting for one
   Windows write callback per packet, while a real full buffer still pauses on `drain`;
 - loopback proxy sockets use native inactivity deadlines and no redundant TCP keepalive probes;
@@ -326,6 +327,50 @@ throttle tunnel throughput. Only low-priority UI and process-routing discovery w
 
 The renderer keeps Electron background throttling enabled, omits unused WebGL, and avoids continuous hidden animation
 or backdrop-blur composition. The single-outbound Xray configuration also omits redundant HTTP/TLS/QUIC sniffing.
+
+## Background connection supervision
+
+The live SSH service treats the connection as a desired state and keeps it there without any server-side support:
+
+- Keepalives are scheduled from the last packet *received* from the server, never from bytes the client sent, so
+  applications retrying through a half-open tunnel cannot postpone the probe that would notice it. A keepalive is
+  considered answered by any packet from the server (the way OpenSSH counts `ServerAliveCountMax`); only 30 seconds of
+  complete silence after a keepalive tears the session down. Sending for 10 seconds without hearing anything back
+  (a channel open the server never confirms, data with no window adjust or reply) triggers a 15-second probe at once,
+  so a dead socket under traffic is noticed in about 25 seconds regardless of the configured keepalive interval.
+- The local HTTP/SOCKS listener outlives the SSH session. When the transport fails the listener keeps its port and
+  accepts connections; each waits up to 25 seconds for the new session and then opens its channel there, so a
+  WebSocket reconnect, a poll or a page load started during the gap completes instead of failing with "connection
+  refused". Connections that were open when the transport died are closed (a TCP stream cannot move to a new SSH
+  session), and applications reconnect them through the waiting listener. Only a user Disconnect, a halt or shutdown
+  stops the listener.
+- System routing (Windows proxy setting, PAC, process discovery, TUN capture) is kept in place while a reconnect is in
+  progress. If no session is back after 30 seconds the machine returns to direct routing, exactly as before, and
+  routing is re-applied when the session returns. While the TUN adapter is up the reconnect goes to the server
+  address the adapter protects, because a fresh lookup could route the transport into its own tunnel; if that address
+  does not answer the adapter is released and the next attempt resolves normally.
+- The first retry after a failure is immediate; only repeated failures back off (1, 2, 4, 8, 16, 30 seconds with
+  jitter). The status goes straight to Reconnecting, without an Error in between.
+- The main process forwards `powerMonitor` resume events to the transports, and the service itself watches for a
+  clock jump (the process did not run for 15 s or more) and for changes of the machine's non-tunnel interface
+  addresses (virtual, VPN and loopback adapters are ignored). Any of these probes a live session with a 15-second
+  deadline, and runs a waiting reconnect immediately with the backoff restarted (never closer than one second to the
+  previous attempt). A wake that arrives while an attempt is already running is applied to the retry that follows
+  it. The backoff is restarted for at most one wake per 30 seconds, so a flapping adapter cannot turn the ladder into
+  an attempt every tick.
+- Reconnecting stops only for a pinned fingerprint mismatch, a changed host key, a missing secret, or rejected
+  credentials; once a session has been established, a rejection during an *automatic* reconnect is retried once
+  before stopping, because the credentials worked before and one rejection is usually a server still coming up. A
+  user Connect always starts fresh: routing is cleared and re-applied, while the listener keeps its port.
+- If the configured host name stops resolving during a reconnect and a server fingerprint is pinned, the address of
+  the last successful session is tried before backing off; a different host answering there is treated as a stale
+  address, not as a configuration error.
+- Every failure path ends in either a scheduled retry or an explicit halt. A 10-second watchdog checks that invariant
+  (session wanted, not halted, but no client, no attempt in progress and no timer armed) and, if it ever fails, logs
+  it as a supervisor bug and schedules the reconnect itself. An attempt that runs for more than five minutes is
+  reported in the diagnostics as well.
+- The diagnostics log records each attempt with its number and trigger, each scheduled retry with its delay, and the
+  wake events that caused a probe.
 
 ## Storage
 
@@ -432,9 +477,14 @@ the traffic. Raw sockets, custom proxy stacks and QUIC/UDP remain outside this p
 UDP is production TCP-only: unsupported UDP traffic is not proxied. This means application UI/API/WebSocket traffic
 can use process routing, while UDP-only voice/video paths (including Discord voice) remain outside the SSH tunnel.
 
-Kernel-level WFP/TUN packet redirection is not bundled. The supported production interception path in this repository
-is TCP over HTTP/SOCKS system proxy/PAC plus live SSH `direct-tcpip`; process-name selected rules use the dynamic
-process destination PAC behavior described above.
+A tunnel adapter (TUN, Windows, the app started as administrator with `wintun.dll` present; see
+`native/TUN_DATAPLANE.md`) captures traffic at the routing table instead, so process rules also reach applications
+that ignore the Windows proxy setting. On that path a domain rule is matched by the name the connection itself
+carries - the TLS ClientHello SNI, the HTTP `Host` header, or the ClientHello inside a QUIC Initial packet - in
+addition to the DNS answers the adapter sees, so a browser that resolved a site before the tunnel came up, or resolves
+over DNS-over-HTTPS, is still routed by its domain rules. Without the adapter the interception path is TCP over the
+HTTP/SOCKS system proxy/PAC plus live SSH `direct-tcpip`, with process-name rules enforced by the local listener or,
+failing that, the dynamic process destination PAC behavior described above.
 
 Live SSH orchestration in the Electron main service path includes KEX, NEWKEYS, encrypted packets, host-key fingerprint
 verification, password/private-key auth, keepalive, reconnect, direct-tcpip checks, HTTP/SOCKS direct-tcpip forwarding, and

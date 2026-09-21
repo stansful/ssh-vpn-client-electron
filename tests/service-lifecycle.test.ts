@@ -56,24 +56,108 @@ describe("live SSH service lifecycle", () => {
     expect(service.getStatus()).toMatchObject({ state: "Disconnected", realTunnelAvailable: false });
   });
 
-  it("invalidates a failed runtime immediately and restores routing before reconnect", async () => {
-    const order: string[] = [];
-    const client = new FakeSshClient(order);
-    vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
-    vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31082 });
-    vi.spyOn(Socks5Proxy.prototype, "stop").mockImplementation(async () => {
-      order.push("stop-proxy");
-    });
-    const service = createService(order);
-    await service.connect(connectRequest("runtime"));
-    order.length = 0;
+  it("keeps routing and the listener while a failed runtime is rebuilt", async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const clients = [new FakeSshClient(order), new FakeSshClient(order)];
+      vi.spyOn(SshLiveClient, "connect")
+        .mockResolvedValueOnce(clients[0].asClient())
+        .mockResolvedValueOnce(clients[1].asClient());
+      vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31082 });
+      vi.spyOn(Socks5Proxy.prototype, "stop").mockImplementation(async () => {
+        order.push("stop-proxy");
+      });
+      const service = createService(order);
+      await service.connect(connectRequest("runtime"));
+      order.length = 0;
 
-    client.emit({ type: "error", error: new Error("transport failed") });
+      clients[0].emit({ type: "error", error: new Error("transport failed") });
 
-    expect(service.getStatus()).toMatchObject({ state: "Error", realTunnelAvailable: false });
-    await vi.waitFor(() => expect(service.getStatus().state).toBe("Reconnecting"));
-    expect(order).toEqual(["restore-routing", "stop-proxy", "disconnect-client"]);
-    await service.dispose();
+      // Straight to Reconnecting: applications keep their proxy endpoint and
+      // the machine keeps its routes while the session is rebuilt underneath.
+      expect(service.getStatus()).toMatchObject({ state: "Reconnecting", realTunnelAvailable: false });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual(["disconnect-client"]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", realTunnelAvailable: true });
+      expect(order).toEqual(["disconnect-client"]);
+      expect(Socks5Proxy.prototype.start).toHaveBeenCalledTimes(1);
+      await service.dispose();
+      expect(order).toEqual(["disconnect-client", "restore-routing", "stop-proxy", "disconnect-client"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("applies system routing again after an automatic reconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const clients = [new FakeSshClient(), new FakeSshClient()];
+      vi.spyOn(SshLiveClient, "connect")
+        .mockResolvedValueOnce(clients[0].asClient())
+        .mockResolvedValueOnce(clients[1].asClient());
+      vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31085 });
+      vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+      const systemProxy = {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager;
+      const service = new LiveSshServiceBridge(initialStatus(), { systemProxy, systemWakeDetection: false });
+      await service.connect(connectRequest("reapply"));
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+      // A user Connect starts from direct routing; that is the one restore.
+      expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+
+      clients[0].emit({ type: "close" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(service.getStatus().state).toBe("Connected");
+      // The Reconnecting status must not make the apply bail out, or PAC and
+      // process rules would silently stop being published after a reconnect.
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+      await service.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns to direct routing when the tunnel stays down past the hold window", async () => {
+    vi.useFakeTimers();
+    try {
+      const clients = [new FakeSshClient(), new FakeSshClient()];
+      vi.spyOn(SshLiveClient, "connect")
+        .mockResolvedValueOnce(clients[0].asClient())
+        .mockRejectedValue(new Error("connect ETIMEDOUT"));
+      vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31086 });
+      vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+      const systemProxy = {
+        apply: vi.fn(async () => ({ applied: true, message: "applied" })),
+        restore: vi.fn(async () => undefined)
+      } as unknown as WindowsSystemProxyManager;
+      const service = new LiveSshServiceBridge(initialStatus(), { systemProxy, systemWakeDetection: false });
+      await service.connect(connectRequest("hold"));
+
+      expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+      clients[0].emit({ type: "close" });
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_500);
+      // Past the window the machine goes back to direct routing, as before;
+      // the listener stays so a late reconnect needs no new endpoint.
+      expect(systemProxy.restore).toHaveBeenCalledTimes(2);
+      expect(Socks5Proxy.prototype.stop).not.toHaveBeenCalled();
+      expect(service.getStatus().state).toBe("Reconnecting");
+
+      vi.mocked(SshLiveClient.connect).mockResolvedValueOnce(clients[1].asClient());
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(service.getStatus().state).toBe("Connected");
+      expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+      expect(Socks5Proxy.prototype.start).toHaveBeenCalledTimes(1);
+      await service.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not retry an explicitly pinned host fingerprint mismatch", async () => {
@@ -133,9 +217,11 @@ describe("live SSH service lifecycle", () => {
 
     expect(service.getStatus()).not.toMatchObject({ state: "Connected" });
     expect(service.getStatus().realTunnelAvailable).toBe(false);
-    expect(Socks5Proxy.prototype.stop).toHaveBeenCalled();
     expect(client.disconnect).toHaveBeenCalledWith("SSH connection setup failed.");
+    // The listener is kept for the retry that follows; only disposal stops it.
+    expect(Socks5Proxy.prototype.stop).not.toHaveBeenCalled();
     await service.dispose();
+    expect(Socks5Proxy.prototype.stop).toHaveBeenCalled();
   });
 
   it("resets terminal state after a remote close so the shell can be reopened", async () => {
@@ -1148,8 +1234,20 @@ describe("live SSH service lifecycle", () => {
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(2);
       expect(internals.currentProcessRoutingDomains()).toEqual(new Set(["gateway.custom.example"]));
 
+      // Past the 120s DNS TTL, and deliberately still routed. Once a
+      // destination is in the PAC the application dials the loopback proxy
+      // instead of the real address, so it can never be observed a second time;
+      // retiring it on the DNS TTL dropped traffic the application was still
+      // sending back to DIRECT. Every successful discovery cycle renews it.
       now.mockReturnValue(1_131_000);
       await internals.learnProcessRoutingIps(request);
+      expect(internals.currentProcessRoutingDomains()).toEqual(new Set(["gateway.custom.example"]));
+
+      // It is retired only once discovery itself has been failing for a full
+      // TTL - decay is driven by losing sight of the process, not by age.
+      processConnectionsProvider.mockRejectedValue(new Error("process table unavailable"));
+      now.mockReturnValue(1_431_001);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
       expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
     } finally {
       try {
@@ -1480,7 +1578,7 @@ describe("live SSH service lifecycle", () => {
     }
   });
 
-  it("retains a shared profiled and generic process IP across an empty snapshot until TTL", async () => {
+  it("renews a shared profiled and generic process IP across empty snapshots, retiring it only once discovery fails for a TTL", async () => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform");
     Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
     const systemProxy = {
@@ -1552,7 +1650,16 @@ describe("live SSH service lifecycle", () => {
       expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
 
+      // An empty snapshot is still a *successful* discovery cycle, so the route
+      // is renewed rather than aged out - the address stays covered for as long
+      // as the session can still see the process.
       now.mockReturnValue(1_300_001);
+      await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
+      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+
+      // Only discovery failing for a full TTL retires it.
+      processConnectionsProvider.mockRejectedValue(new Error("process table unavailable"));
+      now.mockReturnValue(1_600_002);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
       expect(internals.currentProcessRoutingIps()).toEqual(new Set());
     } finally {

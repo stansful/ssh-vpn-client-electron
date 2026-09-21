@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
@@ -167,4 +168,28 @@ func buildResponseWithOwner(question string, owner string, address netip.Addr) [
 	raw := address.AsSlice()
 	message = binary.BigEndian.AppendUint16(message, uint16(len(raw)))
 	return append(message, raw...)
+}
+
+func TestDomainCacheAccumulatesNamesPerAddress(t *testing.T) {
+	cache := NewDomainCache(0)
+	address := netip.MustParseAddr("203.0.113.7")
+	cache.Record([]dnsRecord{{Address: address, Names: []string{"www.example.org", "cdn.example.net"}, TTL: time.Minute}})
+	cache.Record([]dnsRecord{{Address: address, Names: []string{"other.test"}, TTL: time.Minute}})
+	names := cache.Lookup(address)
+	if len(names) != 3 || names[0] != "other.test" || names[1] != "www.example.org" || names[2] != "cdn.example.net" {
+		t.Fatalf("names = %v", names)
+	}
+	// A repeat moves nothing and adds nothing.
+	cache.Record([]dnsRecord{{Address: address, Names: []string{"www.example.org"}, TTL: time.Minute}})
+	if names := cache.Lookup(address); len(names) != 3 || names[0] != "www.example.org" {
+		t.Fatalf("after a repeat: %v", names)
+	}
+	// The list is bounded, newest first.
+	for index := 0; index < 20; index++ {
+		cache.Record([]dnsRecord{{Address: address, Names: []string{fmt.Sprintf("site%d.test", index)}, TTL: time.Minute}})
+	}
+	names = cache.Lookup(address)
+	if len(names) != domainCacheMaxNames || names[0] != "site19.test" {
+		t.Fatalf("bounded names = %v", names)
+	}
 }

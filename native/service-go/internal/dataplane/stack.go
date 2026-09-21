@@ -51,6 +51,22 @@ const (
 	dnsTimeout = 5 * time.Second
 	// dialTimeout bounds one upstream connection attempt.
 	dialTimeout = 15 * time.Second
+	// sniffTimeout bounds how long a flow whose name is not yet known is held
+	// back for a look at its first bytes (see sniff.go). A client that speaks
+	// first - every TLS and HTTP client - has sent them within a round trip
+	// of the loopback handshake, so the wait is only ever paid in full by a
+	// flow whose server speaks first, and only when a rule could depend on
+	// the name.
+	sniffTimeout = 250 * time.Millisecond
+	// sniffMaxReads bounds how many reads one sniff makes. A hello arrives in
+	// a handful of segments; a peer trickling single bytes would otherwise
+	// have the parser re-run once per byte for the whole window.
+	sniffMaxReads = 32
+	// sniffedNameTTL is how long a name read from a flow's first bytes keeps
+	// describing the address it was sent to, so that a later flow to the same
+	// address without a hello of its own - a QUIC attempt above all - is
+	// judged by the same rule.
+	sniffedNameTTL = 10 * time.Minute
 	// relayBufferBytes is the copy buffer for one direction of one TCP flow.
 	relayBufferBytes = 32 * 1024
 	// udpDatagramMaxBytes bounds one datagram read.
@@ -297,7 +313,8 @@ func addrOf(address tcpip.Address) netip.Addr {
 func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 	id := request.ID()
 	flow := d.flowOf(ProtocolTCP, id)
-	decision := d.policy.Load().Decide(flow)
+	policy := d.policy.Load()
+	decision := policy.Decide(flow)
 	if decision.Verdict == VerdictDrop {
 		// A reset tells the application immediately instead of leaving it to
 		// time out, which is what a user reads as "the app is broken".
@@ -316,6 +333,21 @@ func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 
 	go func() {
 		defer local.Close()
+
+		// The name the flow was opened for decides between a domain rule and
+		// nothing, and DNS learning does not see it for a client that resolved
+		// before the tunnel came up or resolves over DoH. Its first bytes do.
+		var head []byte
+		if d.shouldSniff(policy, flow) {
+			var name string
+			head, name = sniffTCP(local)
+			if name != "" {
+				flow.Domains = []string{name}
+				decision = policy.Decide(flow)
+				d.rememberSniffedName(flow.Destination, name)
+			}
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		defer cancel()
 
@@ -327,8 +359,122 @@ func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 			return
 		}
 		defer remote.Close()
+		if len(head) > 0 {
+			if _, err := remote.Write(head); err != nil {
+				return
+			}
+		}
 		relay(local, remote)
 	}()
+}
+
+// sniffTCP reads the opening bytes of a flow until they name the destination,
+// prove they never will, or sniffTimeout passes. Whatever was read is returned
+// so the caller forwards it ahead of the relay; the flow is never altered.
+func sniffTCP(local net.Conn) (head []byte, name string) {
+	if err := local.SetReadDeadline(time.Now().Add(sniffTimeout)); err != nil {
+		return nil, ""
+	}
+	defer func() {
+		_ = local.SetReadDeadline(time.Time{})
+	}()
+	chunk := make([]byte, 4096)
+	for reads := 0; ; reads++ {
+		read, err := local.Read(chunk)
+		if read > 0 {
+			head = append(head, chunk[:read]...)
+			name, needMore := guardedSniffClientName(head)
+			if name != "" || !needMore || len(head) >= sniffMaxBytes || reads >= sniffMaxReads {
+				return head, name
+			}
+		}
+		if err != nil {
+			// A deadline, a peer that closed, or a broken flow: the bytes so
+			// far are forwarded and the flow is routed on what is known.
+			return head, ""
+		}
+	}
+}
+
+// shouldSniff says whether a flow's first bytes are worth reading for a
+// name: only when a rule could turn on it, and only when nothing else has
+// settled the flow already. A process rule or an address rule selects the
+// flow whatever it is named - the direct list never pre-empts a rule - and
+// the transport's own endpoint is settled before any rule.
+//
+// Names the address was learned under do not settle it. One CDN address
+// serves many sites, and only the flow's own hello says which of them this
+// one is for; judging it by whatever name the address happened to be learned
+// under last would route a selected site directly, or an unselected one
+// through the tunnel. The learned names stay as the fallback for a flow that
+// carries no hello.
+func (d *Dataplane) shouldSniff(policy *Policy, flow Flow) bool {
+	if !policy.NamesMatter() {
+		return false
+	}
+	nameless := flow
+	nameless.Domains = nil
+	settled := policy.Decide(nameless)
+	return settled.Verdict == VerdictDirect && settled.Reason != "protected-ssh-connection"
+}
+
+// rememberSniffedName teaches the domain cache what a flow revealed, so a
+// later flow to the same address that carries no hello - a QUIC attempt,
+// or a plain socket - is judged by the same name.
+func (d *Dataplane) rememberSniffedName(destination netip.AddrPort, name string) {
+	d.options.Domains.Record([]dnsRecord{{Address: destination.Addr(), Names: []string{name}, TTL: sniffedNameTTL}})
+}
+
+// sniffUDP reads the opening datagrams of a flow for the name in a QUIC
+// ClientHello. Every datagram read is returned so the caller forwards them
+// ahead of the relay; a flow that is not QUIC is answered on its first
+// datagram without waiting.
+func sniffUDP(local net.Conn) (head [][]byte, name string) {
+	deadline := time.Now().Add(sniffTimeout)
+	defer func() {
+		_ = local.SetReadDeadline(time.Time{})
+	}()
+	sink := newCryptoReassembler()
+	buffer := make([]byte, udpDatagramMaxBytes)
+	for len(head) < quicMaxInitialDatagrams {
+		if err := local.SetReadDeadline(deadline); err != nil {
+			return head, ""
+		}
+		read, err := local.Read(buffer)
+		if err != nil {
+			return head, ""
+		}
+		datagram := append([]byte(nil), buffer[:read]...)
+		head = append(head, datagram)
+		name, isQUIC, needMore := guardedSniffQUICServerName(sink, datagram)
+		if name != "" || !isQUIC || !needMore {
+			return head, name
+		}
+	}
+	return head, ""
+}
+
+// The parsers are fuzzed and bounds-checked, but they read bytes an
+// arbitrary application chose, inside the process that owns the machine's
+// routes. A panic here would take the helper down with the capture routes
+// still installed; a name that could not be read is merely a flow routed as
+// it would have been before there was any sniffing.
+func guardedSniffClientName(data []byte) (name string, needMore bool) {
+	defer func() {
+		if recover() != nil {
+			name, needMore = "", false
+		}
+	}()
+	return sniffClientName(data)
+}
+
+func guardedSniffQUICServerName(sink *cryptoReassembler, datagram []byte) (name string, isQUIC bool, needMore bool) {
+	defer func() {
+		if recover() != nil {
+			name, isQUIC, needMore = "", false, false
+		}
+	}()
+	return sniffQUICServerName(sink, datagram)
 }
 
 func (d *Dataplane) dialTCP(ctx context.Context, verdict Verdict, destination netip.AddrPort) (net.Conn, error) {
@@ -392,7 +538,22 @@ func (d *Dataplane) handleUDP(request *udp.ForwarderRequest) bool {
 			return
 		}
 
-		decision := d.policy.Load().Decide(flow)
+		policy := d.policy.Load()
+		decision := policy.Decide(flow)
+		// A QUIC client's first datagram names the site it is opening (see
+		// quic.go). Reading it here is what lets a domain rule refuse the
+		// datagram flow of a site whose address no DNS answer has explained,
+		// so the client falls back to the TCP flow that is tunnelled.
+		var head [][]byte
+		if d.shouldSniff(policy, flow) {
+			var name string
+			head, name = sniffUDP(local)
+			if name != "" {
+				flow.Domains = []string{name}
+				decision = policy.Decide(flow)
+				d.rememberSniffedName(flow.Destination, name)
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		defer cancel()
 		switch decision.Verdict {
@@ -404,9 +565,9 @@ func (d *Dataplane) handleUDP(request *udp.ForwarderRequest) bool {
 			// answer falls back to TCP, which is tunnelled.
 			d.discardUDP(local)
 		case VerdictProxy:
-			d.relayUDPThroughTunnel(ctx, local, flow)
+			d.relayUDPThroughTunnel(ctx, local, flow, head)
 		default:
-			d.relayUDPDirect(ctx, local, flow)
+			d.relayUDPDirect(ctx, local, flow, head)
 		}
 	}()
 	return true
@@ -425,7 +586,7 @@ func (d *Dataplane) discardUDP(local net.Conn) {
 	}
 }
 
-func (d *Dataplane) relayUDPThroughTunnel(ctx context.Context, local net.Conn, flow Flow) {
+func (d *Dataplane) relayUDPThroughTunnel(ctx context.Context, local net.Conn, flow Flow, head [][]byte) {
 	session, err := d.options.Tunnel.AssociateUDP(ctx)
 	if err != nil {
 		d.options.Log("warning", fmt.Sprintf("TUN udp %s -> %s tunnel failed: %s",
@@ -433,6 +594,11 @@ func (d *Dataplane) relayUDPThroughTunnel(ctx context.Context, local net.Conn, f
 		return
 	}
 	defer session.Close()
+	for _, datagram := range head {
+		if err := session.WriteTo(datagram, flow.Destination); err != nil {
+			return
+		}
+	}
 
 	go func() {
 		buffer := make([]byte, udpDatagramMaxBytes)
@@ -484,13 +650,18 @@ func extendUDPDeadlines(sides ...deadlineSetter) error {
 	return nil
 }
 
-func (d *Dataplane) relayUDPDirect(ctx context.Context, local net.Conn, flow Flow) {
+func (d *Dataplane) relayUDPDirect(ctx context.Context, local net.Conn, flow Flow, head [][]byte) {
 	remote, err := d.options.Direct.ListenUDP(ctx, flow.Destination)
 	if err != nil {
 		return
 	}
 	defer remote.Close()
 	destination := net.UDPAddrFromAddrPort(flow.Destination)
+	for _, datagram := range head {
+		if _, err := remote.WriteTo(datagram, destination); err != nil {
+			return
+		}
+	}
 
 	go func() {
 		buffer := make([]byte, udpDatagramMaxBytes)

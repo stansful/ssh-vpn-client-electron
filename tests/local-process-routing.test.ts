@@ -40,7 +40,7 @@ interface ServiceInternals {
     allowConnecting?: boolean
   ): Promise<void>;
   openProxyChannel(
-    client: SshLiveClient,
+    client: SshLiveClient | (() => Promise<SshLiveClient>),
     target: DirectTcpIpTarget,
     originator: { address: string; port: number },
     signal?: AbortSignal
@@ -89,6 +89,45 @@ describe("locally enforced per-process routing", () => {
         const direct = await open("127.0.0.1", echoPort, OTHER_APP_PORT);
         expect(harness.tunnelled).toHaveLength(tunnelledBefore);
         await direct.close();
+      } finally {
+        await harness.service.dispose();
+      }
+    });
+  });
+
+  it("does not make direct traffic wait for the tunnel while a session is being rebuilt", async () => {
+    await withWin32(async () => {
+      const harness = createHarness({ attributionAvailable: true });
+      const internals = harness.service as unknown as ServiceInternals;
+
+      try {
+        internals.status = { ...internals.status, state: "Connecting" };
+        internals.lastRequest = connectRequest(mixedRules());
+        await internals.applySystemRouting(internals.lastRequest, { host: "127.0.0.1", port: 31_080 }, true);
+        expect(internals.localProcessEnforcement).toBe(true);
+
+        // No session: acquiring one would park the caller. Direct traffic
+        // from an unselected process must never reach that point.
+        let acquisitions = 0;
+        const acquire = async (): Promise<SshLiveClient> => {
+          acquisitions += 1;
+          return new Promise<SshLiveClient>(() => undefined);
+        };
+        const direct = await internals.openProxyChannel(acquire, { host: "127.0.0.1", port: echoPort }, { address: "127.0.0.1", port: OTHER_APP_PORT });
+        expect(acquisitions).toBe(0);
+        await direct.close();
+
+        // Selected traffic does wait, in the tunnel branch only.
+        let settled = false;
+        const tunnelled = internals.openProxyChannel(acquire, { host: "cdn.telegram-cdn.test", port: 443 }, { address: "127.0.0.1", port: TARGET_APP_PORT });
+        void tunnelled.then(() => {
+          settled = true;
+        }, () => {
+          settled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(acquisitions).toBe(1);
+        expect(settled).toBe(false);
       } finally {
         await harness.service.dispose();
       }

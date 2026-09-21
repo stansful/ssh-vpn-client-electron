@@ -46,6 +46,13 @@ export interface SshLiveClientOptions {
   operationTimeoutMs?: number;
   directTcpIpOpenTimeoutMs?: number;
   keepaliveIntervalSec?: number;
+  /**
+   * How long a keepalive may go unanswered before the transport is declared
+   * dead. Any packet from the server during the wait counts as an answer, the
+   * way OpenSSH's ServerAliveCountMax treats received data, so a reply queued
+   * behind a busy download does not tear a healthy session down.
+   */
+  keepaliveTimeoutMs?: number;
   rekeyAfterBytes?: number;
   rekeyIntervalMs?: number;
 }
@@ -102,6 +109,46 @@ const GRACEFUL_DISCONNECT_TIMEOUT_MS = 1_000;
 const MAX_PENDING_CHANNEL_EVENTS = 512;
 const MAX_PENDING_CHANNEL_DATA_BYTES = 16 * 1024 * 1024;
 const MAX_TOTAL_PENDING_CHANNEL_DATA_BYTES = 32 * 1024 * 1024;
+/**
+ * OpenSSH declares a peer dead after ServerAliveInterval x ServerAliveCountMax
+ * (15 s x 3) without any received data. The keepalive here fires no more often
+ * than once a minute, so the wait for its answer is the part that decides how
+ * quickly a half-open socket is noticed; half a minute keeps that under two
+ * minutes end to end while still tolerating a slow link.
+ */
+export const DEFAULT_KEEPALIVE_TIMEOUT_MS = 30_000;
+/**
+ * A probe issued because the machine just woke up or changed networks. The
+ * link is either back or it is not; there is nothing to gain from waiting the
+ * full keepalive timeout before rebuilding a session that will not answer.
+ */
+export const LIVENESS_PROBE_TIMEOUT_MS = 15_000;
+/**
+ * Sending for this long without hearing anything back is the earliest sign
+ * of a half-open socket that does not depend on the keepalive cadence: a
+ * healthy server answers a channel open within a round trip and adjusts the
+ * window while data flows. The check costs one keepalive per silent window
+ * and nothing at all while the peer is talking.
+ */
+export const SILENT_SEND_PROBE_DELAY_MS = 10_000;
+
+type KeepaliveOutcome = "answered" | "abandoned";
+
+type KeepaliveRequest = {
+  /**
+   * Settles "answered" when the server replies, "abandoned" when a waiter gave
+   * up on the reply because other traffic proved the peer alive, and rejects
+   * when the client dies first.
+   */
+  promise: Promise<KeepaliveOutcome>;
+  /**
+   * Resolves once the request has actually been written to the socket. A
+   * deadline measured from before that would count a local upload backlog
+   * against the server.
+   */
+  written: Promise<void>;
+  abandon: () => void;
+};
 
 export class SshLiveClient {
   private readonly events = new EventEmitter();
@@ -116,11 +163,20 @@ export class SshLiveClient {
   private closed = false;
   private terminalChannel: number | undefined;
   private maintenanceTimer: NodeJS.Timeout | undefined;
-  private keepalivePromise: Promise<void> | undefined;
+  private keepaliveRequest: KeepaliveRequest | undefined;
   private rekeyPromise: Promise<void> | undefined;
   private rekeyBytesBaseline = 0;
   private lastRekeyAt = Date.now();
-  private lastActivityAt = Date.now();
+  /**
+   * When the server last sent us anything. Keepalives are scheduled from this
+   * alone: bytes we write prove nothing about the peer, and a proxy client
+   * retrying through a dead tunnel would otherwise keep postponing the one
+   * probe that could notice it.
+   */
+  private lastInboundAt = Date.now();
+  /** Set by a runtime write, cleared by the next inbound packet: one-way traffic while true. */
+  private unansweredOutbound = false;
+  private silentSendProbeTimer: NodeJS.Timeout | undefined;
 
   private constructor(
     private readonly transport: SshSocketTransport,
@@ -217,7 +273,6 @@ export class SshLiveClient {
     }
     const localChannel = this.terminalChannel;
     this.terminalChannel = undefined;
-    this.markActivity();
     try {
       await this.sendRuntimePayload(this.session.buildChannelEof(localChannel));
     } catch {
@@ -274,6 +329,7 @@ export class SshLiveClient {
       channelOpenController.abort();
     }
     const delivery = this.createChannelDelivery(channel.localId);
+    const openStartedAt = Date.now();
     try {
       const openResponse = this.waitForChannelOpen(
         channel.localId,
@@ -293,6 +349,9 @@ export class SshLiveClient {
       channelOpenController.abort();
       this.deleteChannelDelivery(channel.localId);
       await this.abortChannel(channel.localId);
+      if (isChannelTimeoutError(error)) {
+        this.suspectTransportAfterChannelTimeout(openStartedAt);
+      }
       throw error;
     } finally {
       signal?.removeEventListener("abort", forwardAbort);
@@ -310,7 +369,6 @@ export class SshLiveClient {
   }
 
   async closeDirectChannel(localChannel: number, eofAlreadySent = false): Promise<void> {
-    this.markActivity();
     if (!eofAlreadySent) {
       try {
         await this.sendRuntimePayload(this.session.buildChannelEof(localChannel));
@@ -328,39 +386,216 @@ export class SshLiveClient {
   }
 
   async endDirectChannel(localChannel: number): Promise<void> {
-    this.markActivity();
     await this.sendRuntimePayload(this.session.buildChannelEof(localChannel));
   }
 
   async acknowledgeDirectChannelData(localChannel: number, bytes: number): Promise<void> {
     const adjust = this.session.acknowledgeChannelData(localChannel, bytes);
     if (adjust) {
-      await this.sendRuntimePayload(adjust);
+      await this.sendRuntimeReply(adjust);
     }
   }
 
-  sendKeepalive(): Promise<void> {
-    if (this.keepalivePromise) {
-      return this.keepalivePromise;
+  /**
+   * Sends a keepalive unless one is already in flight and waits for the server
+   * to show signs of life within `timeoutMs`.
+   *
+   * The answer to the global request is the expected sign, but any packet that
+   * arrives while we wait is accepted as one: an answer can be queued behind
+   * channel data, and a peer that is still sending is not dead. Only a wait
+   * with nothing received at all rejects, which is the signal the owner uses
+   * to tear the session down.
+   */
+  sendKeepalive(timeoutMs = this.keepaliveTimeoutMs()): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new Error("SSH client is closed."));
     }
-    this.markActivity();
-    const work = this.sendRuntimeAndWaitForGlobalResponse(encodeKeepaliveRequest(), this.operationTimeoutMs());
-    this.keepalivePromise = work;
-    void work.then(
-      () => {
-        if (this.keepalivePromise === work) {
-          this.keepalivePromise = undefined;
-          this.rescheduleMaintenance();
-        }
-      },
-      () => {
-        if (this.keepalivePromise === work) {
-          this.keepalivePromise = undefined;
-          this.rescheduleMaintenance();
-        }
-      }
+    const request = this.keepaliveRequest ?? this.startKeepaliveRequest();
+    return this.awaitKeepaliveEvidence(request, timeoutMs);
+  }
+
+  /**
+   * Asks "is this session still alive?" and answers quickly.
+   *
+   * Meant for the moments when silence proves nothing - right after the
+   * machine wakes up or its network changes - so the owner does not have to
+   * wait for the regular keepalive cadence to learn that the socket died while
+   * the lid was closed. A failed probe destroys the client and reports the
+   * failure through the ordinary `error` event, exactly as a regular keepalive
+   * timeout does, so callers may fire and forget.
+   */
+  async probeLiveness(timeoutMs = LIVENESS_PROBE_TIMEOUT_MS): Promise<void> {
+    if (this.closed) {
+      throw new Error("SSH client is closed.");
+    }
+    try {
+      // Always a fresh request: one that has been pending since before the
+      // wake may already have evidence from before it, which is exactly what a
+      // probe must not be answered with.
+      await this.awaitKeepaliveEvidence(this.startKeepaliveRequest(), timeoutMs);
+    } catch (error) {
+      this.failFromKeepalive(error);
+      throw error;
+    }
+  }
+
+  private startKeepaliveRequest(): KeepaliveRequest {
+    let abandon: () => void = () => undefined;
+    let written!: Promise<void>;
+    const promise = new Promise<KeepaliveOutcome>((resolve, reject) => {
+      const onResponse = (): void => {
+        cleanup();
+        resolve("answered");
+      };
+      const onFailure = (error: Error): void => {
+        cleanup();
+        reject(error);
+      };
+      const cleanup = (): void => {
+        this.events.off("global-response", onResponse);
+        this.events.off("global-error", onFailure);
+      };
+      abandon = () => {
+        cleanup();
+        resolve("abandoned");
+      };
+      this.events.on("global-response", onResponse);
+      this.events.on("global-error", onFailure);
+      written = this.sendRuntimeReply(encodeKeepaliveRequest());
+      written.catch((error: unknown) => {
+        cleanup();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+    const request: KeepaliveRequest = { promise, written, abandon };
+    this.keepaliveRequest = request;
+    void promise.then(
+      () => this.finishKeepaliveRequest(request),
+      () => this.finishKeepaliveRequest(request)
     );
-    return work;
+    return request;
+  }
+
+  private finishKeepaliveRequest(request: KeepaliveRequest): void {
+    if (this.keepaliveRequest === request) {
+      this.keepaliveRequest = undefined;
+      this.rescheduleMaintenance();
+    }
+  }
+
+  /**
+   * Waits up to `timeoutMs` for the server to prove it is alive: the reply to
+   * `request`, or any other packet received after this wait began.
+   */
+  private awaitKeepaliveEvidence(initialRequest: KeepaliveRequest, timeoutMs: number): Promise<void> {
+    let waitingSince = Date.now();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let current = initialRequest;
+      let timer: NodeJS.Timeout | undefined;
+      const hasEvidence = (): boolean => this.lastInboundAt >= waitingSince;
+      const finish = (error?: Error): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const timedOut = (): void => {
+        if (settled) {
+          return;
+        }
+        if (hasEvidence()) {
+          // Something arrived while we waited, so the peer is alive even though
+          // the reply itself has not. Drop the stale request instead of letting
+          // its age excuse every later wait as well.
+          this.abandonKeepaliveRequest(current);
+          finish();
+          return;
+        }
+        // The timer phase runs before this turn's socket reads. Look once more
+        // after them, so a reply that is already in the receive buffer is not
+        // mistaken for silence.
+        setImmediate(() => {
+          if (settled) {
+            return;
+          }
+          if (hasEvidence()) {
+            this.abandonKeepaliveRequest(current);
+            finish();
+            return;
+          }
+          finish(
+            new Error(
+              `SSH keepalive timed out: nothing received from the server for ${Math.round((Date.now() - this.lastInboundAt) / 1000)} s.`
+            )
+          );
+        });
+      };
+      // The deadline starts when the request is on the wire: a keepalive
+      // queued behind an upload backlog has not asked the server anything yet.
+      initialRequest.written.then(
+        () => {
+          if (settled) {
+            return;
+          }
+          waitingSince = Math.max(waitingSince, Date.now());
+          timer = setTimeout(timedOut, Math.max(1, timeoutMs));
+          timer.unref();
+        },
+        (error: unknown) => finish(error instanceof Error ? error : new Error(String(error)))
+      );
+      const attach = (request: KeepaliveRequest): void => {
+        current = request;
+        request.promise.then(
+          (outcome) => {
+            if (settled) {
+              return;
+            }
+            if (outcome === "answered" || hasEvidence()) {
+              finish();
+              return;
+            }
+            // Another waiter gave the request up on evidence older than this
+            // wait. This one has seen nothing yet, so it needs a request of
+            // its own; its deadline stays where it was.
+            if (this.closed) {
+              finish(new Error("SSH client is closed."));
+              return;
+            }
+            attach(this.keepaliveRequest ?? this.startKeepaliveRequest());
+          },
+          (error: unknown) => finish(error instanceof Error ? error : new Error(String(error)))
+        );
+      };
+      attach(initialRequest);
+    });
+  }
+
+  private abandonKeepaliveRequest(request: KeepaliveRequest): void {
+    if (this.keepaliveRequest === request) {
+      this.keepaliveRequest = undefined;
+      request.abandon();
+      this.rescheduleMaintenance();
+      return;
+    }
+    request.abandon();
+  }
+
+  private failFromKeepalive(error: unknown): void {
+    if (this.closed) {
+      return;
+    }
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    this.events.emit("event", { type: "error", error: normalized } satisfies SshLiveClientEvent);
+    this.destroy(normalized);
   }
 
   async disconnect(description = "Client disconnect."): Promise<void> {
@@ -383,7 +618,7 @@ export class SshLiveClient {
       this.transport.destroy();
     }
     this.rejectWaiters(new Error("SSH client disconnected."));
-    this.clearChannelDeliveries();
+    this.clearChannelDeliveries(new Error("SSH client disconnected."));
   }
 
   destroy(error?: Error): void {
@@ -395,7 +630,7 @@ export class SshLiveClient {
     this.stopRekeyMonitor();
     this.transport.destroy(error);
     this.rejectWaiters(error ?? new Error("SSH client destroyed."));
-    this.clearChannelDeliveries();
+    this.clearChannelDeliveries(error ?? new Error("SSH client destroyed."));
   }
 
   async rekey(): Promise<void> {
@@ -533,6 +768,7 @@ export class SshLiveClient {
 
   private stopKeepalive(): void {
     this.stopMaintenanceTimer();
+    this.stopSilentSendProbe();
   }
 
   private startRekeyMonitor(): void {
@@ -551,8 +787,8 @@ export class SshLiveClient {
 
     const deadlines: number[] = [];
     const keepaliveIntervalMs = this.keepaliveIntervalMs();
-    if (keepaliveIntervalMs > 0 && !this.keepalivePromise) {
-      deadlines.push(this.lastActivityAt + keepaliveIntervalMs);
+    if (keepaliveIntervalMs > 0 && !this.keepaliveRequest) {
+      deadlines.push(this.lastInboundAt + keepaliveIntervalMs);
     }
     const rekeyIntervalMs = this.rekeyIntervalMs();
     if (rekeyIntervalMs > 0) {
@@ -590,18 +826,39 @@ export class SshLiveClient {
     }
 
     const keepaliveIntervalMs = this.keepaliveIntervalMs();
-    if (keepaliveIntervalMs > 0 && !this.keepalivePromise && Date.now() - this.lastActivityAt >= keepaliveIntervalMs) {
-      void this.sendKeepalive().catch((error: unknown) => {
-        const normalized = error instanceof Error ? error : new Error(String(error));
-        this.events.emit("event", { type: "error", error: normalized } satisfies SshLiveClientEvent);
-        this.destroy(normalized);
-      });
+    if (keepaliveIntervalMs > 0 && !this.keepaliveRequest && Date.now() - this.lastInboundAt >= keepaliveIntervalMs) {
+      void this.sendKeepalive().catch((error: unknown) => this.failFromKeepalive(error));
     }
     this.rescheduleMaintenance();
   }
 
   private keepaliveIntervalMs(): number {
     return normalizedSshKeepaliveIntervalMs(this.options.keepaliveIntervalSec);
+  }
+
+  private keepaliveTimeoutMs(): number {
+    const configured = this.options.keepaliveTimeoutMs;
+    if (configured !== undefined && Number.isFinite(configured) && configured > 0) {
+      return configured;
+    }
+    return DEFAULT_KEEPALIVE_TIMEOUT_MS;
+  }
+
+  /**
+   * A direct-tcpip open that timed out while the server sent nothing at all
+   * is more likely a dead transport than a slow target. Ask, instead of
+   * leaving every later proxy connection to time out the same way until the
+   * regular keepalive gets around to it.
+   */
+  private suspectTransportAfterChannelTimeout(openStartedAt: number): void {
+    if (this.closed || this.keepaliveRequest || this.keepaliveIntervalMs() <= 0) {
+      return;
+    }
+    if (this.lastInboundAt > openStartedAt) {
+      // The server spoke while the open was pending; the target was slow.
+      return;
+    }
+    void this.sendKeepalive(LIVENESS_PROBE_TIMEOUT_MS).catch((error: unknown) => this.failFromKeepalive(error));
   }
 
   private rekeyIntervalMs(): number {
@@ -614,7 +871,8 @@ export class SshLiveClient {
 
   private handleTransportEvent(event: SshPacketTransportEvent): void {
     if (event.type === "payload") {
-      this.markActivity();
+      this.lastInboundAt = Date.now();
+      this.unansweredOutbound = false;
       if (messageNumber(event.payload) === SSH_MSG_DISCONNECT) {
         this.handlePeerDisconnect();
         return;
@@ -642,7 +900,7 @@ export class SshLiveClient {
     this.stopKeepalive();
     this.stopRekeyMonitor();
     this.rejectWaiters(new Error("SSH transport closed."));
-    this.clearChannelDeliveries();
+    this.clearChannelDeliveries(new Error("SSH transport closed."));
     this.events.emit("event", { type: "close" } satisfies SshLiveClientEvent);
   }
 
@@ -675,7 +933,7 @@ export class SshLiveClient {
     if (number === SSH_MSG_GLOBAL_REQUEST) {
       const request = decodeGlobalRequest(payload);
       if (request.wantReply) {
-        void this.sendRuntimePayload(encodeRequestFailure()).catch((error: unknown) => this.handleFatalError(error));
+        void this.sendRuntimeReply(encodeRequestFailure()).catch((error: unknown) => this.handleFatalError(error));
       }
       return;
     }
@@ -686,10 +944,10 @@ export class SshLiveClient {
     if (isChannelMessage(number)) {
       const channelEvent = this.session.receiveChannelMessage(payload);
       if (channelEvent.windowAdjustPayload) {
-        void this.sendRuntimePayload(channelEvent.windowAdjustPayload).catch((error: unknown) => this.handleFatalError(error));
+        void this.sendRuntimeReply(channelEvent.windowAdjustPayload).catch((error: unknown) => this.handleFatalError(error));
       }
       if (channelEvent.responsePayload) {
-        void this.sendRuntimePayload(channelEvent.responsePayload).catch((error: unknown) => this.handleFatalError(error));
+        void this.sendRuntimeReply(channelEvent.responsePayload).catch((error: unknown) => this.handleFatalError(error));
       }
       this.emitChannelEvent(channelEvent);
     }
@@ -705,7 +963,7 @@ export class SshLiveClient {
     this.stopRekeyMonitor();
     this.transport.destroy(error);
     this.rejectWaiters(error);
-    this.clearChannelDeliveries();
+    this.clearChannelDeliveries(error);
     this.events.emit("event", { type: "close" } satisfies SshLiveClientEvent);
   }
 
@@ -747,7 +1005,7 @@ export class SshLiveClient {
       if ((localChannel === this.terminalChannel || event.type === "extended-data") && this.session.getChannel(localChannel)) {
         const adjust = this.session.acknowledgeChannelData(localChannel, event.data.length);
         if (adjust) {
-          void this.sendRuntimePayload(adjust).catch((error: unknown) => this.handleFatalError(error));
+          void this.sendRuntimeReply(adjust).catch((error: unknown) => this.handleFatalError(error));
         }
       }
       return;
@@ -843,9 +1101,20 @@ export class SshLiveClient {
     this.channelDeliveries.delete(localChannel);
   }
 
-  private clearChannelDeliveries(): void {
-    for (const localChannel of this.channelDeliveries.keys()) {
+  /**
+   * Ends every channel the session still had. The consumers of a channel -
+   * the local proxy sockets above all - learn that their stream is gone only
+   * from these events; without them an idle WebSocket or long poll would sit
+   * on a dead channel for as long as it stays quiet.
+   */
+  private clearChannelDeliveries(reason?: Error): void {
+    for (const [localChannel, delivery] of [...this.channelDeliveries]) {
       this.deleteChannelDelivery(localChannel);
+      if (reason && delivery.emitter.listenerCount("error") > 0) {
+        delivery.emitter.emit("error", reason);
+      } else {
+        delivery.emitter.emit("close");
+      }
     }
   }
 
@@ -889,35 +1158,6 @@ export class SshLiveClient {
       this.rejectChannelWaiters(localChannel, normalized);
       throw normalized;
     }
-  }
-
-  private async sendRuntimeAndWaitForGlobalResponse(payload: Buffer, timeoutMs: number): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("SSH keepalive timed out."));
-      }, timeoutMs);
-      timer.unref();
-      const onResponse = (): void => {
-        cleanup();
-        resolve();
-      };
-      const onFailure = (error: Error): void => {
-        cleanup();
-        reject(error);
-      };
-      const cleanup = (): void => {
-        clearTimeout(timer);
-        this.events.off("global-response", onResponse);
-        this.events.off("global-error", onFailure);
-      };
-      this.events.on("global-response", onResponse);
-      this.events.on("global-error", onFailure);
-      void this.sendRuntimePayload(payload).catch((error: unknown) => {
-        cleanup();
-        reject(error instanceof Error ? error : new Error(String(error)));
-      });
-    });
   }
 
   private waitForPayload(predicate: (payload: Buffer) => boolean, timeoutMs: number): Promise<Buffer> {
@@ -1009,7 +1249,6 @@ export class SshLiveClient {
         () => this.session.buildChannelDataFrames(localChannel, data.subarray(offset))
       );
       if (payloads.length > 0) {
-        this.markActivity();
         for (const payload of payloads) {
           await this.sendChannelRuntimePayload(localChannel, payload);
         }
@@ -1077,7 +1316,19 @@ export class SshLiveClient {
   }
 
   private async sendRuntimePayload(payload: Buffer, signal?: AbortSignal): Promise<void> {
-    await this.withRuntimeGate(() => this.transport.sendOwned(payload, signal));
+    await this.withRuntimeGate(() => {
+      this.noteOutbound();
+      return this.transport.sendOwned(payload, signal);
+    });
+  }
+
+  /**
+   * A packet that answers something the server sent (a window adjust, a reply
+   * to its global request, our own keepalive). Unlike a write of our own it
+   * expects nothing back, so it must not arm the silent-send check.
+   */
+  private async sendRuntimeReply(payload: Buffer): Promise<void> {
+    await this.withRuntimeGate(() => this.transport.sendOwned(payload));
   }
 
   private async abortChannel(localChannel: number): Promise<void> {
@@ -1093,8 +1344,46 @@ export class SshLiveClient {
       if (!this.session.getChannel(localChannel)) {
         throw new Error(`SSH channel ${localChannel} closed before queued data was written.`);
       }
+      this.noteOutbound();
       return this.transport.sendOwned(payload);
     });
+  }
+
+  /**
+   * Records a runtime write and, unless one is already pending, arms the
+   * silent-send check: if nothing has arrived by the time it fires while we
+   * kept sending, the peer is asked directly whether it is still there.
+   */
+  private noteOutbound(): void {
+    this.unansweredOutbound = true;
+    if (this.closed || this.silentSendProbeTimer || this.keepaliveRequest || this.keepaliveIntervalMs() <= 0) {
+      return;
+    }
+    this.silentSendProbeTimer = setTimeout(() => {
+      this.silentSendProbeTimer = undefined;
+      this.checkSilentSend();
+    }, SILENT_SEND_PROBE_DELAY_MS);
+    this.silentSendProbeTimer.unref();
+  }
+
+  private checkSilentSend(): void {
+    if (this.closed || this.keepaliveRequest) {
+      return;
+    }
+    if (!this.unansweredOutbound || Date.now() - this.lastInboundAt < SILENT_SEND_PROBE_DELAY_MS) {
+      // Either the peer answered after our last write or it spoke recently
+      // enough that the silence is not suspicious yet; a later write re-arms
+      // the check.
+      return;
+    }
+    void this.sendKeepalive(LIVENESS_PROBE_TIMEOUT_MS).catch((error: unknown) => this.failFromKeepalive(error));
+  }
+
+  private stopSilentSendProbe(): void {
+    if (this.silentSendProbeTimer) {
+      clearTimeout(this.silentSendProbeTimer);
+      this.silentSendProbeTimer = undefined;
+    }
   }
 
   private async withRuntimeGate<T>(action: () => T | Promise<T>): Promise<T> {
@@ -1202,10 +1491,10 @@ export class SshLiveClient {
     }
     return Math.min(this.operationTimeoutMs(), 12_000);
   }
+}
 
-  private markActivity(): void {
-    this.lastActivityAt = Date.now();
-  }
+function isChannelTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.name !== "AbortError" && /Timed out waiting for SSH channel/.test(error.message);
 }
 
 function channelOpenCancelledError(): Error {

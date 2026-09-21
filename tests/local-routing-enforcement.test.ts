@@ -83,7 +83,7 @@ describe("routing decision log", () => {
   // single tunnelled decision was ever written.
   it("does not let one direction spend the other's budget", () => {
     const messages: string[] = [];
-    const log = new RoutingDecisionLog((message) => messages.push(message));
+    const log = new RoutingDecisionLog((message) => messages.push(message), { now: () => 0 });
     for (let index = 0; index < MAX_LOGGED_DECISIONS_PER_DIRECTION * 2; index += 1) {
       log.record(target, { shouldProxy: false, reason: "no-match" });
     }
@@ -91,14 +91,34 @@ describe("routing decision log", () => {
     log.record(target, { shouldProxy: true, reason: "domain" });
 
     expect(afterDirect).toBe(MAX_LOGGED_DECISIONS_PER_DIRECTION);
-    expect(messages[afterDirect - 1]).toBe("Further direct routing decisions are suppressed for this session.");
+    expect(messages[afterDirect - 1]).toBe("Further direct routing decisions are suppressed for up to 60s.");
     expect(messages[afterDirect]).toBe("Tunnel egress for youtube.com:443 (domain).");
   });
 
-  // A long-lived process used to go permanently silent after one busy session.
-  it("restores both budgets on reset", () => {
+  // The whole point of the rework: an earlier version capped each direction for
+  // the entire session, so the log went permanently silent after one busy
+  // minute - exactly when a later stall most needed to be visible. The budget
+  // must refill on its own as time passes.
+  it("refills each direction's budget once the window elapses", () => {
     const messages: string[] = [];
-    const log = new RoutingDecisionLog((message) => messages.push(message), 2);
+    let clock = 1_000;
+    const log = new RoutingDecisionLog((message) => messages.push(message), { limit: 2, windowMs: 60_000, now: () => clock });
+
+    log.record(target, { shouldProxy: true, reason: "domain" });
+    log.record(target, { shouldProxy: true, reason: "domain" }); // hits the limit, emits the suppression note
+    log.record(target, { shouldProxy: true, reason: "domain" }); // silent, still in window
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toBe("Further tunnelled routing decisions are suppressed for up to 60s.");
+
+    clock += 60_000;
+    log.record(target, { shouldProxy: true, reason: "domain" });
+    expect(messages).toHaveLength(3);
+    expect(messages[2]).toBe("Tunnel egress for youtube.com:443 (domain).");
+  });
+
+  it("starts a fresh budget on reset", () => {
+    const messages: string[] = [];
+    const log = new RoutingDecisionLog((message) => messages.push(message), { limit: 2, now: () => 0 });
     log.record(target, { shouldProxy: true, reason: "domain" });
     log.record(target, { shouldProxy: true, reason: "domain" });
     log.record(target, { shouldProxy: true, reason: "domain" });

@@ -197,7 +197,9 @@ export class LocalRoutingEnforcer {
 }
 
 /** How many per-connection decisions of each direction reach the log. */
-export const MAX_LOGGED_DECISIONS_PER_DIRECTION = 60;
+export const MAX_LOGGED_DECISIONS_PER_DIRECTION = 40;
+/** Each direction's budget refills once this much time has passed. */
+export const ROUTING_DECISION_LOG_WINDOW_MS = 60_000;
 
 /** Renders one routing decision for the diagnostics log. */
 export function describeRoutingDecision(target: DirectTcpIpTarget, decision: LocalRoutingDecision): string {
@@ -221,31 +223,57 @@ export function describeRoutingDecision(target: DirectTcpIpTarget, decision: Loc
  *
  * Both transports share this so their diagnostics cannot drift apart.
  */
+export interface RoutingDecisionLogOptions {
+  limit?: number;
+  windowMs?: number;
+  /** Injection seam for tests; defaults to the wall clock. */
+  now?: () => number;
+}
+
 export class RoutingDecisionLog {
   private tunnelled = 0;
   private direct = 0;
+  private windowStartedAt: number | undefined;
+  private readonly limit: number;
+  private readonly windowMs: number;
+  private readonly now: () => number;
 
-  constructor(
-    private readonly emit: (message: string) => void,
-    private readonly limit: number = MAX_LOGGED_DECISIONS_PER_DIRECTION
-  ) {}
+  constructor(private readonly emit: (message: string) => void, options: RoutingDecisionLogOptions = {}) {
+    this.limit = options.limit ?? MAX_LOGGED_DECISIONS_PER_DIRECTION;
+    this.windowMs = options.windowMs ?? ROUTING_DECISION_LOG_WINDOW_MS;
+    this.now = options.now ?? (() => Date.now());
+  }
 
   /** Starts a fresh budget, so a reconnect is not silenced by the last session. */
   reset(): void {
     this.tunnelled = 0;
     this.direct = 0;
+    this.windowStartedAt = undefined;
   }
 
   record(target: DirectTcpIpTarget, decision: LocalRoutingDecision): void {
+    // A rolling window rather than a once-per-session cap: an earlier version
+    // capped each direction for the whole session, so a busy browser exhausted
+    // the budget in the first minute and the log then went permanently silent -
+    // useless for watching a stall that starts later. The budget now refills
+    // every window, so recent activity is always visible while a burst is still
+    // bounded.
+    const at = this.now();
+    if (this.windowStartedAt === undefined || at - this.windowStartedAt >= this.windowMs) {
+      this.windowStartedAt = at;
+      this.tunnelled = 0;
+      this.direct = 0;
+    }
     const count = decision.shouldProxy ? (this.tunnelled += 1) : (this.direct += 1);
     if (count > this.limit) {
       return;
     }
     if (count === this.limit) {
+      const seconds = Math.round(this.windowMs / 1000);
       this.emit(
         decision.shouldProxy
-          ? "Further tunnelled routing decisions are suppressed for this session."
-          : "Further direct routing decisions are suppressed for this session."
+          ? `Further tunnelled routing decisions are suppressed for up to ${seconds}s.`
+          : `Further direct routing decisions are suppressed for up to ${seconds}s.`
       );
       return;
     }

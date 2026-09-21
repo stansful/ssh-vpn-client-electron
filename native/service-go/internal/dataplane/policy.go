@@ -218,6 +218,19 @@ func (p *Policy) HasProcessRules() bool {
 	return len(p.processNames) > 0
 }
 
+// NamesMatter reports whether a name can select a flow that its address did
+// not: a domain rule or the curated proxy list. Only then is it worth holding
+// a flow back to read its name from its first bytes. The direct list does not
+// count, because it can only unselect a flow the proxy list selected, and the
+// proxy list needs a name to begin with; proxy-all and address- or
+// process-only rule sets answer the same with or without a name.
+func (p *Policy) NamesMatter() bool {
+	if p.config.Mode != routing.ModeSelectedRules {
+		return false
+	}
+	return p.matcher.Summary().DomainRules > 0 || len(p.proxySuffixes) > 0
+}
+
 func (p *Policy) isProtectedEndpoint(destination netip.AddrPort) bool {
 	for _, protected := range p.config.ProtectedEndpoints {
 		if !protected.IsValid() || protected.Port() != destination.Port() {

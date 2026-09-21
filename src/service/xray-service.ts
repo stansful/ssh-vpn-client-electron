@@ -23,6 +23,7 @@ import {
 } from "../core/routing/process-route-domains.js";
 import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
 import { Socks5Proxy } from "../core/network/socks5-proxy.js";
+import { ProxyActivityHeartbeat, PROXY_HEARTBEAT_INTERVAL_MS } from "../core/network/proxy-activity-heartbeat.js";
 import { openSocks5UpstreamChannel } from "../core/network/socks5-upstream.js";
 import { LocalRoutingEnforcer, RoutingDecisionLog, type LocalRoutingContext } from "./local-routing-enforcement.js";
 import { NativeDataplaneController, type DataplaneController } from "./native-dataplane.js";
@@ -131,6 +132,7 @@ export class XrayServiceBridge {
   private readonly localRoutingEnforcer: LocalRoutingEnforcer;
   private localRoutingContext: LocalRoutingContext | undefined;
   private localProxy: Socks5Proxy | undefined;
+  private localProxyHeartbeat: NodeJS.Timeout | undefined;
   private proxyDiagnostics = 0;
   /**
    * Both directions of every routing decision, so the log can tell "no rule
@@ -602,10 +604,33 @@ export class XrayServiceBridge {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.lastRequest && this.isCurrentLifecycle(generation) && !this.disconnectRequested) {
-        void this.connect(this.lastRequest);
+        this.connect(this.lastRequest).catch((error: unknown) => {
+          // The retry loop must outlive a broken attempt.
+          const message = error instanceof Error ? error.message : String(error);
+          this.appendDiagnostic("error", `Xray restart could not be started: ${message}`);
+          this.scheduleReconnect(message, this.lifecycleGeneration);
+        });
       }
     }, delayMs);
     this.reconnectTimer.unref();
+  }
+
+  /**
+   * The machine resumed or changed networks: a restart that is waiting out
+   * its backoff runs now, because the delay was sized for a failure that has
+   * since been overtaken by events.
+   */
+  wake(reason: string): void {
+    if (this.disposed || this.disconnectRequested || !this.lastRequest || !this.reconnectTimer) {
+      return;
+    }
+    this.appendDiagnostic("info", `Wake (${reason}): restarting the Xray transport now instead of waiting out the backoff.`);
+    this.clearReconnectTimer();
+    this.connect(this.lastRequest).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendDiagnostic("error", `Xray restart could not be started: ${message}`);
+      this.scheduleReconnect(message, this.lifecycleGeneration);
+    });
   }
 
   private clearReconnectTimer(): void {
@@ -731,7 +756,7 @@ export class XrayServiceBridge {
     this.clearProcessRoutingState();
     this.appendDiagnostic(
       "info",
-      "TUN routing is active: every selected application's traffic is captured at the adapter, including UDP."
+      "TUN routing is active: every selected application's traffic is captured at the adapter, including UDP. Domain rules match on the name each connection opens (TLS SNI, HTTP Host, QUIC), so a browser that resolved before connecting or uses DNS-over-HTTPS is covered."
     );
     return true;
   }
@@ -1104,6 +1129,7 @@ export class XrayServiceBridge {
       const endpoint = await proxy.start();
       rememberLocalProxyPort(endpoint.port);
       this.localProxy = proxy;
+      this.startLocalProxyHeartbeat(generation);
       this.appendDiagnostic("info", `Local routing proxy is listening on ${endpoint.host}:${endpoint.port}.`);
       return endpoint;
     } catch (error) {
@@ -1117,10 +1143,38 @@ export class XrayServiceBridge {
   }
 
   private async stopLocalProxy(): Promise<void> {
+    this.stopLocalProxyHeartbeat();
     const proxy = this.localProxy;
     this.localProxy = undefined;
     this.localRoutingContext = undefined;
     await proxy?.stop().catch(() => undefined);
+  }
+
+  /**
+   * Logs a periodic summary of local-proxy traffic while the tunnel is up, so a
+   * data-plane stall can be told apart from a routing miss without a live
+   * debugger on the user's machine.
+   */
+  private startLocalProxyHeartbeat(generation: number): void {
+    this.stopLocalProxyHeartbeat();
+    const heartbeat = new ProxyActivityHeartbeat(
+      () => this.localProxy?.snapshotStats(),
+      (message) => {
+        if (generation === this.processRoutingGeneration && this.isRoutingApplicable()) {
+          this.appendDiagnostic("info", message);
+        }
+      }
+    );
+    heartbeat.start();
+    this.localProxyHeartbeat = setInterval(() => heartbeat.tick(), PROXY_HEARTBEAT_INTERVAL_MS);
+    this.localProxyHeartbeat.unref();
+  }
+
+  private stopLocalProxyHeartbeat(): void {
+    if (this.localProxyHeartbeat) {
+      clearInterval(this.localProxyHeartbeat);
+      this.localProxyHeartbeat = undefined;
+    }
   }
 
   private startProcessRoutingMonitor(request: ProxyConnectRequest, socksEndpoint: { host: string; port: number }): void {

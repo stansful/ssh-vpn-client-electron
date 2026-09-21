@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SshLiveClient,
   sshKernelKeepaliveInitialDelayMs,
@@ -434,6 +434,348 @@ describe("SSH live client rekey coordination", () => {
     expect(closes).toEqual(["close"]);
   });
 });
+
+describe("SSH live client liveness", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("schedules the keepalive from the last inbound packet, not from outbound writes", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { keepaliveIntervalSec: 60 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    internals.startKeepalive();
+    transport.onSend = (payload) => {
+      if (payload[0] === SSH_MSG_CHANNEL_OPEN) {
+        transport.emitPayload(
+          new SshBinaryWriter().byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION).uint32(0).uint32(9).uint32(1024 * 1024).uint32(64 * 1024).toBuffer()
+        );
+      }
+    };
+    const channel = await client.openDirectTcpIpChannel({ host: "example.com", port: 443 }, { address: "127.0.0.1", port: 50000 });
+
+    // Outbound traffic through a half-open socket used to postpone the probe
+    // for as long as the proxied applications kept retrying. Now a write that
+    // gets no answer for ten seconds asks the server directly.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await channel.write(Buffer.from("GET / HTTP/1.1\r\n\r\n"));
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(keepalives(transport)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(keepalives(transport)).toHaveLength(1);
+
+    // The answer is inbound, so the regular probe is a full interval after it.
+    await vi.advanceTimersByTimeAsync(1_000);
+    transport.emitPayload(Buffer.from([SSH_MSG_REQUEST_SUCCESS]));
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(keepalives(transport)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(keepalives(transport)).toHaveLength(2);
+  });
+
+  it("tears down a session that stays silent after being written to", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { keepaliveIntervalSec: 60 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const events: string[] = [];
+    client.onEvent((event) => events.push(event.type));
+    internals.startKeepalive();
+
+    // A channel open that the server never confirms: the write arms the check.
+    const opening = client.openDirectTcpIpChannel({ host: "dead.example.com", port: 443 }, { address: "127.0.0.1", port: 50000 });
+    const openFailure = expect(opening).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(keepalives(transport)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(transport.destroyed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_005);
+    expect(events).toEqual(["error"]);
+    expect(transport.destroyed).toBe(true);
+    await openFailure;
+
+    // A peer that keeps talking is never probed for one-way traffic.
+    const talking = new FakeTransport();
+    const talkingClient = createTestClient(talking, 60_000, { keepaliveIntervalSec: 60 });
+    const talkingInternals = talkingClient as unknown as LiveClientInternals;
+    talkingInternals.runtimeDispatchEnabled = true;
+    forceAuthenticated(talkingInternals.session);
+    talkingInternals.startKeepalive();
+    talking.onSend = (payload) => {
+      if (payload[0] === SSH_MSG_CHANNEL_OPEN) {
+        talking.emitPayload(
+          new SshBinaryWriter().byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION).uint32(0).uint32(9).uint32(1024 * 1024).uint32(64 * 1024).toBuffer()
+        );
+      }
+    };
+    const talkingChannel = await talkingClient.openDirectTcpIpChannel({ host: "example.com", port: 443 }, { address: "127.0.0.1", port: 50001 });
+    for (let second = 0; second < 30; second += 1) {
+      await talkingChannel.write(Buffer.from("ping"));
+      talking.emitPayload(new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(0).string(Buffer.from("pong")).toBuffer());
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(keepalives(talking)).toHaveLength(0);
+  });
+
+  it("accepts any inbound packet during the keepalive wait as proof of life", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { keepaliveIntervalSec: 60, keepaliveTimeoutMs: 1_000 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const errors: string[] = [];
+    client.onEvent((event) => {
+      if (event.type === "error") {
+        errors.push(event.error.message);
+      }
+    });
+    internals.startKeepalive();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(keepalives(transport)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(500);
+    // A server-initiated global request that wants no reply: unrelated to
+    // our keepalive, but only a live peer sends it.
+    transport.emitPayload(
+      new SshBinaryWriter().byte(SSH_MSG_GLOBAL_REQUEST).string("hostkeys-00@openssh.com").boolean(false).toBuffer()
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(errors).toEqual([]);
+    expect(transport.destroyed).toBe(false);
+    // The unanswered request is dropped, so the next interval sends a fresh one
+    // rather than excusing itself with the old evidence forever.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(keepalives(transport)).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1_005);
+    expect(errors).toEqual([expect.stringContaining("SSH keepalive timed out")]);
+    expect(transport.destroyed).toBe(true);
+  });
+
+  it("destroys the session when a keepalive gets no answer and nothing else arrives", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { keepaliveIntervalSec: 60, keepaliveTimeoutMs: 1_000 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const events: string[] = [];
+    client.onEvent((event) => events.push(event.type));
+    internals.startKeepalive();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(keepalives(transport)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(transport.destroyed).toBe(false);
+    // The verdict waits one more turn for socket reads that may already hold
+    // the answer; nothing arrives, so the session goes down.
+    await vi.advanceTimersByTimeAsync(5);
+
+    expect(events).toEqual(["error"]);
+    expect(transport.destroyed).toBe(true);
+  });
+
+  it("does not let evidence older than a probe answer the probe", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { keepaliveIntervalSec: 60, keepaliveTimeoutMs: 30_000 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const errors: string[] = [];
+    client.onEvent((event) => {
+      if (event.type === "error") {
+        errors.push(event.error.message);
+      }
+    });
+    internals.startKeepalive();
+
+    // t=60: regular keepalive. t=62: an unrelated packet, then the link dies.
+    await vi.advanceTimersByTimeAsync(62_000);
+    expect(keepalives(transport)).toHaveLength(1);
+    transport.emitPayload(
+      new SshBinaryWriter().byte(SSH_MSG_GLOBAL_REQUEST).string("hostkeys-00@openssh.com").boolean(false).toBuffer()
+    );
+    // t=80: the machine woke up; the probe sends its own request instead of
+    // riding on the one whose window already holds the t=62 packet.
+    await vi.advanceTimersByTimeAsync(18_000);
+    const probe = client.probeLiveness(15_000);
+    const rejection = expect(probe).rejects.toThrow("SSH keepalive timed out");
+    expect(keepalives(transport)).toHaveLength(2);
+    // t=90: the regular wait excuses itself with the t=62 packet ...
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(errors).toEqual([]);
+    // ... but the probe saw nothing in its own window and fails at t=95.
+    await vi.advanceTimersByTimeAsync(5_005);
+    await rejection;
+    expect(errors).toHaveLength(1);
+    expect(transport.destroyed).toBe(true);
+  });
+
+  it("ends every open channel when the transport dies", async () => {
+    const transport = new FakeTransport();
+    const client = createTestClient(transport);
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    transport.onSend = (payload) => {
+      if (payload[0] === SSH_MSG_CHANNEL_OPEN) {
+        transport.emitPayload(
+          new SshBinaryWriter().byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION).uint32(0).uint32(9).uint32(1024 * 1024).uint32(64 * 1024).toBuffer()
+        );
+      }
+    };
+    const channel = await client.openDirectTcpIpChannel({ host: "chat.example.com", port: 443 }, { address: "127.0.0.1", port: 50000 });
+    const observed: string[] = [];
+    channel.onError((error) => observed.push(`error:${error.message}`));
+    channel.onClose(() => observed.push("close"));
+    await nextTurn();
+
+    // An idle WebSocket learns about the dead tunnel only from this; without
+    // it the local socket would stay open on a channel that no longer exists.
+    transport.emitClose();
+    expect(observed).toEqual(["error:SSH transport closed."]);
+
+    // A consumer without an error listener is told through close instead.
+    const quiet = new FakeTransport();
+    const quietClient = createTestClient(quiet);
+    const quietInternals = quietClient as unknown as LiveClientInternals;
+    quietInternals.runtimeDispatchEnabled = true;
+    forceAuthenticated(quietInternals.session);
+    quiet.onSend = (payload) => {
+      if (payload[0] === SSH_MSG_CHANNEL_OPEN) {
+        quiet.emitPayload(
+          new SshBinaryWriter().byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION).uint32(0).uint32(9).uint32(1024 * 1024).uint32(64 * 1024).toBuffer()
+        );
+      }
+    };
+    const quietChannel = await quietClient.openDirectTcpIpChannel({ host: "chat.example.com", port: 443 }, { address: "127.0.0.1", port: 50001 });
+    const quietObserved: string[] = [];
+    quietChannel.onClose(() => quietObserved.push("close"));
+    await nextTurn();
+    quietClient.destroy(new Error("keepalive gave up"));
+    expect(quietObserved).toEqual(["close"]);
+  });
+
+  it("starts the keepalive deadline only once the request is on the wire", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { keepaliveIntervalSec: 60 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    const errors: string[] = [];
+    client.onEvent((event) => {
+      if (event.type === "error") {
+        errors.push(event.error.message);
+      }
+    });
+    // The upload backlog holds the keepalive frame for a while.
+    const backlog = deferred<undefined>();
+    transport.onSendOwned = async (payload) => {
+      transport.payloads.push(payload);
+      if (payload[0] === SSH_MSG_GLOBAL_REQUEST) {
+        await backlog.promise;
+      }
+    };
+
+    const probe = client.probeLiveness(1_000);
+    let settled = false;
+    void probe.then(() => {
+      settled = true;
+    }, () => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(settled).toBe(false);
+    expect(errors).toEqual([]);
+
+    backlog.resolve(undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(5);
+    expect(settled).toBe(true);
+    expect(errors).toEqual([expect.stringContaining("SSH keepalive timed out")]);
+    await expect(probe).rejects.toThrow("SSH keepalive timed out");
+  });
+
+  it("probes liveness on demand with its own short deadline", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const client = createTestClient(transport, 60_000, { keepaliveIntervalSec: 60 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    internals.startKeepalive();
+
+    const healthy = client.probeLiveness(500);
+    expect(keepalives(transport)).toHaveLength(1);
+    transport.emitPayload(Buffer.from([SSH_MSG_REQUEST_FAILURE]));
+    await expect(healthy).resolves.toBeUndefined();
+    expect(transport.destroyed).toBe(false);
+
+    const errors: string[] = [];
+    client.onEvent((event) => {
+      if (event.type === "error") {
+        errors.push(event.error.message);
+      }
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    const dead = client.probeLiveness(500);
+    const rejection = expect(dead).rejects.toThrow("SSH keepalive timed out");
+    expect(keepalives(transport)).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(505);
+    await rejection;
+    expect(errors).toHaveLength(1);
+    expect(transport.destroyed).toBe(true);
+    await expect(client.probeLiveness(500)).rejects.toThrow("SSH client is closed");
+  });
+
+  it("asks the server whether it is alive after a direct-tcpip open times out in silence", async () => {
+    const silent = new FakeTransport();
+    const client = createTestClient(silent, 60_000, { keepaliveIntervalSec: 60, directTcpIpOpenTimeoutMs: 5 });
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    await expect(client.openDirectTcpIpChannel(
+      { host: "slow.example.com", port: 443 },
+      { address: "127.0.0.1", port: 50000 }
+    )).rejects.toThrow("Timed out waiting for SSH channel");
+    expect(keepalives(silent)).toHaveLength(1);
+
+    // A peer that is still talking gets no extra probe; the open was slow, not the link.
+    const talking = new FakeTransport();
+    const talkingClient = createTestClient(talking, 60_000, { keepaliveIntervalSec: 60, directTcpIpOpenTimeoutMs: 5 });
+    const talkingInternals = talkingClient as unknown as LiveClientInternals;
+    talkingInternals.runtimeDispatchEnabled = true;
+    forceAuthenticated(talkingInternals.session);
+    talking.onSend = (payload) => {
+      if (payload[0] === SSH_MSG_CHANNEL_OPEN) {
+        setTimeout(() => {
+          talking.emitPayload(
+            new SshBinaryWriter().byte(SSH_MSG_GLOBAL_REQUEST).string("hostkeys-00@openssh.com").boolean(false).toBuffer()
+          );
+        }, 2);
+      }
+    };
+    await expect(talkingClient.openDirectTcpIpChannel(
+      { host: "slow.example.com", port: 443 },
+      { address: "127.0.0.1", port: 50000 }
+    )).rejects.toThrow("Timed out waiting for SSH channel");
+    expect(keepalives(talking)).toHaveLength(0);
+  });
+});
+
+function keepalives(transport: FakeTransport): Buffer[] {
+  return transport.payloads.filter((payload) => payload[0] === SSH_MSG_GLOBAL_REQUEST);
+}
 
 interface LiveClientInternals {
   runtimeDispatchEnabled: boolean;
