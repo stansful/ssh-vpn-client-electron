@@ -1,4 +1,4 @@
-import { createDefaultStore, DEFAULT_SETTINGS } from "../shared/defaults.js";
+import { createDefaultStore, DEFAULT_SETTINGS, PUBLIC_PROXY_LIST_URL } from "../shared/defaults.js";
 import { normalizeProxyDomain } from "../core/routing/domain-proxy-list.js";
 import type { RendererEvent, ShadowSshApi } from "../shared/ipc.js";
 import { appendBoundedDiagnosticEntries } from "../shared/diagnostics-history.js";
@@ -69,7 +69,6 @@ const PREVIEW_VERSION = "2.2.0";
 const HOUR = 3600_000;
 /** main.log rotates at 5 MB; the seeded archives are full ones. */
 const LOG_ARCHIVE_BYTES = 5 * 1024 * 1024;
-const PUBLIC_LIST_URL = "https://hub.mos.ru/zieng2/wl/raw/main/list_universal.txt";
 
 class BrowserPreview {
   readonly api: ShadowSshApi;
@@ -769,7 +768,7 @@ class BrowserPreview {
       refreshProxyProfiles: async () => {
         this.assertWritable();
         await delay(1200);
-        const result = await this.importProfiles({ text: publicListText(), source: "remote", sourceUrl: PUBLIC_LIST_URL });
+        const result = await this.importProfiles({ text: publicListText(), source: "remote", sourceUrl: PUBLIC_PROXY_LIST_URL });
         return { snapshot: this.snapshot(), result };
       },
       selectProxyProfile: async (id) => {
@@ -1259,7 +1258,7 @@ function seedStore(today: Date, loggingEnabled: boolean): AppStore {
       isPinned: pinned,
       isStale: gone,
       isSelected: index === 0,
-      sourceUrl: source === "remote" ? PUBLIC_LIST_URL : undefined
+      sourceUrl: source === "remote" ? PUBLIC_PROXY_LIST_URL : undefined
     })
   );
   for (let index = 1; profiles.length < 128; index += 1) {
@@ -1275,7 +1274,7 @@ function seedStore(today: Date, loggingEnabled: boolean): AppStore {
         isPinned: index % 13 === 0 && profiles.filter((profile) => profile.isPinned).length < 12,
         isStale: index % 23 === 0,
         isSelected: false,
-        sourceUrl: PUBLIC_LIST_URL
+        sourceUrl: PUBLIC_PROXY_LIST_URL
       })
     );
   }

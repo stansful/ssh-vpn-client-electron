@@ -556,7 +556,8 @@
 .term .t-err { color: #FF8A8F; }
 .term .t-prompt { color: var(--accent); }
 .term-lines { white-space: normal; display: flex; flex-direction: column; }
-.term-line { white-space: pre-wrap; min-height: 1.6em; }
+/* No shrinking: a height-capped column would squeeze wrapped lines to one row and overlap them. */
+.term-line { flex-shrink: 0; white-space: pre-wrap; min-height: 1.6em; }
 .term-input {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 8px 8px 14px;

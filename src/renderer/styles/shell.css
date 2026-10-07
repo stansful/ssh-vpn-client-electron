@@ -159,6 +159,8 @@
   transition: opacity var(--t-mid) var(--ease-out);
 }
 .sb[data-collapsed="true"] .nav-item { justify-content: center; padding: 0; gap: 0; }
+/* The count's auto margin would take the free space and pin the icon to the left. */
+.sb[data-collapsed="true"] .nav-count { margin-left: 0; overflow: hidden; }
 
 /* Sidebar status card (global connection) */
 .sb-status {
@@ -193,7 +195,7 @@
 .sb-status-copy { display: flex; flex-direction: column; min-width: 0; transition: opacity var(--t-mid) var(--ease-out); }
 .sb-status-title { font-weight: 600; font-size: 13px; white-space: nowrap; }
 .sb-status-sub { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sb[data-collapsed="true"] .sb-status { justify-content: center; padding: 10px 0; }
+.sb[data-collapsed="true"] .sb-status { justify-content: center; padding: 10px 0; gap: 0; }
 
 /* ---------- Preview-only banner (connection core failed to start) ---------- */
 .preview-banner { display: flex; flex-direction: column; }

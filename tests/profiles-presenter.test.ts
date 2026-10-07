@@ -292,7 +292,7 @@ describe("public list", () => {
     expect(describeRefreshFailure(new Error("Public proxy refresh failed: 404 Not Found")).reason).toBe("the source answered 404 Not Found");
     expect(describeRefreshFailure(new Error("Remote proxy source is larger than the allowed limit.")).reason).toBe("the list was over 2 MB");
     expect(describeRefreshFailure(new Error("Proxy profile count exceeds the 10000 profile limit.")).reason).toBe("it would pass the 10,000-profile limit");
-    const offline = describeRefreshFailure(new Error("getaddrinfo ENOTFOUND hub.mos.ru"));
+    const offline = describeRefreshFailure(new Error("getaddrinfo ENOTFOUND gitverse.ru"));
     expect(offline.reason).toBe("the source couldn’t be reached");
     expect(offline.message).toMatch(/Nothing changed\.$/u);
   });

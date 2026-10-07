@@ -23,7 +23,7 @@ describe("app-originated HTTP fetches", () => {
 
     expect(fetchImpl).toHaveBeenCalledOnce();
     expect(new Headers(requests[0]?.init?.headers).get("cache-control")).toBe("no-store");
-    expect(requests[0]?.input).toContain("hub.mos.ru");
+    expect(requests[0]?.input).toBe("https://gitverse.ru/api/repos/zieng2/wl/raw/branch/master/list_universal.txt");
     expect(requests[0]?.init?.signal).toBeInstanceOf(AbortSignal);
     expect(importProxyProfiles).toHaveBeenCalledWith(expect.objectContaining({ text: source, source: "remote" }));
     expect(result.imported).toBe(1);

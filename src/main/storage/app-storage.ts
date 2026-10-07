@@ -10,6 +10,8 @@ import {
   createDefaultStore,
   DEFAULT_CUSTOM_THEME,
   LEGACY_DEFAULT_SIGNAL_COLORS,
+  LEGACY_PUBLIC_PROXY_LIST_URLS,
+  PUBLIC_PROXY_LIST_URL,
   RUSSIA_INSIDE_PROXY_LIST_URL,
   RUSSIA_OUTSIDE_DIRECT_LIST_URL,
   STORE_SCHEMA_VERSION
@@ -1029,10 +1031,19 @@ function normalizeStore(input: AppStore): AppStore {
     ? inputSettings.tunDataplaneEnabled
     : defaults.settings.tunDataplaneEnabled;
   // Xray 26 removed the HTTP/2 transport, so a profile saved with it can no
-  // longer run; "unknown" marks it unsupported, as the parsers now do.
-  const proxyProfiles = (Array.isArray(input.proxyProfiles) ? input.proxyProfiles : []).map((profile) =>
-    typeof profile === "object" && profile !== null && profile.transport === "http" ? { ...profile, transport: "unknown" as const } : profile
-  );
+  // longer run; "unknown" marks it unsupported, as the parsers now do. Profiles
+  // from a former public list URL move to the current one, or a refresh would
+  // never mark the ones that left the list stale.
+  const proxyProfiles = (Array.isArray(input.proxyProfiles) ? input.proxyProfiles : []).map((profile) => {
+    if (typeof profile !== "object" || profile === null) {
+      return profile;
+    }
+    let migrated = profile.transport === "http" ? { ...profile, transport: "unknown" as const } : profile;
+    if (migrated.sourceUrl && LEGACY_PUBLIC_PROXY_LIST_URLS.includes(migrated.sourceUrl)) {
+      migrated = { ...migrated, sourceUrl: PUBLIC_PROXY_LIST_URL };
+    }
+    return migrated;
+  });
   assertStoredProxyProfileCapacity(proxyProfiles.length, 0);
   const routingRules = Array.isArray(input.routingRules) ? input.routingRules : [];
   if (routingRules.length > MAX_ROUTING_RULES) {

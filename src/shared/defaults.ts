@@ -9,6 +9,12 @@ import type { AppSettings, AppStore, CustomTheme, PlatformTarget, RuntimeStatus 
 export const STORE_SCHEMA_VERSION = 3;
 export const RUSSIA_INSIDE_PROXY_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst";
 export const RUSSIA_OUTSIDE_DIRECT_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst";
+export const PUBLIC_PROXY_LIST_URL = "https://gitverse.ru/api/repos/zieng2/wl/raw/branch/master/list_universal.txt";
+/**
+ * Earlier homes of the public list. Profiles fetched from them are counted as
+ * coming from the current one, so the next refresh can mark the gone ones stale.
+ */
+export const LEGACY_PUBLIC_PROXY_LIST_URLS: readonly string[] = ["https://hub.mos.ru/zieng2/wl/raw/main/list_universal.txt"];
 
 /**
  * Version 3 moves the signal colours to the "Night Signal" palette. Stores

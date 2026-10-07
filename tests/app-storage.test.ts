@@ -7,6 +7,8 @@ import {
   createDefaultStore,
   DEFAULT_CUSTOM_THEME,
   LEGACY_DEFAULT_SIGNAL_COLORS,
+  LEGACY_PUBLIC_PROXY_LIST_URLS,
+  PUBLIC_PROXY_LIST_URL,
   RUSSIA_INSIDE_PROXY_LIST_URL,
   RUSSIA_OUTSIDE_DIRECT_LIST_URL,
   STORE_SCHEMA_VERSION
@@ -844,6 +846,23 @@ describe("AppStorage profiles Xray 26 can no longer run", () => {
     expect(store.proxyProfiles.find((profile) => profile.id === h2.id)).toMatchObject({ transport: "unknown", isSelected: false });
     expect(store.proxyProfiles.find((profile) => profile.name === "ws")?.isSelected).toBe(true);
     await expect(reopened.selectProxyProfile(h2.id)).rejects.toThrow(UNSUPPORTED_PROXY_PROFILE_MESSAGE);
+  });
+
+  it("moves profiles from the former public list URL to the current one, so a refresh marks the gone ones stale", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const kept = "vless://11111111-1111-4111-8111-111111111111@kept.example.com:443?type=ws&security=tls#kept";
+    const gone = "vless://11111111-1111-4111-8111-111111111111@gone.example.com:443?type=ws&security=tls#gone";
+    const first = new AppStorage(dir);
+    await first.init();
+    await first.importProxyProfiles({ text: [kept, gone].join("\n"), source: "remote", sourceUrl: LEGACY_PUBLIC_PROXY_LIST_URLS[0] });
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    expect(reopened.getStore().proxyProfiles.map((profile) => profile.sourceUrl)).toEqual([PUBLIC_PROXY_LIST_URL, PUBLIC_PROXY_LIST_URL]);
+
+    const { store } = await reopened.importProxyProfiles({ text: kept, source: "remote", sourceUrl: PUBLIC_PROXY_LIST_URL });
+    expect(store.proxyProfiles.find((profile) => profile.name === "kept")?.isStale).toBe(false);
+    expect(store.proxyProfiles.find((profile) => profile.name === "gone")?.isStale).toBe(true);
   });
 });
 
