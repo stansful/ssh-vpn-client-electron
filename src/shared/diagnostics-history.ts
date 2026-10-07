@@ -1,4 +1,4 @@
-import type { DiagnosticsEntry } from "./types.js";
+import type { DiagnosticsEntry, DiagnosticsSource } from "./types.js";
 import { utf8ByteLength } from "./terminal-history.js";
 
 export const MAX_DIAGNOSTICS_HISTORY_ENTRIES = 500;
@@ -8,7 +8,15 @@ export const MAX_DIAGNOSTIC_ID_CHARACTERS = 128;
 export const MAX_DIAGNOSTIC_TIMESTAMP_CHARACTERS = 64;
 
 const DIAGNOSTIC_TRUNCATION_MARKER = "\n[diagnostic truncated]";
+const DIAGNOSTIC_SOURCES: ReadonlySet<string> = new Set<DiagnosticsSource>(["ssh", "xray", "routing", "update", "app"]);
 const byteLengthCache = new WeakMap<readonly DiagnosticsEntry[], number>();
+
+/**
+ * Service messages about routing, the TUN adapter or the Windows proxy. They
+ * come from a transport, but the user looks for them under Routing.
+ */
+const ROUTING_DIAGNOSTIC_PATTERN =
+  /^(TUN |Routing |Selected[ -](rules|routing|process-name) |Process-name |Per-process enforcement |Local routing proxy |Further local routing |Proxy-all TCP routing |Windows proxy |Reconnect through the protected address |The tunnel has been down for )/u;
 
 /** Bounds untrusted/native diagnostic fields before logging, IPC and retention. */
 export function normalizeDiagnosticEntry(
@@ -18,7 +26,34 @@ export function normalizeDiagnosticEntry(
   const id = entry.id.slice(0, MAX_DIAGNOSTIC_ID_CHARACTERS);
   const at = entry.at.slice(0, MAX_DIAGNOSTIC_TIMESTAMP_CHARACTERS);
   const message = truncateUtf8(entry.message, maxMessageBytes, DIAGNOSTIC_TRUNCATION_MARKER);
-  return id === entry.id && at === entry.at && message === entry.message ? entry : { ...entry, id, at, message };
+  const sourceValid = entry.source === undefined || DIAGNOSTIC_SOURCES.has(entry.source);
+  if (id === entry.id && at === entry.at && message === entry.message && sourceValid) {
+    return entry;
+  }
+  const normalized: DiagnosticsEntry = { ...entry, id, at, message };
+  if (!sourceValid) {
+    delete normalized.source;
+  }
+  return normalized;
+}
+
+/**
+ * Names the part of the app a diagnostic belongs to. Transport messages about
+ * routing are filed under "routing"; everything else keeps its origin.
+ */
+export function classifyDiagnosticSource(message: string, origin: DiagnosticsSource): DiagnosticsSource {
+  if ((origin === "ssh" || origin === "xray") && ROUTING_DIAGNOSTIC_PATTERN.test(message)) {
+    return "routing";
+  }
+  return origin;
+}
+
+/** Returns the entry with `source` set, keeping a valid source it already has. */
+export function withDiagnosticSource(entry: DiagnosticsEntry, origin: DiagnosticsSource): DiagnosticsEntry {
+  if (entry.source !== undefined && DIAGNOSTIC_SOURCES.has(entry.source)) {
+    return entry;
+  }
+  return { ...entry, source: classifyDiagnosticSource(entry.message, origin) };
 }
 
 /** Retains the newest diagnostic tail under both entry-count and UTF-8 byte caps. */

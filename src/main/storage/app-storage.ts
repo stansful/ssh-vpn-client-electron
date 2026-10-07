@@ -1,18 +1,26 @@
 import { app, safeStorage } from "electron";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, open, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { parseProxyShareLink, parseProxyShareLinks } from "../../core/proxy/share-link-parser.js";
-import { assertSshPrivateKeyText, normalizeSshPrivateKeyText } from "../../core/ssh/private-key.js";
-import { createDefaultStore, RUSSIA_INSIDE_PROXY_LIST_URL, RUSSIA_OUTSIDE_DIRECT_LIST_URL, STORE_SCHEMA_VERSION } from "../../shared/defaults.js";
-import { validateSshServerFingerprint } from "../../shared/validation.js";
+import { assertSshPrivateKeyText, detectSshKeyMetadata, normalizeSshPrivateKeyText } from "../../core/ssh/private-key.js";
+import {
+  createDefaultStore,
+  DEFAULT_CUSTOM_THEME,
+  LEGACY_DEFAULT_SIGNAL_COLORS,
+  RUSSIA_INSIDE_PROXY_LIST_URL,
+  RUSSIA_OUTSIDE_DIRECT_LIST_URL,
+  STORE_SCHEMA_VERSION
+} from "../../shared/defaults.js";
+import { validateCheckEndpoint, validateSshServerFingerprint } from "../../shared/validation.js";
 import type {
   ImportProxyProfilesInput,
   ImportProxyProfilesResult,
   AppSettings,
   AppStore,
+  CustomTheme,
   ProxyProfile,
   ProxyServiceSecrets,
   RoutingDirectList,
@@ -34,6 +42,12 @@ const MAX_ROUTING_DOMAINS = 20_000;
 export const MAX_STORED_PROXY_PROFILES = 10_000;
 const MAX_APP_STORE_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_SECRET_STORE_FILE_BYTES = 64 * 1024 * 1024;
+/** Enough to list every failed line of a large paste; the parser itself stops at its line limit. */
+const MAX_IMPORT_ERRORS_RETURNED = 500;
+export const STORAGE_WRITE_BLOCKED_MESSAGE =
+  "Saved data couldn't be read, so changes are blocked. Recover it on the startup screen first.";
+export const UNSUPPORTED_PROXY_PROFILE_MESSAGE =
+  "This profile uses an unsupported security mode or transport, so it can't be selected.";
 
 interface SecretRecord {
   id: string;
@@ -49,21 +63,59 @@ interface SecretStore {
   secrets: Record<string, SecretRecord>;
 }
 
+/** The two files saved data lives in. */
+export type StorageFile = "store" | "secrets";
+
+/**
+ * Saved data exists but could not be read or understood. Only this error
+ * means "unreadable": recovery moves exactly `files` aside, so a file that
+ * read fine is never set aside with it.
+ */
+export class StorageUnreadableError extends Error {
+  constructor(
+    readonly files: StorageFile[],
+    /** The first file that could not be read, for the recovery screen. */
+    readonly filePath: string,
+    message: string,
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+    this.name = "StorageUnreadableError";
+  }
+}
+
+export interface StorageInitResult {
+  /**
+   * Everything was read and is in use, but writing its migrated form back
+   * failed (a locked file, a full disk). The files on disk are untouched and
+   * the next save tries again.
+   */
+  writeError?: Error;
+}
+
 export class AppStorage {
   private readonly dataDir: string;
-  private readonly storePath: string;
+  private readonly storeFilePath: string;
   private readonly secretPath: string;
   private store: AppStore = createDefaultStore();
   private secrets: SecretStore = { schemaVersion: 1, secrets: {} };
   private secretsRevision = 0;
+  /**
+   * False until `init` succeeds. A store that could not be read is never
+   * written over: the next save would replace whatever the user still had on
+   * disk with defaults, so every mutation is refused until it is recovered.
+   */
+  private initialized = false;
+  /** Which files the last `init` could not read; undefined when it read both or never ran. */
+  private unreadableFiles: StorageFile[] | undefined;
   private readonly storeWriter: CoalescingAtomicJsonWriter;
   private readonly secretsWriter: CoalescingAtomicJsonWriter;
 
   constructor(dataDir = path.join(app.getPath("userData"), "storage")) {
     this.dataDir = dataDir;
-    this.storePath = path.join(dataDir, "app-store.v1.json");
+    this.storeFilePath = path.join(dataDir, "app-store.v1.json");
     this.secretPath = path.join(dataDir, "secret-store.v1.json");
-    this.storeWriter = new CoalescingAtomicJsonWriter(this.storePath, writeJsonTextAtomic, {
+    this.storeWriter = new CoalescingAtomicJsonWriter(this.storeFilePath, writeJsonTextAtomic, {
       maxBytes: MAX_APP_STORE_FILE_BYTES,
       label: "Application store"
     });
@@ -73,36 +125,196 @@ export class AppStorage {
     });
   }
 
-  async init(): Promise<void> {
-    await mkdir(this.dataDir, { recursive: true });
-    const storedStore = await readJsonWithStatus<AppStore>(
-      this.storePath,
-      createDefaultStore(),
-      MAX_APP_STORE_FILE_BYTES,
-      "Application store"
-    );
-    const storedSecrets = await readJsonWithStatus<SecretStore>(
-      this.secretPath,
-      { schemaVersion: 1, secrets: {} },
-      MAX_SECRET_STORE_FILE_BYTES,
-      "Secret store"
-    );
-    this.store = normalizeStore(storedStore.value);
-    this.secrets = storedSecrets.value;
-    const migration = this.migrateConfigPassphrasesToKeys();
-    this.ensureProxySelection();
-    const removedOrphanedSecrets = this.removeOrphanedSecrets();
+  /** The application store file, for the recovery screen. */
+  get storePath(): string {
+    return this.storeFilePath;
+  }
 
-    if (!storedStore.exists || !areJsonValuesEqual(storedStore.value, this.store)) {
-      await this.persistStore();
-    } else {
-      await ensurePrivateFileMode(this.storePath);
+  /** The folder holding the store and secret files. */
+  get dataDirectory(): string {
+    return this.dataDir;
+  }
+
+  /** Whether `init` succeeded, so the store may be written. */
+  get isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  /**
+   * Reads both files. A file that exists but cannot be read or understood
+   * throws `StorageUnreadableError` and leaves the store blocked for writes;
+   * a failure to write the migrated data back does not - it is returned as
+   * `writeError` and the data is used as read.
+   */
+  async init(): Promise<StorageInitResult> {
+    return this.load({ dropMissingSecretReferences: false });
+  }
+
+  /**
+   * Recovery for saved data that cannot be read: the unreadable files are
+   * moved aside as `<name>.unreadable-<YYYYMMDD-HHmmss>.json` - never deleted,
+   * they may still be repairable by hand - and the app goes on without them.
+   * An unreadable store takes the secret file along, because secrets without
+   * the store that references them would be removed as orphans; an
+   * unreadable secret file alone leaves the store in place, minus the secret
+   * references that now point nowhere.
+   *
+   * Returns the backup paths, the store's first.
+   */
+  async startFresh(): Promise<string[]> {
+    this.initialized = false;
+    await Promise.all([this.storeWriter.settled(), this.secretsWriter.settled()]);
+    // Without a record of which file failed, both move, as before.
+    const files = new Set<StorageFile>(this.unreadableFiles?.length ? this.unreadableFiles : ["store", "secrets"]);
+    if (files.has("store")) {
+      files.add("secrets");
     }
-    if (!storedSecrets.exists || migration.secretsChanged || removedOrphanedSecrets) {
-      await this.persistSecrets();
-    } else {
-      await ensurePrivateFileMode(this.secretPath);
+    const stamp = formatBackupTimestamp(new Date());
+    const moved: Array<{ file: StorageFile; from: string; to: string }> = [];
+    try {
+      // Secrets first: if the store's rename then fails, a store without its
+      // secret file only keeps dangling references, while secrets left
+      // without their store would be purged as orphans on the next start.
+      for (const file of (["secrets", "store"] as const).filter((candidate) => files.has(candidate))) {
+        const from = file === "store" ? this.storeFilePath : this.secretPath;
+        const to = await moveAside(from, "unreadable", stamp);
+        if (to) {
+          moved.push({ file, from, to });
+        }
+      }
+    } catch (error) {
+      for (const { from, to } of [...moved].reverse()) {
+        await rename(to, from).catch(() => undefined);
+      }
+      throw error;
     }
+    this.store = createDefaultStore();
+    this.secrets = { schemaVersion: 1, secrets: {} };
+    this.secretsRevision += 1;
+    await this.load({ dropMissingSecretReferences: !files.has("store") });
+    return [...moved.filter((entry) => entry.file === "store"), ...moved.filter((entry) => entry.file !== "store")].map((entry) => entry.to);
+  }
+
+  private async load({ dropMissingSecretReferences }: { dropMissingSecretReferences: boolean }): Promise<StorageInitResult> {
+    this.initialized = false;
+    this.unreadableFiles = undefined;
+    await mkdir(this.dataDir, { recursive: true });
+
+    const failures: Array<{ file: StorageFile; filePath: string; error: unknown }> = [];
+    let storedStore: { value: AppStore; exists: boolean } | undefined;
+    let store: AppStore | undefined;
+    try {
+      storedStore = await readJsonWithStatus<AppStore>(
+        this.storeFilePath,
+        createDefaultStore(),
+        MAX_APP_STORE_FILE_BYTES,
+        "Application store"
+      );
+      store = normalizeStore(storedStore.value);
+    } catch (error) {
+      failures.push({ file: "store", filePath: this.storeFilePath, error });
+    }
+    let storedSecrets: { value: SecretStore; exists: boolean } | undefined;
+    let secrets: SecretStore | undefined;
+    try {
+      storedSecrets = await readJsonWithStatus<SecretStore>(
+        this.secretPath,
+        { schemaVersion: 1, secrets: {} },
+        MAX_SECRET_STORE_FILE_BYTES,
+        "Secret store"
+      );
+      secrets = normalizeSecretStore(storedSecrets.value);
+    } catch (error) {
+      failures.push({ file: "secrets", filePath: this.secretPath, error });
+    }
+    if (failures.length > 0 || !storedStore || !store || !storedSecrets || !secrets) {
+      throw this.unreadable(failures);
+    }
+
+    this.store = store;
+    this.secrets = secrets;
+    let migration: { secretsChanged: boolean };
+    try {
+      migration = this.migrateConfigPassphrasesToKeys();
+      if (dropMissingSecretReferences) {
+        this.dropMissingSecretReferences();
+      }
+      this.ensureProxySelection();
+    } catch (error) {
+      // Entries of an unexpected shape inside an otherwise valid file.
+      throw this.unreadable([{ file: "store", filePath: this.storeFilePath, error }]);
+    }
+
+    let orphansSetAside = false;
+    if (!storedStore.exists && storedSecrets.exists && Object.keys(this.secrets.secrets).length > 0) {
+      // Every secret would count as an orphan below and be deleted for good,
+      // although the store may only be missing for now: moved by hand, or a
+      // recovery interrupted between its renames. Keep them aside instead.
+      await moveAside(this.secretPath, "orphaned", formatBackupTimestamp(new Date()));
+      this.secrets = { schemaVersion: 1, secrets: {} };
+      this.secretsRevision += 1;
+      orphansSetAside = true;
+    }
+    const removedOrphanedSecrets = this.removeOrphanedSecrets();
+    this.backfillKeyMetadata();
+
+    let writeError: Error | undefined;
+    try {
+      if (!storedStore.exists || !areJsonValuesEqual(storedStore.value, this.store)) {
+        await this.persistStore();
+      } else {
+        await ensurePrivateFileMode(this.storeFilePath);
+      }
+      // Secret changes follow store changes; if the store could not be
+      // written, the secrets on disk stay as they are too.
+      if (!storedSecrets.exists || migration.secretsChanged || removedOrphanedSecrets || orphansSetAside) {
+        await this.persistSecrets();
+      } else {
+        await ensurePrivateFileMode(this.secretPath);
+      }
+    } catch (error) {
+      writeError = error instanceof Error ? error : new Error(String(error));
+    }
+    this.initialized = true;
+    return writeError ? { writeError } : {};
+  }
+
+  private unreadable(failures: Array<{ file: StorageFile; filePath: string; error: unknown }>): StorageUnreadableError {
+    this.unreadableFiles = failures.map((failure) => failure.file);
+    const [first] = failures;
+    const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+    const message = failures.length > 1
+      ? failures.map((failure) => `${failure.file === "store" ? "Application store" : "Secret store"}: ${describe(failure.error)}`).join(" ")
+      : describe(first?.error);
+    return new StorageUnreadableError(
+      failures.map((failure) => failure.file),
+      first?.filePath ?? this.storeFilePath,
+      message,
+      { cause: first?.error }
+    );
+  }
+
+  /**
+   * After an unreadable secret file was set aside, the store still points at
+   * secrets that no longer exist. Servers keep everything but the saved
+   * password; keys and profiles, which are nothing without their secret, are
+   * removed. Rules, lists and settings stay as they were.
+   */
+  private dropMissingSecretReferences(): void {
+    const exists = (id: string | undefined): id is string => id !== undefined && Object.hasOwn(this.secrets.secrets, id);
+    this.store.sshKeys = this.store.sshKeys
+      .filter((key) => exists(key.privateKeySecretId))
+      .map((key) => (key.privateKeyPassphraseSecretId === undefined || exists(key.privateKeyPassphraseSecretId)
+        ? key
+        : { ...key, privateKeyPassphraseSecretId: undefined }));
+    const keyIds = new Set(this.store.sshKeys.map((key) => key.id));
+    this.store.sshConfigs = this.store.sshConfigs.map((config) => ({
+      ...config,
+      passwordSecretId: exists(config.passwordSecretId) ? config.passwordSecretId : undefined,
+      privateKeyPassphraseSecretId: exists(config.privateKeyPassphraseSecretId) ? config.privateKeyPassphraseSecretId : undefined,
+      privateKeyId: config.privateKeyId !== undefined && keyIds.has(config.privateKeyId) ? config.privateKeyId : undefined
+    }));
+    this.store.proxyProfiles = this.store.proxyProfiles.filter((profile) => exists(profile.rawUriSecretId));
   }
 
   getStore(): AppStore {
@@ -115,6 +327,7 @@ export class AppStorage {
   }
 
   async upsertConfig(input: UpsertSshConfigInput): Promise<AppStore> {
+    this.assertWritable();
     const fingerprintValidation = validateSshServerFingerprint(input.expectedServerFingerprint);
     if (!fingerprintValidation.ok) {
       throw new Error(fingerprintValidation.message);
@@ -158,6 +371,7 @@ export class AppStorage {
   }
 
   async deleteConfig(id: string): Promise<AppStore> {
+    this.assertWritable();
     const existing = this.store.sshConfigs.find((config) => config.id === id);
     if (!existing) {
       return this.getStore();
@@ -177,6 +391,7 @@ export class AppStorage {
   }
 
   async selectConfig(id: string): Promise<AppStore> {
+    this.assertWritable();
     if (!this.store.sshConfigs.some((config) => config.id === id)) {
       throw new Error("SSH configuration does not exist.");
     }
@@ -189,6 +404,7 @@ export class AppStorage {
   }
 
   async upsertKey(input: UpsertSshKeyInput): Promise<AppStore> {
+    this.assertWritable();
     const now = new Date().toISOString();
     const existing = input.id ? this.store.sshKeys.find((key) => key.id === input.id) : undefined;
     if (!existing && !input.privateKey) {
@@ -217,12 +433,19 @@ export class AppStorage {
       await this.persistSecrets();
     }
 
+    const passphrase = input.privateKeyPassphrase || this.readSecretQuietly(privateKeyPassphraseSecretId);
+    const metadata = normalizedPrivateKey !== undefined
+      ? detectSshKeyMetadata(normalizedPrivateKey, passphrase)
+      : existing && hasKnownKeyMetadata(existing)
+        ? { keyType: existing.keyType, keyFormat: existing.keyFormat, encryptedOpenSsh: existing.encryptedOpenSsh }
+        : this.detectStoredKeyMetadata(privateKeySecretId, passphrase);
     const key: SshKeyMetadata = {
       id: existing?.id ?? randomUUID(),
       name: input.name.trim(),
       privateKeySecretId,
       privateKeyPassphraseSecretId,
       fingerprint: normalizedPrivateKey ? fingerprintSecret(normalizedPrivateKey) : existing?.fingerprint ?? "",
+      ...metadata,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     };
@@ -238,6 +461,7 @@ export class AppStorage {
   }
 
   async deleteKey(id: string): Promise<AppStore> {
+    this.assertWritable();
     if (this.store.sshConfigs.some((config) => config.privateKeyId === id)) {
       throw new Error("This private key is used by at least one SSH configuration.");
     }
@@ -256,9 +480,21 @@ export class AppStorage {
   }
 
   async updateSettings(patch: Partial<AppSettings>): Promise<AppStore> {
+    this.assertWritable();
+    const checkEndpoint = patch.checkEndpoint?.trim();
+    // Only a changed endpoint is checked: a settings patch may carry back an
+    // endpoint saved before the rules got stricter, and that must not block
+    // every other setting.
+    if (checkEndpoint !== undefined && checkEndpoint !== this.store.settings.checkEndpoint) {
+      const validation = validateCheckEndpoint(checkEndpoint);
+      if (!validation.ok) {
+        throw new Error(validation.message);
+      }
+    }
     const nextSettings: AppSettings = {
       ...this.store.settings,
       ...patch,
+      ...(checkEndpoint !== undefined ? { checkEndpoint } : {}),
       customTheme: patch.customTheme
         ? { ...this.store.settings.customTheme, ...patch.customTheme }
         : this.store.settings.customTheme
@@ -272,6 +508,7 @@ export class AppStorage {
   }
 
   async updateRoutingMode(mode: RoutingMode): Promise<AppStore> {
+    this.assertWritable();
     if (mode === this.store.routingMode) {
       return this.getStore();
     }
@@ -281,6 +518,7 @@ export class AppStorage {
   }
 
   async updateRoutingRules(rules: RoutingRule[]): Promise<AppStore> {
+    this.assertWritable();
     if (!Array.isArray(rules) || rules.length > MAX_ROUTING_RULES) {
       throw new Error(`Routing rule count exceeds the ${MAX_ROUTING_RULES} rule limit.`);
     }
@@ -293,6 +531,7 @@ export class AppStorage {
   }
 
   async updateRoutingProxyList(list: RoutingProxyList): Promise<AppStore> {
+    this.assertWritable();
     const nextList: RoutingProxyList = {
       enabled: list.enabled,
       sourceUrl: list.sourceUrl.trim() || RUSSIA_INSIDE_PROXY_LIST_URL,
@@ -308,6 +547,7 @@ export class AppStorage {
   }
 
   async updateRoutingDirectList(list: RoutingDirectList): Promise<AppStore> {
+    this.assertWritable();
     const nextList: RoutingDirectList = {
       enabled: list.enabled,
       sourceUrl: list.sourceUrl.trim() || RUSSIA_OUTSIDE_DIRECT_LIST_URL,
@@ -323,6 +563,7 @@ export class AppStorage {
   }
 
   async upsertProxyProfile(input: UpsertProxyProfileInput): Promise<AppStore> {
+    this.assertWritable();
     const parsed = parseProxyShareLink(input.rawUri.trim());
     const now = new Date().toISOString();
     const existingById = input.id ? this.store.proxyProfiles.find((profile) => profile.id === input.id) : undefined;
@@ -336,6 +577,9 @@ export class AppStorage {
       protocol: parsed.protocol,
       host: parsed.host,
       port: parsed.port,
+      // Built field by field, so a new link without a hop list or the insecure flag drops the stored one.
+      ...(parsed.hopPorts ? { hopPorts: parsed.hopPorts } : {}),
+      ...(parsed.insecureWithoutPin ? { insecureWithoutPin: true } : {}),
       transport: parsed.transport,
       security: parsed.security,
       flow: parsed.flow,
@@ -363,6 +607,7 @@ export class AppStorage {
   }
 
   async importProxyProfiles(input: ImportProxyProfilesInput): Promise<{ store: AppStore; result: ImportProxyProfilesResult }> {
+    this.assertWritable();
     const parsed = parseProxyShareLinks(input.text);
     const knownFingerprints = new Set(this.store.proxyProfiles.map((profile) => profile.fingerprint));
     let additionalProfiles = 0;
@@ -390,6 +635,8 @@ export class AppStorage {
         protocol: profileInput.protocol,
         host: profileInput.host,
         port: profileInput.port,
+        ...(profileInput.hopPorts ? { hopPorts: profileInput.hopPorts } : {}),
+        ...(profileInput.insecureWithoutPin ? { insecureWithoutPin: true } : {}),
         transport: profileInput.transport,
         security: profileInput.security,
         flow: profileInput.flow,
@@ -430,6 +677,8 @@ export class AppStorage {
           ? { ...profile, isStale: true, updatedAt: now }
           : profile
       );
+      // Kept apart from the profiles, which "Remove unpinned" can delete.
+      this.store.publicProxyRefresh = { at: now, listed: fingerprints.size };
     }
 
     if (this.secretsRevision !== secretsRevisionBefore) {
@@ -442,25 +691,31 @@ export class AppStorage {
       updated,
       skipped: parsed.skipped,
       failed: parsed.errors.length,
-      errors: parsed.errors.slice(0, 20)
+      errors: parsed.errors.slice(0, MAX_IMPORT_ERRORS_RETURNED)
     };
     return { store: this.getStore(), result };
   }
 
   async selectProxyProfile(id: string): Promise<AppStore> {
-    if (!this.store.proxyProfiles.some((profile) => profile.id === id)) {
+    this.assertWritable();
+    const profile = this.store.proxyProfiles.find((candidate) => candidate.id === id);
+    if (!profile) {
       throw new Error("Proxy profile does not exist.");
+    }
+    if (!isSupportedProxyProfile(profile)) {
+      throw new Error(UNSUPPORTED_PROXY_PROFILE_MESSAGE);
     }
     if (this.store.selectedProxyProfileId === id) {
       return this.getStore();
     }
     this.store.selectedProxyProfileId = id;
-    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) => ({ ...profile, isSelected: profile.id === id }));
+    this.store.proxyProfiles = this.store.proxyProfiles.map((candidate) => ({ ...candidate, isSelected: candidate.id === id }));
     await this.persistStore();
     return this.getStore();
   }
 
   async toggleProxyProfilePin(id: string): Promise<AppStore> {
+    this.assertWritable();
     if (!this.store.proxyProfiles.some((profile) => profile.id === id)) {
       return this.getStore();
     }
@@ -472,6 +727,7 @@ export class AppStorage {
   }
 
   async deleteProxyProfile(id: string): Promise<AppStore> {
+    this.assertWritable();
     const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
     if (!existing) {
       return this.getStore();
@@ -484,6 +740,7 @@ export class AppStorage {
   }
 
   async deleteUnpinnedProxyProfiles(): Promise<AppStore> {
+    this.assertWritable();
     const deleted = this.store.proxyProfiles.filter((profile) => !profile.isPinned);
     if (deleted.length === 0) {
       return this.getStore();
@@ -637,7 +894,9 @@ export class AppStorage {
     let firstSelectableId: string | undefined;
     let selectedExists = false;
     for (const profile of this.store.proxyProfiles) {
-      if (profile.isStale) {
+      // Neither a profile gone from its source nor one Xray cannot run is a
+      // useful automatic pick: Connect would fail on it straight away.
+      if (profile.isStale || !isSupportedProxyProfile(profile)) {
         continue;
       }
       firstSelectableId ??= profile.id;
@@ -688,6 +947,52 @@ export class AppStorage {
     return referenced;
   }
 
+  private assertWritable(): void {
+    if (!this.initialized) {
+      throw new Error(STORAGE_WRITE_BLOCKED_MESSAGE);
+    }
+  }
+
+  private readSecretQuietly(id: string | undefined): string | undefined {
+    if (!id) {
+      return undefined;
+    }
+    try {
+      return this.readSecret(id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private detectStoredKeyMetadata(
+    privateKeySecretId: string,
+    passphrase: string | undefined
+  ): Partial<Pick<SshKeyMetadata, "keyType" | "keyFormat" | "encryptedOpenSsh">> {
+    const privateKey = this.readSecretQuietly(privateKeySecretId);
+    return privateKey === undefined ? {} : detectSshKeyMetadata(privateKey, passphrase);
+  }
+
+  /**
+   * Keys saved before their type was recorded get it on the first start that
+   * can decrypt them. A key that cannot be decrypted right now is left alone
+   * and tried again next time.
+   */
+  private backfillKeyMetadata(): void {
+    if (!this.store.sshKeys.some((key) => key.keyType === undefined)) {
+      return;
+    }
+    this.store.sshKeys = this.store.sshKeys.map((key) => {
+      if (key.keyType !== undefined) {
+        return key;
+      }
+      const metadata = this.detectStoredKeyMetadata(
+        key.privateKeySecretId,
+        this.readSecretQuietly(key.privateKeyPassphraseSecretId)
+      );
+      return metadata.keyType === undefined ? key : { ...key, ...metadata };
+    });
+  }
+
   private async persistStore(): Promise<void> {
     await this.storeWriter.write(this.store);
   }
@@ -698,6 +1003,9 @@ export class AppStorage {
 }
 
 function normalizeStore(input: AppStore): AppStore {
+  if (!isPlainObject(input)) {
+    throw new Error("Application store has an unexpected format.");
+  }
   const defaults = createDefaultStore();
   const rawSettings = input.settings as unknown as ({ activeGlobalTab?: string } & Record<string, unknown>) | undefined;
   const inputSettings = (input.settings ?? {}) as Partial<AppSettings> & {
@@ -720,7 +1028,11 @@ function normalizeStore(input: AppStore): AppStore {
   const tunDataplaneEnabled = storedSchemaVersion >= 2 && typeof inputSettings.tunDataplaneEnabled === "boolean"
     ? inputSettings.tunDataplaneEnabled
     : defaults.settings.tunDataplaneEnabled;
-  const proxyProfiles = Array.isArray(input.proxyProfiles) ? input.proxyProfiles : [];
+  // Xray 26 removed the HTTP/2 transport, so a profile saved with it can no
+  // longer run; "unknown" marks it unsupported, as the parsers now do.
+  const proxyProfiles = (Array.isArray(input.proxyProfiles) ? input.proxyProfiles : []).map((profile) =>
+    typeof profile === "object" && profile !== null && profile.transport === "http" ? { ...profile, transport: "unknown" as const } : profile
+  );
   assertStoredProxyProfileCapacity(proxyProfiles.length, 0);
   const routingRules = Array.isArray(input.routingRules) ? input.routingRules : [];
   if (routingRules.length > MAX_ROUTING_RULES) {
@@ -743,10 +1055,18 @@ function normalizeStore(input: AppStore): AppStore {
       showXrayWarningOnEnter: inputSettings.showXrayWarningOnEnter ?? inputSettings.showOpenSourceWarningOnEnter ?? defaults.settings.showXrayWarningOnEnter,
       xrayRiskBannerExpanded: inputSettings.xrayRiskBannerExpanded ?? inputSettings.openSourceRiskBannerExpanded ?? defaults.settings.xrayRiskBannerExpanded,
       tunDataplaneEnabled,
-      customTheme: {
-        ...defaults.settings.customTheme,
-        ...inputSettings.customTheme
-      }
+      notifyTunnelChanges: booleanOr(inputSettings.notifyTunnelChanges, defaults.settings.notifyTunnelChanges),
+      notifyUpdateDownloaded: booleanOr(inputSettings.notifyUpdateDownloaded, defaults.settings.notifyUpdateDownloaded),
+      notifyStillRunningInTray: booleanOr(inputSettings.notifyStillRunningInTray, defaults.settings.notifyStillRunningInTray),
+      notifyOnlyWhenHidden: booleanOr(inputSettings.notifyOnlyWhenHidden, defaults.settings.notifyOnlyWhenHidden),
+      stillRunningNoticeShown: booleanOr(inputSettings.stillRunningNoticeShown, defaults.settings.stillRunningNoticeShown),
+      customTheme: migrateSignalColors(
+        {
+          ...defaults.settings.customTheme,
+          ...inputSettings.customTheme
+        },
+        storedSchemaVersion
+      )
     },
     sshConfigs: Array.isArray(input.sshConfigs) ? input.sshConfigs : [],
     sshKeys: Array.isArray(input.sshKeys) ? input.sshKeys : [],
@@ -754,8 +1074,99 @@ function normalizeStore(input: AppStore): AppStore {
     selectedProxyProfileId: input.selectedProxyProfileId,
     routingRules,
     routingProxyList: normalizeRoutingProxyList(input.routingProxyList ?? (input as AppStore & { routingBypassList?: unknown }).routingBypassList, defaults.routingProxyList),
-    routingDirectList: normalizeRoutingDirectList(input.routingDirectList, defaults.routingDirectList)
+    routingDirectList: normalizeRoutingDirectList(input.routingDirectList, defaults.routingDirectList),
+    publicProxyRefresh: normalizePublicProxyRefresh(input.publicProxyRefresh)
   };
+}
+
+function normalizePublicProxyRefresh(value: unknown): AppStore["publicProxyRefresh"] {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  const { at, listed } = value as { at?: unknown; listed?: unknown };
+  if (typeof at !== "string" || !Number.isFinite(Date.parse(at)) || typeof listed !== "number" || !Number.isInteger(listed) || listed < 0) {
+    return undefined;
+  }
+  return { at, listed };
+}
+
+/**
+ * Version 3 replaced the default signal colours. A store that still holds the
+ * old defaults never chose them, so it follows the new palette; any colour the
+ * user picked is kept as it is.
+ */
+function migrateSignalColors(theme: CustomTheme, storedSchemaVersion: number): CustomTheme {
+  if (storedSchemaVersion >= 3) {
+    return theme;
+  }
+  const migrated = { ...theme };
+  for (const name of ["accent", "success", "danger"] as const) {
+    if (isDeepStrictEqual(theme[name], LEGACY_DEFAULT_SIGNAL_COLORS[name])) {
+      migrated[name] = { ...DEFAULT_CUSTOM_THEME[name] };
+    }
+  }
+  return migrated;
+}
+
+function booleanOr(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeSecretStore(input: SecretStore): SecretStore {
+  if (!isPlainObject(input) || !isPlainObject(input.secrets)) {
+    throw new Error("Secret store has an unexpected format.");
+  }
+  return input;
+}
+
+function hasKnownKeyMetadata(key: SshKeyMetadata): boolean {
+  return key.keyType !== undefined && key.keyType !== "unknown";
+}
+
+/** Xray cannot run a profile whose security mode or transport the parser did not recognise. */
+export function isSupportedProxyProfile(profile: Pick<ProxyProfile, "security" | "transport">): boolean {
+  return profile.security !== "unknown" && profile.transport !== "unknown";
+}
+
+/** Local time, because the user reads it next to the file's own timestamps. */
+function formatBackupTimestamp(date: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+/** Renames `filePath` to `<name>.<label>-<stamp>.json`; undefined when there is no file to move. */
+async function moveAside(filePath: string, label: "unreadable" | "orphaned", stamp: string): Promise<string | undefined> {
+  const parsed = path.parse(filePath);
+  for (let attempt = 1; attempt <= 100; attempt += 1) {
+    const suffix = attempt === 1 ? "" : `-${attempt}`;
+    const backupPath = path.join(parsed.dir, `${parsed.name}.${label}-${stamp}${suffix}${parsed.ext || ".json"}`);
+    if (await pathExists(backupPath)) {
+      continue;
+    }
+    try {
+      await rename(filePath, backupPath);
+      return backupPath;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+  throw new Error(`Could not find a free backup name for ${parsed.base}.`);
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeRoutingProxyList(input: unknown, defaults: RoutingProxyList): RoutingProxyList {
@@ -988,6 +1399,7 @@ export interface CoalescingAtomicJsonWriterOptions {
 export class CoalescingAtomicJsonWriter {
   private active = false;
   private pending: PendingAtomicJsonWrite | undefined;
+  private draining: Promise<void> | undefined;
 
   constructor(
     private readonly filePath: string,
@@ -1009,9 +1421,16 @@ export class CoalescingAtomicJsonWriter {
       }
       if (!this.active) {
         this.active = true;
-        void this.drain();
+        this.draining = this.drain();
       }
     });
+  }
+
+  /** Resolves once no write is queued or in flight. Never rejects. */
+  async settled(): Promise<void> {
+    while (this.draining) {
+      await this.draining;
+    }
   }
 
   private async drain(): Promise<void> {
@@ -1032,11 +1451,12 @@ export class CoalescingAtomicJsonWriter {
       }
     } finally {
       this.active = false;
+      this.draining = undefined;
       // No await occurs between the last pending check and this assignment,
       // but keep this guard so a future refactor cannot strand a queued write.
       if (this.pending) {
         this.active = true;
-        void this.drain();
+        this.draining = this.drain();
       }
     }
   }

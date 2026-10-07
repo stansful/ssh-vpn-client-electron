@@ -98,6 +98,13 @@ export interface DataplaneStartRequest {
    */
   protectedAddresses: string[];
   protectedPort: number;
+  /**
+   * Extra destination ports on the protected addresses that must stay direct,
+   * as a port list such as "443,20000-30000". Only Hysteria 2 port hopping
+   * sends it: the transport then starts on a random port from the list, not
+   * on `protectedPort`, and hops across the rest.
+   */
+  protectedPorts?: string;
   /** Whether the active transport can carry datagrams at all. */
   udpSupported: boolean;
   enforceIpv6: boolean;

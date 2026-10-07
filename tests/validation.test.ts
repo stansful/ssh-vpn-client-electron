@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { validateDomainPattern, validateIpOrCidr, validateProcessName, validateSshServerFingerprint } from "../src/shared/validation.js";
+import {
+  CHECK_ENDPOINT_FORMAT_MESSAGE,
+  validateCheckEndpoint,
+  validateDomainPattern,
+  validateIpOrCidr,
+  validateProcessName,
+  validateSshServerFingerprint
+} from "../src/shared/validation.js";
 
 describe("routing rule validation", () => {
   it("accepts exact and wildcard domain patterns", () => {
@@ -36,5 +43,56 @@ describe("routing rule validation", () => {
     expect(validateSshServerFingerprint("").ok).toBe(true);
     expect(validateSshServerFingerprint("", false).ok).toBe(false);
     expect(validateSshServerFingerprint("sha256:not-a-pin").ok).toBe(false);
+  });
+});
+
+describe("tunnel check endpoint validation", () => {
+  it("accepts host:port with a name, an IPv4 address or a bracketed IPv6 address", () => {
+    for (const endpoint of [
+      "youtube.com:443",
+      " youtube.com:443 ",
+      "db.example.org:5432",
+      "localhost:8080",
+      "1.1.1.1:53",
+      "[2606:4700::1111]:443",
+      "[::1]:80",
+      "пример.рф:443",
+      "example.com.:443"
+    ]) {
+      expect(validateCheckEndpoint(endpoint), endpoint).toEqual({ ok: true });
+    }
+  });
+
+  it("asks for host:port instead of a link when given a scheme, a path or credentials", () => {
+    for (const endpoint of [
+      "https://youtube.com",
+      "https://youtube.com:443",
+      "tcp://youtube.com:443",
+      "youtube.com/watch",
+      "youtube.com:443/",
+      "/youtube.com:443",
+      "user@youtube.com:443",
+      "youtube.com:443?x=1",
+      "youtube.com:443#top"
+    ]) {
+      expect(validateCheckEndpoint(endpoint), endpoint).toEqual({ ok: false, message: CHECK_ENDPOINT_FORMAT_MESSAGE });
+    }
+    expect(CHECK_ENDPOINT_FORMAT_MESSAGE).toBe("Enter host:port without https:// or a path — for example youtube.com:443.");
+  });
+
+  it("keeps the existing messages for an empty value, a bad host and a bad port", () => {
+    expect(validateCheckEndpoint("  ")).toEqual({ ok: false, message: "Endpoint is required. Use host:port." });
+    for (const endpoint of ["youtube.com", "youtube.com:", "youtube.com:0", "youtube.com:65536", "youtube.com:https", "[::1]"]) {
+      expect(validateCheckEndpoint(endpoint), endpoint).toEqual({
+        ok: false,
+        message: "Endpoint must use host:port with a valid TCP port."
+      });
+    }
+    for (const endpoint of ["bad host:443", "-bad.example.com:443", "bad..example.com:443", "999.1.1.1:443", "2001:db8::1:443", "[zz]:443", ":443"]) {
+      expect(validateCheckEndpoint(endpoint), endpoint).toEqual({
+        ok: false,
+        message: "Endpoint must use host:port, for example youtube.com:443."
+      });
+    }
   });
 });

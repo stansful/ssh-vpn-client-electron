@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadSnapshotWithTimeout } from "../src/renderer/lib/snapshot-loader.js";
-import { createDefaultRuntimeStatus, createDefaultStore } from "../src/shared/defaults.js";
 import type { AppSnapshot } from "../src/shared/types.js";
+import { createTestSnapshot } from "./renderer-fixtures.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -34,17 +34,5 @@ describe("renderer snapshot loader", () => {
 });
 
 function createSnapshot(): AppSnapshot {
-  return {
-    store: createDefaultStore(),
-    runtime: createDefaultRuntimeStatus({
-      platform: "unknown",
-      arch: "unknown",
-      serviceExecutableName: "shadow-ssh-service",
-      serviceRelativePath: "native/unknown/unknown/shadow-ssh-service",
-      supportsPrivilegedService: false
-    }),
-    diagnostics: [],
-    terminal: [],
-    logFilePaths: []
-  };
+  return createTestSnapshot();
 }

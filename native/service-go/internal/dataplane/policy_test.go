@@ -94,6 +94,73 @@ func TestProtectedEndpointIsNeverTunnelled(t *testing.T) {
 	}
 }
 
+func TestHysteria2HopPortsAreNeverTunnelled(t *testing.T) {
+	// Port hopping sends QUIC to every port in the range. Where the server has
+	// no host route, a captured hop would be proxied back into Xray itself.
+	policy := NewPolicy(Config{
+		Mode: routing.ModeProxyAll,
+		ProtectedEndpoints: []netip.AddrPort{
+			mustAddrPort(t, "198.51.100.4:443"),
+			mustAddrPort(t, "[2001:db8::4]:443"),
+		},
+		ProtectedPorts: []PortRange{{First: 443, Last: 443}, {First: 20000, Last: 30000}},
+		UDPSupported:   true,
+	})
+
+	for _, destination := range []string{
+		"198.51.100.4:443",
+		"198.51.100.4:20000",
+		"198.51.100.4:25000",
+		"198.51.100.4:30000",
+		"[::ffff:198.51.100.4]:25000",
+		"[2001:db8::4]:20001",
+	} {
+		decision := policy.Decide(Flow{
+			Protocol:    ProtocolUDP,
+			Destination: mustAddrPort(t, destination),
+			ProcessName: "xray.exe",
+		})
+		if decision.Verdict != VerdictDirect || decision.Reason != "protected-ssh-connection" {
+			t.Fatalf("expected hop port %s to stay direct, got %+v", destination, decision)
+		}
+	}
+
+	// A port outside the list on the same host, and a listed port on any other
+	// host, are ordinary traffic.
+	for _, destination := range []string{"198.51.100.4:19999", "198.51.100.4:30001", "198.51.100.4:8443", "198.51.100.5:25000"} {
+		decision := policy.Decide(Flow{Protocol: ProtocolUDP, Destination: mustAddrPort(t, destination)})
+		if decision.Verdict != VerdictProxy || decision.Reason != "proxy-all" {
+			t.Fatalf("expected %s to be routed normally, got %+v", destination, decision)
+		}
+	}
+}
+
+func TestHopPortsDoNotProtectAHostThatIsNotTheTransport(t *testing.T) {
+	// Without a protected endpoint there is no address for the ports to belong
+	// to: a port number alone must never exempt a flow.
+	policy := NewPolicy(Config{
+		Mode:           routing.ModeProxyAll,
+		ProtectedPorts: []PortRange{{First: 20000, Last: 30000}},
+		UDPSupported:   true,
+	})
+	decision := policy.Decide(Flow{Protocol: ProtocolUDP, Destination: mustAddrPort(t, "198.51.100.4:25000")})
+	if decision.Verdict != VerdictProxy {
+		t.Fatalf("expected a hop port on an unprotected host to be routed normally, got %+v", decision)
+	}
+}
+
+func TestPortRangeContainsItsEnds(t *testing.T) {
+	span := PortRange{First: 20000, Last: 30000}
+	for port, want := range map[uint16]bool{19999: false, 20000: true, 25000: true, 30000: true, 30001: false} {
+		if got := span.Contains(port); got != want {
+			t.Fatalf("Contains(%d) = %v, want %v", port, got, want)
+		}
+	}
+	if single := (PortRange{First: 443, Last: 443}); !single.Contains(443) || single.Contains(444) {
+		t.Fatalf("a single-port range must contain exactly its port: %+v", single)
+	}
+}
+
 func TestSelectedProcessUDPIsDroppedWhenTheTransportCannotCarryIt(t *testing.T) {
 	// Letting it out directly would leak exactly the traffic the rule exists to
 	// capture; dropping it makes QUIC fall back to TCP, which is tunnelled.

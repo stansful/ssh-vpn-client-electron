@@ -2,10 +2,124 @@ import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:cr
 import { SshBinaryReader, SshBinaryWriter } from "./binary.js";
 import { encodeSshSignatureBlob, exportSshPublicKeyBlob } from "./host-key.js";
 import { encodePublicKeyAuthSignedRequest } from "./auth-messages.js";
+import type { SshKeyFormat, SshKeyType } from "../../shared/types.js";
 
 export interface LoadedPrivateKey {
   privateKey: KeyObject;
   publicKey: KeyObject;
+}
+
+export interface SshKeyTextMetadata {
+  keyType: SshKeyType;
+  keyFormat: SshKeyFormat;
+  /** Passphrase-protected OpenSSH key, which {@link loadPrivateKey} cannot load yet. */
+  encryptedOpenSsh: boolean;
+}
+
+/**
+ * Describes a private key from its text alone, for the key list and the key
+ * picker. Nothing here proves the key loads: an OpenSSH key names its type in
+ * the public part of the envelope, which stays readable even when the private
+ * part is encrypted, and a PEM key names it in its header. Only unencrypted
+ * PKCS#8 (or encrypted PKCS#8 with its passphrase) has to be parsed.
+ *
+ * Never throws; anything unrecognised is reported as unknown.
+ */
+export function detectSshKeyMetadata(privateKeyText: string, passphrase?: string): SshKeyTextMetadata {
+  const unknown: SshKeyTextMetadata = { keyType: "unknown", keyFormat: "unknown", encryptedOpenSsh: false };
+  let normalized: string;
+  try {
+    normalized = normalizeSshPrivateKeyText(privateKeyText);
+  } catch {
+    return unknown;
+  }
+  const header = normalized.match(/^-----BEGIN ([A-Z0-9 ]+)-----$/mu)?.[1];
+  switch (header) {
+    case "OPENSSH PRIVATE KEY":
+      return detectOpenSshKeyMetadata(normalized);
+    case "RSA PRIVATE KEY":
+      return { keyType: "rsa", keyFormat: "pem", encryptedOpenSsh: false };
+    case "DSA PRIVATE KEY":
+      return { keyType: "dsa", keyFormat: "pem", encryptedOpenSsh: false };
+    case "EC PRIVATE KEY":
+      return { keyType: "ecdsa", keyFormat: "pem", encryptedOpenSsh: false };
+    case "PRIVATE KEY":
+      return { keyType: detectPkcs8KeyType(normalized), keyFormat: "pkcs8", encryptedOpenSsh: false };
+    case "ENCRYPTED PRIVATE KEY":
+      // The algorithm sits inside the encrypted part, so the type is only
+      // known when the passphrase is at hand.
+      return {
+        keyType: passphrase ? detectPkcs8KeyType(normalized, passphrase) : "unknown",
+        keyFormat: "pkcs8",
+        encryptedOpenSsh: false
+      };
+    default:
+      return unknown;
+  }
+}
+
+function detectOpenSshKeyMetadata(normalized: string): SshKeyTextMetadata {
+  try {
+    const envelope = readOpenSshEnvelope(normalized);
+    const encrypted = envelope.cipherName !== "none" || envelope.kdfName !== "none";
+    let algorithm = envelope.publicKeys[0] ? readSshString(envelope.publicKeys[0]) : undefined;
+    if (!algorithm && !encrypted) {
+      // The public section is optional in practice; an unencrypted private
+      // block names the type right after its two check integers.
+      const reader = new SshBinaryReader(envelope.privateBlock);
+      reader.uint32();
+      reader.uint32();
+      algorithm = reader.utf8String();
+    }
+    return { keyType: sshAlgorithmToKeyType(algorithm), keyFormat: "openssh", encryptedOpenSsh: encrypted };
+  } catch {
+    return { keyType: "unknown", keyFormat: "openssh", encryptedOpenSsh: false };
+  }
+}
+
+function readSshString(blob: Buffer): string | undefined {
+  try {
+    return new SshBinaryReader(blob).utf8String();
+  } catch {
+    return undefined;
+  }
+}
+
+function sshAlgorithmToKeyType(algorithm: string | undefined): SshKeyType {
+  if (algorithm === "ssh-ed25519" || algorithm === "sk-ssh-ed25519@openssh.com") {
+    return "ed25519";
+  }
+  if (algorithm === "ssh-rsa") {
+    return "rsa";
+  }
+  if (algorithm?.startsWith("ecdsa-sha2-") || algorithm?.startsWith("sk-ecdsa-sha2-")) {
+    return "ecdsa";
+  }
+  if (algorithm === "ssh-dss") {
+    return "dsa";
+  }
+  return "unknown";
+}
+
+function detectPkcs8KeyType(normalized: string, passphrase?: string): SshKeyType {
+  try {
+    const keyType = createPrivateKey({ key: normalized, format: "pem", passphrase }).asymmetricKeyType;
+    if (keyType === "ed25519") {
+      return "ed25519";
+    }
+    if (keyType === "rsa" || keyType === "rsa-pss") {
+      return "rsa";
+    }
+    if (keyType === "ec") {
+      return "ecdsa";
+    }
+    if (keyType === "dsa") {
+      return "dsa";
+    }
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 export class SshPrivateKeyLoadError extends Error {

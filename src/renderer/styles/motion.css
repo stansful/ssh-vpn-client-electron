@@ -1,0 +1,68 @@
+/* ==========================================================================
+   Motion: entrance choreography, exits, keyframes, reduced motion
+   ========================================================================== */
+
+/* Entrance: blocks rise 10 px and fade in, staggered by style="--d:N" */
+.rise { animation: rise var(--t-slow) var(--ease-out) both; animation-delay: calc(var(--d, 0) * 55ms); }
+.fade { animation: fade var(--t-slow) var(--ease-out) both; animation-delay: calc(var(--d, 0) * 55ms); }
+.anim-swap { animation: swap-in var(--t-slow) var(--ease-out) both; }
+
+/* Exits: set the attribute/class for ~220 ms before removing the element */
+.is-leaving { animation: leave var(--t-mid) var(--ease-out) both; pointer-events: none; }
+
+/* Theme flips cross-fade colours (data-theme-switching is set for ~450 ms) */
+html[data-theme-switching] *,
+html[data-theme-switching] *::before,
+html[data-theme-switching] *::after {
+  transition-property: background-color, border-color, color, fill, stroke, box-shadow !important;
+  transition-duration: var(--t-slow) !important;
+  transition-timing-function: var(--ease-io) !important;
+}
+
+/* Loops stop while the window is hidden (saves energy) */
+html[data-document-hidden] *,
+html[data-document-hidden] *::before,
+html[data-document-hidden] *::after {
+  animation-play-state: paused !important;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes fade-out { to { opacity: 0; } }
+@keyframes swap-in { from { opacity: 0; transform: translateY(6px); filter: blur(3px); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes modal-in { from { opacity: 0; transform: translateY(14px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes modal-out { to { opacity: 0; transform: translateY(10px) scale(.98); } }
+@keyframes menu-in { from { opacity: 0; transform: translateY(-6px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes menu-in-up { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes menu-out { to { opacity: 0; transform: scale(.985); } }
+@keyframes toast-in { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: none; } }
+@keyframes toast-out { to { opacity: 0; transform: translateX(24px); } }
+@keyframes leave { to { opacity: 0; transform: translateX(-12px); } }
+@keyframes ring-pulse {
+  0% { transform: scale(.92); opacity: 0; }
+  30% { opacity: .9; }
+  100% { transform: scale(1.12); opacity: 0; }
+}
+@keyframes ring-breathe { 0%, 100% { transform: scale(1); opacity: .7; } 50% { transform: scale(1.03); opacity: 1; } }
+@keyframes breathe { 0%, 100% { opacity: .55; transform: scale(.96); } 50% { opacity: .95; transform: scale(1.06); } }
+@keyframes dot-pulse { 0% { box-shadow: 0 0 0 0 var(--accent-line); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+@keyframes shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-6px); } 40% { transform: translateX(5px); } 60% { transform: translateX(-3px); } 80% { transform: translateX(2px); } }
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@keyframes indeterminate { 0% { transform: translateX(-110%); } 100% { transform: translateX(310%); } }
+@keyframes timer { from { width: 100%; } to { width: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+  .progress.indeterminate > span { width: 100%; opacity: .45; transform: none; }
+  .splash-shimmer { background: none; color: var(--text-2); }
+  /* Timers still need to read as time left: keep them still and full width */
+  .toast-timer { animation: none !important; }
+}

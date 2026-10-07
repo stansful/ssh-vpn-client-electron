@@ -1,32 +1,30 @@
 import { describe, expect, it } from "vitest";
 import { BoundedRendererEventQueue } from "../src/renderer/lib/renderer-event-queue.js";
 import { nextRenderPageCount, sliceRenderPage } from "../src/renderer/lib/render-page.js";
-import {
-  TERMINAL_HISTORY_OMITTED_MARKER,
-  TerminalDisplayBuffer
-} from "../src/renderer/lib/terminal-display-buffer.js";
+import { buildTerminalDisplay } from "../src/renderer/components/pages/connect/terminal-view.js";
 import { createDefaultRuntimeStatus } from "../src/shared/defaults.js";
 import type { RendererEvent } from "../src/shared/ipc.js";
 import type { TerminalLine } from "../src/shared/types.js";
 
 describe("renderer energy bounds", () => {
-  it("keeps only the live terminal tail and releases its display copy while hidden", () => {
-    const buffer = new TerminalDisplayBuffer(5);
-    const first = [line("one", "abc"), line("two", "def")];
+  it("renders only the live terminal tail, by characters and by rows", () => {
+    const history = [line("one", "abc\n"), line("two", "def\n"), line("three", "gh\n")];
 
-    expect(buffer.update(first)).toBe(`${TERMINAL_HISTORY_OMITTED_MARKER}bcdef`);
-    expect(buffer.update([...first, line("three", "gh")], false)).toBe("");
-    expect(buffer.update([...first, line("three", "gh")])).toBe(`${TERMINAL_HISTORY_OMITTED_MARKER}defgh`);
-    expect(buffer.update([])).toBe("");
-  });
-
-  it("rebuilds an untruncated terminal display when line-count eviction changes its prefix", () => {
-    const buffer = new TerminalDisplayBuffer(20);
-    const one = line("one", "a");
-    const two = line("two", "b");
-
-    expect(buffer.update([one, two])).toBe("ab");
-    expect(buffer.update([two, line("three", "c")])).toBe("bc");
+    expect(buildTerminalDisplay(history, 6)).toEqual({
+      lines: [
+        { text: "ef", cls: "" },
+        { text: "gh", cls: "" }
+      ],
+      truncated: true
+    });
+    expect(buildTerminalDisplay(history, 1000, 2)).toEqual({
+      lines: [
+        { text: "def", cls: "" },
+        { text: "gh", cls: "" }
+      ],
+      truncated: true
+    });
+    expect(buildTerminalDisplay([])).toEqual({ lines: [], truncated: false });
   });
 
   it("bounds queued output without dropping the latest authoritative status", () => {

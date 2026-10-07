@@ -31,6 +31,7 @@ function createMissingPreloadApi(): ShadowSshApi {
     refreshRoutingDirectList: reject,
     clearDiagnostics: reject,
     readLogFile: () => Promise.resolve(""),
+    getLogFileInfo: () => Promise.resolve([]),
     clearLogFile: () => Promise.resolve(""),
     listProcesses: () => Promise.resolve([]),
     connect: reject,
@@ -44,7 +45,14 @@ function createMissingPreloadApi(): ShadowSshApi {
     downloadUpdate: reject,
     revealDownloadedUpdate: () => Promise.resolve(false),
     copyText: reject,
+    readClipboardText: () => Promise.resolve(""),
     openExternal: reject,
+    dismissConnectionError: reject,
+    dismissAttention: reject,
+    openLogFolder: () => Promise.resolve(false),
+    openDataFolder: () => Promise.resolve(false),
+    recoverStorage: reject,
+    quitApp: () => Promise.resolve(),
     onServiceEvent: () => () => undefined
   };
 }

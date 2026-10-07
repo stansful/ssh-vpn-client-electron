@@ -26,7 +26,7 @@ This constrains the design and must be settled before writing the forwarding lay
 
 | Transport | TCP | UDP |
 | --- | --- | --- |
-| Xray (SOCKS5 inbound) | yes | yes, via `UDP ASSOCIATE` — requires `udp: true` on the inbound, which `buildXrayConfig` currently disables |
+| Xray (SOCKS5 inbound) | yes | yes, via `UDP ASSOCIATE` — `buildXrayConfig` sets `udp: true` on the inbound |
 | Live SSH | yes, via `direct-tcpip` | **no** — the SSH connection protocol has no datagram channel |
 
 So "all of an application's traffic" is only literally achievable on Xray. On SSH the honest
@@ -64,6 +64,8 @@ All six are implemented. What each one ended up doing, and where:
    forces exactly one refresh. The rule order mirrors `LocalRoutingEnforcer.decide` in
    `src/service/local-routing-enforcement.ts` line for line: protected endpoint, then process
    rule, then domain/IP, then proxy list, then direct list. `policy_test.go` pins each step.
+   The protected endpoint also covers a Hysteria 2 server's hop ports, which the TypeScript
+   never has to: see "Keeping the transport out of its own tunnel" below.
 5. **Forwarding** — matched TCP and UDP go to a loopback SOCKS5 inbound
    (`internal/dataplane/socks5.go`); unmatched flows are dialled through
    `internal/winnet`'s interface-pinned dialer. The pinning is not an optimisation: with the
@@ -110,6 +112,41 @@ Not covered: ICMP is not terminated, so pings to a captured destination do not a
 On the SSH transport the local listener is left in place but stops enforcing policy: the
 helper has already decided, and a second pass would apply the rules twice with different
 information. Everything the listener receives is tunnelled.
+
+## Keeping the transport out of its own tunnel
+
+A flow from the transport to its own server that ends up in the adapter is a loop: it is
+proxied back into the transport it belongs to. Two layers prevent it.
+
+- **A host route per server address** — `/32` via the physical next hop, planned by
+  `protectedRoutePlan` and applied by `winroute` before the capture routes. A route matches
+  an address, not a port, so it covers every port and protocol the transport uses: the SSH
+  port, Xray's TCP transports, QUIC, and Hysteria 2 port hopping, where the client starts on
+  a random port of the hop list and moves its QUIC/UDP to another port of the same server
+  every `hopInterval` (30 s by default). This is the protection that normally does the work.
+- **An in-stack guard** — `Policy.isProtectedEndpoint`, the first check in `Decide`. A flow to
+  a protected address that reaches the stack anyway is relayed direct with the reason
+  `protected-ssh-connection` and is never held for sniffing. That happens when there is no
+  host route: none is planned for a server whose route has no next hop, on the assumption
+  that its on-link route is more specific than `/1`, which a link whose default route is
+  itself on-link (some PPP connections) breaks. The guard matches the address on
+  `protectedPort` and, when the `start-dataplane` payload carries `protectedPorts`, on any
+  port in that list.
+
+`protectedPorts` is a string of ports and inclusive ranges, `"443,20000-30000"`, in the form
+`hysteria2-link.ts` normalises a link's hop list to: sorted, with overlapping and adjacent
+ranges merged, at most 64 ranges. The Electron side sends it only for a Hysteria 2 profile
+that hops. With hopping, Xray starts on a random port from the list, not on `protectedPort`
+(the first port written in the link, which it dials only when the link doesn't hop), so
+without the list its flows on every other port would be captured whenever the host route
+is missing. A list the helper cannot read refuses the start request rather than running
+with the hop ports unguarded, and a changed list rebuilds the dataplane, as a changed
+`protectedPort` does. `policy_test.go` and `internal/app/dataplane_test.go` pin both.
+
+Hysteria 2 is QUIC, so it needs UDP to the server. The app reports "Connected" once Xray's
+local listeners are up, even if UDP to the server is blocked; the tunnel check after connect
+is the only signal. Xray logs why a Hysteria 2 dial failed at `[Info]`, below the `warning`
+level the app runs it at, so the Activity log doesn't show the reason either.
 
 ## Permissions and packaging
 

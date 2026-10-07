@@ -24,7 +24,7 @@ import {
 } from "../core/routing/process-route-domains.js";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/local-tcp-proxy.js";
 import { parseEndpoint } from "../core/network/socks5-check.js";
-import { probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
+import { passedTunnelCheck, probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
 import { LocalRoutingEnforcer, RoutingDecisionLog, type LocalRoutingContext } from "./local-routing-enforcement.js";
 import { preferredLocalProxyPort, rememberLocalProxyPort } from "./local-proxy-port.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
@@ -33,7 +33,17 @@ import { errorText, resolveProtectedAddresses, startDataplaneWithRetry, TUN_ADAP
 import { LIVENESS_PROBE_TIMEOUT_MS, SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
 import { SystemWakeDetector, type SystemWakeDetectorOptions, type SystemWakeEvent } from "./system-wake-detector.js";
 import type { ServiceEvent } from "../shared/ipc.js";
-import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
+import type {
+  ConnectRequest,
+  DiagnosticsEntry,
+  LocalProxyEndpoint,
+  RoutingRule,
+  RoutingUpdateRequest,
+  RuntimeStatus,
+  SshConfig,
+  TerminalLine,
+  TunnelCheckResult
+} from "../shared/types.js";
 import { normalizeRuleValue, validateRoutingRuleValue } from "../shared/validation.js";
 import type { ServiceBridge } from "./service-bridge.js";
 
@@ -247,7 +257,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
           // is a place the user can actually put wintun.dll - unlike the
           // packaged resources of a portable build.
           userDataDirectory: options.userDataDirectory,
-          onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message)
+          onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message),
+          onActiveChange: () => this.syncDerivedStatus()
         })
       : undefined);
     this.dataplaneJournalPath = path.join(options.userDataDirectory ?? options.pacDirectory ?? os.tmpdir(), TUN_ROUTING_JOURNAL_FILE);
@@ -265,7 +276,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
       state: "Disconnected",
       transport: "live-ssh",
       realTunnelAvailable: false,
-      message: "Live SSH service is ready."
+      message: "Live SSH service is ready.",
+      ...this.derivedStatus()
     };
   }
 
@@ -457,6 +469,11 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.setStatus({
       state: trigger === "user" ? "Connecting" : "Reconnecting",
       activeConfigId: request.config.id,
+      activeConfigName: request.config.name,
+      activeTarget: formatServiceTarget(request.config.host, request.config.port),
+      // A user Connect may reach a different server; the key this session
+      // verifies is reported once it is up.
+      ...(trigger === "user" ? { observedHostKeyFingerprint: undefined } : {}),
       message: trigger === "user"
         ? `Connecting to ${request.config.host}:${request.config.port} over live SSH.`
         : `Reconnecting to ${request.config.host}:${request.config.port} (attempt ${this.status.reconnectAttempt}).`,
@@ -579,6 +596,9 @@ export class LiveSshServiceBridge implements ServiceBridge {
       this.setStatus({
         state: "Connected",
         activeConfigId: effectiveRequest.config.id,
+        activeConfigName: effectiveRequest.config.name,
+        activeTarget: formatServiceTarget(effectiveRequest.config.host, effectiveRequest.config.port),
+        observedHostKeyFingerprint: client.hostKeyFingerprint,
         connectedAt: new Date().toISOString(),
         reconnectAttempt: 0,
         realTunnelAvailable: true,
@@ -763,13 +783,35 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
     this.setStatus({
       state: "Disconnected",
-      activeConfigId: undefined,
-      connectedAt: undefined,
-      reconnectAttempt: 0,
-      realTunnelAvailable: false,
+      ...CLEARED_SESSION_STATUS,
       message: "Disconnected."
     });
     this.appendDiagnostic("info", "SSH session disconnected.");
+  }
+
+  /**
+   * Dismisses an error the user has read: Error becomes Disconnected and
+   * nothing is retried until the next Connect. A halted session already
+   * released its routing; the stop below only finishes a teardown that was
+   * still racing the halt when the user dismissed it.
+   */
+  clearError(): Promise<void> {
+    if (this.disposed || this.status.state !== "Error") {
+      return Promise.resolve();
+    }
+    this.disconnectRequested = true;
+    this.clearReconnectTimer();
+    this.stopSupervisor();
+    this.lifecycleGeneration += 1;
+    this.setStatus({
+      state: "Disconnected",
+      ...CLEARED_SESSION_STATUS,
+      message: "Disconnected."
+    });
+    if (this.systemRoutingApplied || this.socksProxy) {
+      void this.enqueueMutation(() => this.stopRouting()).catch(() => undefined);
+    }
+    return Promise.resolve();
   }
 
   async checkTunnel(endpoint: string): Promise<TunnelCheckResult> {
@@ -792,14 +834,11 @@ export class LiveSshServiceBridge implements ServiceBridge {
       // tunnel check means.
       const probe = await probeTunnelEndpoint(
         (signal) => client.openDirectTcpIpChannel(target, { address: "127.0.0.1", port: 0 }, signal),
-        target
+        target,
+        // The server confirms a direct-tcpip channel only after its own TCP connect.
+        { openReachesTarget: true }
       );
-      const result = {
-        endpoint,
-        ok: true,
-        at,
-        message: `Tunnel check succeeded for ${endpoint} in ${Date.now() - startedAt} ms: ${probe.detail}.`
-      };
+      const result = passedTunnelCheck(endpoint, at, Date.now() - startedAt, probe);
       this.appendDiagnostic(probe.outcome === "unverified" ? "warning" : "info", result.message);
       this.emit({ type: "tunnel-check-result", result });
       return result;
@@ -1251,6 +1290,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.socksEndpoint = endpoint;
     this.startSocksProxyHeartbeat(proxy);
     this.appendDiagnostic("info", `Local HTTP/SOCKS proxy is listening on ${endpoint.host}:${endpoint.port}.`);
+    this.syncDerivedStatus();
     return endpoint;
   }
 
@@ -1433,6 +1473,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         this.appendDiagnostic("warning", `Local proxy cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    this.syncDerivedStatus();
   }
 
   private async applySystemRouting(
@@ -1683,6 +1724,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
 
     this.tunRoutingActive = true;
+    this.syncDerivedStatus();
     // The local listener now only receives traffic the helper already decided
     // to tunnel, so a second policy pass here would double-count the rules.
     this.localProcessEnforcement = false;
@@ -1708,6 +1750,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         `TUN routing teardown failed; the machine may still be routing through a stale adapter: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+    this.syncDerivedStatus();
   }
 
   private async applyLocallyEnforcedRouting(
@@ -2265,10 +2308,29 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.status = {
       ...this.status,
       ...update,
+      ...this.derivedStatus(),
       transport: "live-ssh",
       platformTarget: this.status.platformTarget
     };
     this.emit({ type: "status-changed", status: this.getStatus() });
+  }
+
+  /** Status fields that follow the listener and the adapter rather than the session state. */
+  private derivedStatus(): Pick<RuntimeStatus, "localProxy" | "tunActive"> {
+    const endpoint = this.socksEndpoint;
+    return {
+      // One listener speaks both protocols, so there is no separate SOCKS port.
+      localProxy: endpoint ? { host: endpoint.host, httpPort: endpoint.port } : undefined,
+      tunActive: this.tunRoutingActive && this.dataplane?.isActive === true
+    };
+  }
+
+  /** Publishes a listener or adapter change that happened without a state change. */
+  private syncDerivedStatus(): void {
+    const derived = this.derivedStatus();
+    if (!sameLocalProxy(derived.localProxy, this.status.localProxy) || derived.tunActive !== this.status.tunActive) {
+      this.setStatus({});
+    }
   }
 
   private currentProcessRoutingRefreshIntervalMs(): number {
@@ -2426,6 +2488,26 @@ function requiredSecret(secret: string | undefined, label: string): string {
     throw new Error(`${label} is unavailable.`);
   }
   return secret;
+}
+
+/** Clears what describes a session, for a status that no longer has one. */
+const CLEARED_SESSION_STATUS = {
+  activeConfigId: undefined,
+  activeConfigName: undefined,
+  activeTarget: undefined,
+  observedHostKeyFingerprint: undefined,
+  connectedAt: undefined,
+  reconnectAttempt: 0,
+  realTunnelAvailable: false
+} as const satisfies Partial<RuntimeStatus>;
+
+/** `host:port`, with an IPv6 literal in brackets so the port stays unambiguous. */
+export function formatServiceTarget(host: string, port: number): string {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+export function sameLocalProxy(left: LocalProxyEndpoint | undefined, right: LocalProxyEndpoint | undefined): boolean {
+  return left?.host === right?.host && left?.httpPort === right?.httpPort && left?.socksPort === right?.socksPort;
 }
 
 function redactSecrets(message: string): string {

@@ -4,7 +4,7 @@ import { access, chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { parseEndpoint } from "../core/network/socks5-check.js";
-import { probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
+import { passedTunnelCheck, probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
 import { RoutingMatcher, type RoutingMatcherSummary } from "../core/routing/routing-matcher.js";
 import {
   isAutoLearnableRemoteAddress,
@@ -30,16 +30,34 @@ import { NativeDataplaneController, type DataplaneController } from "./native-da
 import { errorText, resolveProtectedAddresses, startDataplaneWithRetry, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { buildXrayConfig } from "../core/proxy/xray-config.js";
+import { parseHysteria2Link } from "../core/proxy/hysteria2-link.js";
 import type { ServiceEvent } from "../shared/ipc.js";
-import type { DiagnosticsEntry, ProxyConnectRequest, RoutingRule, RoutingUpdateRequest, RuntimeStatus, TunnelCheckResult } from "../shared/types.js";
+import { proxyProtocolLabel } from "../shared/proxy-protocols.js";
+import type {
+  DiagnosticsEntry,
+  ProxyConnectRequest,
+  ProxyProfile,
+  RoutingRule,
+  RoutingUpdateRequest,
+  RuntimeStatus,
+  TunnelCheckResult
+} from "../shared/types.js";
 import { normalizeRuleValue, validateRoutingRuleValue } from "../shared/validation.js";
 import {
   buildProcessRouteSignature,
   buildSelectedRulesWithProcessIps,
+  formatServiceTarget,
   recordBoundedProcessRouteDomain,
-  recordBoundedProcessRouteIp
+  recordBoundedProcessRouteIp,
+  sameLocalProxy
 } from "./live-ssh-service.js";
-import { reserveDistinctLocalTcpPorts, terminateProcess, waitForProcessStartup, type XrayProcess } from "./xray/process-utils.js";
+import {
+  detectXrayVersion,
+  reserveDistinctLocalTcpPorts,
+  terminateProcess,
+  waitForProcessStartup,
+  type XrayProcess
+} from "./xray/process-utils.js";
 import { preferredLocalProxyPort, rememberLocalProxyPort } from "./local-proxy-port.js";
 
 export interface XrayServiceBridgeOptions {
@@ -65,6 +83,12 @@ export interface XrayServiceBridgeOptions {
   dataplane?: DataplaneController;
   /** Injection seam for tests; defaults to a DNS lookup of the profile host. */
   protectedAddressResolver?: (host: string) => Promise<string[]>;
+  /**
+   * Injection seam for tests; defaults to asking the binary (`xray version`),
+   * once per binary. The answer picks the config shape where Xray releases
+   * differ.
+   */
+  xrayVersionProvider?: (executablePath: string) => Promise<string | undefined>;
 }
 
 const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
@@ -87,6 +111,35 @@ const MAX_XRAY_IMPORTANT_LOG_LINES = 200;
 const MAX_XRAY_ROUTINE_LOG_LINES = 40;
 const MAX_XRAY_PROCESS_LOG_CHUNK_CHARACTERS = 64 * 1024;
 const MAX_XRAY_PROCESS_LOG_LINE_CHARACTERS = 4096;
+/**
+ * Xray's whole explanation for a config it cannot load is one unmarked stdout
+ * line, printed just before it exits with code 23 - and that exit can be seen
+ * before the line has been read. A failed startup waits this long for it.
+ */
+const XRAY_STARTUP_OUTPUT_DRAIN_MS = 1_000;
+const MAX_XRAY_STARTUP_REASON_CHARACTERS = 400;
+const XRAY_STARTUP_FAILURE_PREFIX = /^Failed to start:\s*/u;
+const HYSTERIA2_INSECURE_WARNING =
+  "This link asks to skip certificate checks (insecure=1), which the bundled Xray can’t do, so the server’s certificate is checked as usual. If the server uses a self-signed certificate, add its pinSHA256 to the link.";
+/**
+ * Hysteria 2 is QUIC, so it is UDP end to end. Xray's local listeners come up
+ * whether or not a single datagram reaches the server, which makes a failed
+ * check the first sign of a network that drops UDP. The hint has to name the
+ * other suspects itself: Xray logs a Hysteria 2 dial failure (auth refused,
+ * certificate mismatch, timeout) at [Info], below the "warning" level the
+ * runtime runs at, so its reason never reaches the Activity log.
+ */
+const HYSTERIA2_TUNNEL_CHECK_HINT =
+  "Hysteria 2 runs over UDP (QUIC): the network may block UDP to the server or its ports, or the link’s password (auth), certificate pin (pinSHA256) or obfs password may be wrong.";
+/** Clears what describes a session, for a status that no longer has one. */
+const CLEARED_SESSION_STATUS = {
+  activeConfigId: undefined,
+  activeConfigName: undefined,
+  activeTarget: undefined,
+  connectedAt: undefined,
+  reconnectAttempt: 0,
+  realTunnelAvailable: false
+} as const satisfies Partial<RuntimeStatus>;
 
 export class XrayServiceBridge {
   private readonly events = new EventEmitter();
@@ -98,8 +151,11 @@ export class XrayServiceBridge {
   private readonly configPath: string;
   private readonly startupConfigCleanup: Promise<void>;
   private readonly executablePath: string | undefined;
+  private readonly xrayVersionProvider: (executablePath: string) => Promise<string | undefined>;
   private status: RuntimeStatus;
   private process: XrayProcess | undefined;
+  /** The process whose listeners are being awaited; its exit is reported by the startup path. */
+  private startingProcess: XrayProcess | undefined;
   private socksEndpoint: { host: string; port: number } | undefined;
   private httpEndpoint: { host: string; port: number } | undefined;
   private lastRequest: ProxyConnectRequest | undefined;
@@ -143,6 +199,8 @@ export class XrayServiceBridge {
   private importantProcessLogLines = 0;
   private routineProcessLogLines = 0;
   private readonly processLogDrainers = new WeakMap<XrayProcess, () => void>();
+  /** The last "Failed to start" reason each process printed, redacted and bounded. */
+  private readonly processStartupFailures = new WeakMap<XrayProcess, string>();
   private mutationTail: Promise<void> = Promise.resolve();
   private lifecycleGeneration = 0;
   private routingGeneration = 0;
@@ -167,7 +225,8 @@ export class XrayServiceBridge {
           // is a place the user can actually put wintun.dll - unlike the
           // packaged resources of a portable build.
           userDataDirectory: options.userDataDirectory,
-          onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message)
+          onDiagnostic: (level, message) => this.appendDiagnostic(level === "error" ? "error" : level, message),
+          onActiveChange: () => this.syncDerivedStatus()
         })
       : undefined);
     this.dataplaneJournalPath = path.join(options.userDataDirectory ?? options.pacDirectory ?? options.runtimeDirectory, TUN_ROUTING_JOURNAL_FILE);
@@ -177,12 +236,14 @@ export class XrayServiceBridge {
     this.configPath = path.join(this.runtimeDirectory, "xray-config.json");
     this.startupConfigCleanup = rm(this.configPath, { force: true }).catch(() => undefined);
     this.executablePath = options.executablePath;
+    this.xrayVersionProvider = options.xrayVersionProvider ?? detectXrayVersion;
     this.status = {
       ...initialStatus,
       state: "Disconnected",
       transport: "xray",
       realTunnelAvailable: false,
-      message: "Xray transport is ready."
+      message: "Xray transport is ready.",
+      ...this.derivedStatus()
     };
   }
 
@@ -280,9 +341,11 @@ export class XrayServiceBridge {
     this.setStatus({
       state: "Connecting",
       activeConfigId: request.profile.id,
+      activeConfigName: request.profile.name,
+      activeTarget: formatServiceTarget(request.profile.host, request.profile.port),
       connectedAt: undefined,
       realTunnelAvailable: false,
-      message: `Starting ${request.profile.protocol.toUpperCase()} profile ${request.profile.name}.`
+      message: `Starting ${proxyProtocolLabel(request.profile.protocol)} profile ${request.profile.name}.`
     });
     return this.enqueueMutation(() => this.connectInternal(request, generation));
   }
@@ -321,12 +384,22 @@ export class XrayServiceBridge {
     }
     this.appendDiagnostic(
       "info",
-      `Xray connect requested for ${request.profile.protocol.toUpperCase()} ${request.profile.host}:${request.profile.port}, transport=${request.profile.transport}, security=${request.profile.security}, routing=${request.routingMode}.`
+      `Xray connect requested for ${describeProfileEndpoint(request.profile)}, transport=${request.profile.transport}, security=${request.profile.security}, routing=${request.routingMode}.`
     );
+    if (hasUnpinnedInsecureFlag(request)) {
+      this.appendDiagnostic("warning", HYSTERIA2_INSECURE_WARNING);
+    }
 
     let acquiredProcess: XrayProcess | undefined;
     try {
       const executablePath = await this.requireExecutablePath();
+      if (!this.isCurrentLifecycle(generation)) {
+        return;
+      }
+      // Unknown is fine: the config then takes the bundled release's shape.
+      const xrayVersion = await Promise.resolve()
+        .then(() => this.xrayVersionProvider(executablePath))
+        .catch(() => undefined);
       if (!this.isCurrentLifecycle(generation)) {
         return;
       }
@@ -343,7 +416,8 @@ export class XrayServiceBridge {
           socksHost: socksEndpoint.host,
           socksPort: socksEndpoint.port,
           httpHost: httpEndpoint.host,
-          httpPort: httpEndpoint.port
+          httpPort: httpEndpoint.port,
+          xrayVersion
         })
       );
       if (!this.isCurrentLifecycle(generation)) {
@@ -358,18 +432,25 @@ export class XrayServiceBridge {
       this.process = processHandle;
       this.attachProcessLogging(processHandle, generation);
       processHandle.on("error", (error) => this.handleXrayFailure(processHandle, generation, error));
+      const outputClosed = new Promise<void>((resolve) => processHandle.once("close", () => resolve()));
       processHandle.once("close", (code, signal) => {
         this.handleXrayClose(processHandle, generation, code, signal);
       });
       const startupAbortController = new AbortController();
       this.startupAbortController = startupAbortController;
+      this.startingProcess = processHandle;
       try {
         await waitForProcessStartup(processHandle, [socksEndpoint, httpEndpoint], {
           signal: startupAbortController.signal
         });
+      } catch (error) {
+        throw new Error(await this.describeStartupFailure(processHandle, error, outputClosed));
       } finally {
         if (this.startupAbortController === startupAbortController) {
           this.startupAbortController = undefined;
+        }
+        if (this.startingProcess === processHandle) {
+          this.startingProcess = undefined;
         }
       }
       if (!this.isCurrentLifecycle(generation) || this.process !== processHandle) {
@@ -387,6 +468,8 @@ export class XrayServiceBridge {
       this.setStatus({
         state: "Connected",
         activeConfigId: effectiveRequest.profile.id,
+        activeConfigName: effectiveRequest.profile.name,
+        activeTarget: formatServiceTarget(effectiveRequest.profile.host, effectiveRequest.profile.port),
         connectedAt: new Date().toISOString(),
         reconnectAttempt: 0,
         realTunnelAvailable: true,
@@ -394,7 +477,7 @@ export class XrayServiceBridge {
       });
       this.appendDiagnostic(
         "info",
-        `Xray runtime started for ${effectiveRequest.profile.protocol.toUpperCase()} ${effectiveRequest.profile.host}:${effectiveRequest.profile.port}.`
+        `Xray runtime${xrayVersion ? ` ${xrayVersion}` : ""} started for ${describeProfileEndpoint(effectiveRequest.profile)}.`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -446,13 +529,31 @@ export class XrayServiceBridge {
     }
     this.setStatus({
       state: "Disconnected",
-      activeConfigId: undefined,
-      connectedAt: undefined,
-      reconnectAttempt: 0,
-      realTunnelAvailable: false,
+      ...CLEARED_SESSION_STATUS,
       message: "Disconnected."
     });
     this.appendDiagnostic("info", "Xray transport disconnected.");
+  }
+
+  /**
+   * Dismisses an error the user has read: Error becomes Disconnected and no
+   * restart follows. Routing is released on the way into Error; a teardown
+   * still queued from the failure runs as it would have.
+   */
+  clearError(): Promise<void> {
+    if (this.disposed || this.status.state !== "Error") {
+      return Promise.resolve();
+    }
+    this.disconnectRequested = true;
+    this.clearReconnectTimer();
+    this.cancelProcessStartup();
+    this.lifecycleGeneration += 1;
+    this.setStatus({
+      state: "Disconnected",
+      ...CLEARED_SESSION_STATUS,
+      message: "Disconnected."
+    });
+    return Promise.resolve();
   }
 
   async checkTunnel(endpoint: string): Promise<TunnelCheckResult> {
@@ -467,6 +568,7 @@ export class XrayServiceBridge {
     // Captured before the probe: the property can be replaced by a concurrent
     // reconnect, and a check must report on the tunnel it started against.
     const socksEndpoint = this.socksEndpoint;
+    const protocol = this.lastRequest?.profile.protocol;
     try {
       this.appendDiagnostic("info", `Xray tunnel check requested for ${endpoint}.`);
       const startedAt = Date.now();
@@ -478,21 +580,19 @@ export class XrayServiceBridge {
         (signal) => openSocks5UpstreamChannel(socksEndpoint, target, { signal }),
         target
       );
-      const result = {
-        endpoint,
-        ok: true,
-        at,
-        message: `Tunnel check succeeded for ${endpoint} in ${Date.now() - startedAt} ms: ${probe.detail}.`
-      };
+      const result = passedTunnelCheck(endpoint, at, Date.now() - startedAt, probe);
       this.appendDiagnostic(probe.outcome === "unverified" ? "warning" : "info", result.message);
       this.emit({ type: "tunnel-check-result", result });
       return result;
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
       const result = {
         endpoint,
         ok: false,
         at,
-        message: error instanceof Error ? error.message : String(error)
+        message: protocol === "hysteria2"
+          ? `${/[.!?]$/u.test(reason) ? reason : `${reason}.`} ${HYSTERIA2_TUNNEL_CHECK_HINT}`
+          : reason
       };
       this.appendDiagnostic("warning", `Xray tunnel check failed for ${endpoint}: ${result.message}`);
       this.emit({ type: "tunnel-check-result", result });
@@ -555,7 +655,9 @@ export class XrayServiceBridge {
     code: number | null,
     signal: NodeJS.Signals | null
   ): void {
-    if (this.process !== processHandle || !this.isCurrentLifecycle(generation)) {
+    // An exit during startup is the startup path's to report, together with
+    // the reason Xray printed for it.
+    if (this.process !== processHandle || !this.isCurrentLifecycle(generation) || this.startingProcess === processHandle) {
       return;
     }
     const reason = `Xray runtime exited${code === null ? "" : ` with code ${code}`}${signal ? ` signal ${signal}` : ""}.`;
@@ -716,6 +818,10 @@ export class XrayServiceBridge {
         tunnelProxyEndpoint: `${socksEndpoint.host}:${socksEndpoint.port}`,
         protectedAddresses,
         protectedPort: request.profile.port,
+        // With port hopping Xray starts on a random port from the list, not on
+        // profile.port, and moves across the rest, so the whole list stays
+        // off the adapter.
+        ...(request.profile.hopPorts ? { protectedPorts: request.profile.hopPorts } : {}),
         udpSupported: true,
         enforceIpv6: true,
         adapterName: TUN_ADAPTER_NAME,
@@ -752,6 +858,7 @@ export class XrayServiceBridge {
     }
 
     this.tunRoutingActive = true;
+    this.syncDerivedStatus();
     this.localRoutingContext = undefined;
     this.clearProcessRoutingState();
     this.appendDiagnostic(
@@ -774,6 +881,7 @@ export class XrayServiceBridge {
         `TUN routing teardown failed; the machine may still be routing through a stale adapter: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+    this.syncDerivedStatus();
   }
 
   private async stopRouting(): Promise<void> {
@@ -791,6 +899,7 @@ export class XrayServiceBridge {
     }
     this.socksEndpoint = undefined;
     this.httpEndpoint = undefined;
+    this.syncDerivedStatus();
   }
 
   private async stopXrayProcess(processHandle: XrayProcess | undefined): Promise<void> {
@@ -854,11 +963,13 @@ export class XrayServiceBridge {
     processHandle.stdout.setEncoding("utf8");
     processHandle.stderr.setEncoding("utf8");
     const stdoutLog = (data: string): void => {
+      this.recordStartupFailure(processHandle, data);
       if (!this.appendProcessLogFor(processHandle, generation, "info", data)) {
         this.stopParsingProcessLogs(processHandle);
       }
     };
     const stderrLog = (data: string): void => {
+      this.recordStartupFailure(processHandle, data);
       if (!this.appendProcessLogFor(processHandle, generation, "warning", data)) {
         this.stopParsingProcessLogs(processHandle);
       }
@@ -875,6 +986,43 @@ export class XrayServiceBridge {
     this.processLogDrainers.set(processHandle, drainWithoutParsing);
     processHandle.stdout.on("data", stdoutLog);
     processHandle.stderr.on("data", stderrLog);
+  }
+
+  /** Keeps the reason from a "Failed to start" line for the startup error. */
+  private recordStartupFailure(processHandle: XrayProcess, chunk: string): void {
+    // The cheap test first: this runs for every chunk of connection chatter.
+    if (!chunk.includes("Failed to start")) {
+      return;
+    }
+    for (const line of chunk.split(/\r?\n/u)) {
+      const reason = xrayStartupFailureReason(line);
+      if (reason) {
+        this.processStartupFailures.set(processHandle, reason);
+      }
+    }
+  }
+
+  /**
+   * The message for a startup that did not reach its listeners. When Xray
+   * exited, its output gets a moment to drain first, so the reason it printed
+   * can be named instead of only the exit code.
+   */
+  private async describeStartupFailure(processHandle: XrayProcess, error: unknown, outputClosed: Promise<void>): Promise<string> {
+    const message = error instanceof Error ? error.message : String(error);
+    if (processHandle.exitCode === null && processHandle.signalCode === null) {
+      return message;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      outputClosed,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, XRAY_STARTUP_OUTPUT_DRAIN_MS);
+        timer.unref();
+      })
+    ]);
+    clearTimeout(timer);
+    const reason = this.processStartupFailures.get(processHandle);
+    return reason ? `${message.replace(/\.$/u, "")}: ${reason}` : message;
   }
 
   private stopParsingProcessLogs(processHandle: XrayProcess): void {
@@ -1692,10 +1840,30 @@ export class XrayServiceBridge {
     this.status = {
       ...this.status,
       ...update,
+      ...this.derivedStatus(),
       transport: "xray",
       platformTarget: this.status.platformTarget
     };
     this.emit({ type: "status-changed", status: this.getStatus() });
+  }
+
+  /** Status fields that follow Xray's inbounds and the adapter rather than the session state. */
+  private derivedStatus(): Pick<RuntimeStatus, "localProxy" | "tunActive"> {
+    const http = this.httpEndpoint;
+    const socks = this.socksEndpoint;
+    return {
+      // Xray's own inbounds: what an app on macOS or Linux is pointed at.
+      localProxy: http && socks ? { host: http.host, httpPort: http.port, socksPort: socks.port } : undefined,
+      tunActive: this.tunRoutingActive && this.dataplane?.isActive === true
+    };
+  }
+
+  /** Publishes an inbound or adapter change that happened without a state change. */
+  private syncDerivedStatus(): void {
+    const derived = this.derivedStatus();
+    if (!sameLocalProxy(derived.localProxy, this.status.localProxy) || derived.tunActive !== this.status.tunActive) {
+      this.setStatus({});
+    }
   }
 
   private currentProcessRoutingRefreshIntervalMs(): number {
@@ -1876,8 +2044,73 @@ function enabledProcessRuleNames(rules: RoutingRule[]): Set<string> {
   );
 }
 
-function redactSecrets(message: string): string {
-  return message.replace(/(password|passphrase|private key|proxy uri|uri)\s*[:=]\s*\S+/giu, "$1=<redacted>");
+/** "Hysteria 2 example.com:443,20000-30000": the protocol and every port the profile may dial. */
+function describeProfileEndpoint(profile: ProxyProfile): string {
+  return `${proxyProtocolLabel(profile.protocol)} ${profile.host}:${profile.hopPorts ?? profile.port}`;
+}
+
+/**
+ * Whether a Hysteria 2 link asks for insecure=1 without a pinSHA256 pin. Xray
+ * removed tlsSettings.allowInsecure, so the flag is dropped and the server's
+ * certificate is verified anyway: fine for a real certificate, fatal for a
+ * self-signed one that only a pin could have accepted.
+ */
+function hasUnpinnedInsecureFlag(request: ProxyConnectRequest): boolean {
+  if (request.profile.protocol !== "hysteria2") {
+    return false;
+  }
+  try {
+    const link = parseHysteria2Link(request.secrets.rawUri);
+    return link.insecure && link.pinnedCertSha256.length === 0;
+  } catch {
+    // Building the config reports a link that cannot be read.
+    return false;
+  }
+}
+
+/**
+ * Masks credentials in a line bound for the log or the status. Beyond the
+ * `key=value` forms, Xray echoes config fragments as JSON ("auth", a
+ * salamander "password") and a share link carries its credential in the
+ * userinfo. A pinSHA256 is a public certificate hash and is left alone.
+ *
+ * Every line Xray prints passes through here, so each pattern must stay
+ * linear in the line's length. The share-link one finds the "://" and looks
+ * back a single character for a scheme, instead of matching the scheme
+ * forwards: `\b[a-z][a-z0-9+.-]*:\/\/` restarted at every label of a long
+ * dotted host and rescanned the rest of it each time, a full second for one
+ * 64 KB line. It also never misses a scheme for being long, and at worst
+ * masks an "x://y@" that no scheme precedes.
+ */
+export function redactSecrets(message: string): string {
+  return message
+    .replace(/"((?:[\w-]*password)|auth)"\s*:\s*"(?:[^"\\]|\\.)*"/giu, "\"$1\":\"<redacted>\"")
+    .replace(/(?<=[a-z0-9+.-]:\/\/)[^\s/?#@]+@/giu, "<redacted>@")
+    .replace(/(password|passphrase|private key|proxy uri|uri)\s*[:=]\s*\S+/giu, "$1=<redacted>");
+}
+
+/**
+ * The reason in Xray's "Failed to start: ..." line, without the boilerplate
+ * naming the config file: "infra/conf: failed to build outbound config ...".
+ * Redacted, and cut from the front when long, because the most specific
+ * cause comes last in Xray's error chains.
+ */
+export function xrayStartupFailureReason(line: string): string | undefined {
+  const trimmed = line.trim();
+  if (!XRAY_STARTUP_FAILURE_PREFIX.test(trimmed)) {
+    return undefined;
+  }
+  const reason = redactSecrets(
+    trimmed
+      .replace(XRAY_STARTUP_FAILURE_PREFIX, "")
+      .replace(/^main: failed to load config files: \[[^\]]*\]\s*>\s*/u, "")
+  ).trim();
+  if (!reason) {
+    return undefined;
+  }
+  return reason.length > MAX_XRAY_STARTUP_REASON_CHARACTERS
+    ? `…${reason.slice(-MAX_XRAY_STARTUP_REASON_CHARACTERS)}`
+    : reason;
 }
 
 /**
@@ -1889,7 +2122,8 @@ export function classifyXrayLogLevel(
   line: string,
   streamLevel: DiagnosticsEntry["level"]
 ): DiagnosticsEntry["level"] {
-  if (/\[Error\]/u.test(line)) {
+  // A config Xray refuses gets no marker at all, only this prefix.
+  if (/\[Error\]/u.test(line) || XRAY_STARTUP_FAILURE_PREFIX.test(line.trim())) {
     return "error";
   }
   if (/\[Warning\]/u.test(line)) {

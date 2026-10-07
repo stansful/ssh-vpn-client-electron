@@ -6,7 +6,9 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "dist/renderer",
-    emptyOutDir: true
+    emptyOutDir: true,
+    // Never inline fonts as data: URLs: the renderer CSP only allows 'self'.
+    assetsInlineLimit: (filePath) => (/\.(woff2?|ttf|otf)$/u.test(filePath) ? false : undefined)
   },
   server: {
     port: 5173,

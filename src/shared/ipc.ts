@@ -3,6 +3,10 @@ import type {
   AppSnapshot,
   AppUpdateDownload,
   AppUpdateInfo,
+  AttentionEvent,
+  GlobalTab,
+  LogFileInfo,
+  RoutingMutationResult,
   ImportProxyProfilesInput,
   ImportProxyProfilesResult,
   DiagnosticsEntry,
@@ -40,6 +44,7 @@ export const IPC_CHANNELS = {
   refreshRoutingDirectList: "shadow-ssh:refresh-routing-direct-list",
   clearDiagnostics: "shadow-ssh:clear-diagnostics",
   readLogFile: "shadow-ssh:read-log-file",
+  getLogFileInfo: "shadow-ssh:get-log-file-info",
   clearLogFile: "shadow-ssh:clear-log-file",
   listProcesses: "shadow-ssh:list-processes",
   connect: "shadow-ssh:connect",
@@ -53,7 +58,14 @@ export const IPC_CHANNELS = {
   downloadUpdate: "shadow-ssh:download-update",
   revealDownloadedUpdate: "shadow-ssh:reveal-downloaded-update",
   copyText: "shadow-ssh:copy-text",
+  readClipboardText: "shadow-ssh:read-clipboard-text",
   openExternal: "shadow-ssh:open-external",
+  dismissConnectionError: "shadow-ssh:dismiss-connection-error",
+  dismissAttention: "shadow-ssh:dismiss-attention",
+  openLogFolder: "shadow-ssh:open-log-folder",
+  openDataFolder: "shadow-ssh:open-data-folder",
+  recoverStorage: "shadow-ssh:recover-storage",
+  quitApp: "shadow-ssh:quit-app",
   serviceEvent: "shadow-ssh:service-event"
 } as const;
 
@@ -64,7 +76,19 @@ export type ServiceEvent =
   | { type: "terminal-output"; line: TerminalLine }
   | { type: "error"; message: string };
 
-export type RendererEvent = ServiceEvent | { type: "update-download-changed"; download: AppUpdateDownload };
+export type RendererEvent =
+  | ServiceEvent
+  | { type: "update-download-changed"; download: AppUpdateDownload }
+  | { type: "attention-changed"; attention: AttentionEvent[] }
+  /**
+   * Main-process state changed outside a renderer request (tray menu actions,
+   * auto-connect, storage recovery). The renderer should reload its snapshot.
+   */
+  | { type: "snapshot-invalidated"; reason: string }
+  /** The active transport switched (SSH <-> Xray); `runtime` follows it. */
+  | { type: "active-transport-changed"; transport: GlobalTab; status: RuntimeStatus }
+  /** A tunnel check started or finished (mirrors `AppSnapshot.tunnelCheckRunning`). */
+  | { type: "tunnel-check-changed"; running: boolean };
 
 export interface ShadowSshApi {
   loadSnapshot(): Promise<AppSnapshot>;
@@ -82,14 +106,16 @@ export interface ShadowSshApi {
   deleteProxyProfile(id: string): Promise<AppSnapshot>;
   deleteUnpinnedProxyProfiles(): Promise<AppSnapshot>;
   updateSettings(patch: Partial<AppSettings>): Promise<AppSnapshot>;
-  updateRoutingMode(mode: RoutingMode): Promise<AppSnapshot>;
-  updateRoutingRules(rules: RoutingRule[]): Promise<AppSnapshot>;
-  updateRoutingProxyListEnabled(enabled: boolean): Promise<AppSnapshot>;
-  refreshRoutingProxyList(): Promise<AppSnapshot>;
-  updateRoutingDirectListEnabled(enabled: boolean): Promise<AppSnapshot>;
-  refreshRoutingDirectList(): Promise<AppSnapshot>;
+  updateRoutingMode(mode: RoutingMode): Promise<RoutingMutationResult>;
+  updateRoutingRules(rules: RoutingRule[]): Promise<RoutingMutationResult>;
+  updateRoutingProxyListEnabled(enabled: boolean): Promise<RoutingMutationResult>;
+  refreshRoutingProxyList(): Promise<RoutingMutationResult>;
+  updateRoutingDirectListEnabled(enabled: boolean): Promise<RoutingMutationResult>;
+  refreshRoutingDirectList(): Promise<RoutingMutationResult>;
   clearDiagnostics(): Promise<AppSnapshot>;
   readLogFile(): Promise<string>;
+  /** main.log and its rotation archives, newest first, with their sizes on disk. */
+  getLogFileInfo(): Promise<LogFileInfo[]>;
   clearLogFile(): Promise<string>;
   listProcesses(): Promise<string[]>;
   connect(): Promise<AppSnapshot>;
@@ -103,6 +129,20 @@ export interface ShadowSshApi {
   downloadUpdate(): Promise<AppSnapshot>;
   revealDownloadedUpdate(): Promise<boolean>;
   copyText(text: string): Promise<boolean>;
+  /** Plain-text clipboard contents (capped at 2 MiB of characters) for explicit Paste buttons. */
+  readClipboardText(): Promise<string>;
   openExternal(url: string): Promise<boolean>;
+  /** Leaves the Error state of the active transport and returns it to Disconnected. */
+  dismissConnectionError(): Promise<AppSnapshot>;
+  /** Dismisses one attention event, or all of them when `id` is omitted. */
+  dismissAttention(id?: string): Promise<AppSnapshot>;
+  openLogFolder(): Promise<boolean>;
+  openDataFolder(): Promise<boolean>;
+  /**
+   * Recovers from unreadable saved data. "start-fresh" renames the unreadable
+   * files to `*.unreadable-<timestamp>.json` (a backup) and starts with defaults.
+   */
+  recoverStorage(action: "start-fresh"): Promise<AppSnapshot>;
+  quitApp(): Promise<void>;
   onServiceEvent(callback: (event: RendererEvent) => void): () => void;
 }

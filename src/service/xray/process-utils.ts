@@ -1,4 +1,5 @@
-import { type ChildProcessByStdio } from "node:child_process";
+import { execFile, type ChildProcessByStdio, type ExecFileException } from "node:child_process";
+import { stat } from "node:fs/promises";
 import net from "node:net";
 import type { Readable } from "node:stream";
 
@@ -21,6 +22,109 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 250;
 const MAX_PORT_RESERVATION_ATTEMPTS = 32;
 const PROCESS_TERMINATE_GRACE_MS = 1500;
 const PROCESS_TERMINATE_DEADLINE_MS = 3000;
+/** `xray version` answers at once; the slack is for a first run under an antivirus scan. */
+const DEFAULT_VERSION_TIMEOUT_MS = 3_000;
+const MAX_VERSION_OUTPUT_BYTES = 64 * 1024;
+
+/** What one `<executable> version` run produced. */
+export interface XrayVersionRun {
+  /** Whatever the command printed on stdout, possibly nothing. */
+  output: string;
+  /**
+   * Whether the binary ran to its own exit, whatever its exit code. False when
+   * it could not be started (ENOENT, EACCES, EAGAIN, EMFILE...) or was cut off
+   * by the timeout: that says something about the moment, not the binary.
+   */
+  completed: boolean;
+}
+
+export interface XrayVersionDetectorOptions {
+  timeoutMs?: number;
+  /** Runs `<executable> version`. Injection seam for tests. */
+  run?: (executablePath: string, timeoutMs: number) => Promise<XrayVersionRun>;
+  /** Injection seam for tests. */
+  stat?: (executablePath: string) => Promise<{ mtimeMs: number; size: number }>;
+}
+
+/**
+ * Asks an Xray binary for its version ("26.3.27"), once per binary: the
+ * answer is cached per path and asked again only when the file's size or
+ * modification time changes, so a connect costs a stat, not a spawn.
+ *
+ * Only a run that completed is kept, even one whose banner is not Xray's. A
+ * run that could not start or timed out - a machine out of processes or file
+ * handles, a first launch held up by an antivirus scan - is asked again on
+ * the next connect, rather than pinning the bundled shape until the binary
+ * changes.
+ *
+ * Never throws: a binary that cannot say yields undefined, and the config
+ * builder then falls back to the shape of the bundled release.
+ */
+export class XrayVersionDetector {
+  private readonly cache = new Map<string, XrayVersionCacheEntry>();
+  private readonly timeoutMs: number;
+  private readonly run: (executablePath: string, timeoutMs: number) => Promise<XrayVersionRun>;
+  private readonly stat: (executablePath: string) => Promise<{ mtimeMs: number; size: number }>;
+
+  constructor(options: XrayVersionDetectorOptions = {}) {
+    this.timeoutMs = positiveNumber(options.timeoutMs, DEFAULT_VERSION_TIMEOUT_MS);
+    this.run = options.run ?? runXrayVersionCommand;
+    this.stat = options.stat ?? stat;
+  }
+
+  async detect(executablePath: string): Promise<string | undefined> {
+    let signature: string;
+    try {
+      const file = await this.stat(executablePath);
+      signature = `${file.size}:${file.mtimeMs}`;
+    } catch {
+      return undefined;
+    }
+    const cached = this.cache.get(executablePath);
+    if (cached?.signature === signature) {
+      return cached.version;
+    }
+    // The promise is cached, not the answer, so concurrent connects share one
+    // spawn; a run that did not complete then takes its entry back out.
+    const entry: XrayVersionCacheEntry = { signature, version: Promise.resolve(undefined) };
+    const forget = (): void => {
+      if (this.cache.get(executablePath) === entry) {
+        this.cache.delete(executablePath);
+      }
+    };
+    entry.version = Promise.resolve()
+      .then(() => this.run(executablePath, this.timeoutMs))
+      .then((run) => {
+        if (!run.completed) {
+          forget();
+        }
+        return parseXrayVersion(run.output);
+      })
+      .catch(() => {
+        forget();
+        return undefined;
+      });
+    this.cache.set(executablePath, entry);
+    return entry.version;
+  }
+}
+
+interface XrayVersionCacheEntry {
+  signature: string;
+  version: Promise<string | undefined>;
+}
+
+const sharedXrayVersionDetector = new XrayVersionDetector();
+
+/** The running app's shared {@link XrayVersionDetector}. */
+export function detectXrayVersion(executablePath: string): Promise<string | undefined> {
+  return sharedXrayVersionDetector.detect(executablePath);
+}
+
+/** Reads "26.3.27" out of "Xray 26.3.27 (Xray, Penetrates Everything.) ...". */
+export function parseXrayVersion(output: string): string | undefined {
+  return /^\s*Xray\s+v?(\d+\.\d+\.\d+)/imu.exec(output)?.[1];
+}
 
 export async function reserveLocalTcpPort(): Promise<{ host: string; port: number }> {
   const server = net.createServer();
@@ -203,6 +307,56 @@ function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
       finish();
     }
   });
+}
+
+/** Resolves with whatever the command printed, and whether it ran to its own exit. Never rejects. */
+function runXrayVersionCommand(executablePath: string, timeoutMs: number): Promise<XrayVersionRun> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (output: string, completed: boolean): void => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(deadline);
+        resolve({ output, completed });
+      }
+    };
+    // execFile kills the child at timeoutMs, but still waits for its pipes to
+    // close; this settles even if something keeps them open.
+    const deadline = setTimeout(() => finish("", false), timeoutMs + 500);
+    deadline.unref();
+    const startedAt = Date.now();
+    try {
+      execFile(
+        executablePath,
+        ["version"],
+        { encoding: "utf8", timeout: timeoutMs, maxBuffer: MAX_VERSION_OUTPUT_BYTES, windowsHide: true },
+        (error, stdout) => finish(
+          typeof stdout === "string" ? stdout : "",
+          // Past the timeout the child was signalled, even if it then chose
+          // to exit cleanly.
+          ranToExit(error) && Date.now() - startedAt < timeoutMs
+        )
+      );
+    } catch {
+      finish("", false);
+    }
+  });
+}
+
+/**
+ * Whether execFile's error still means the binary ran and exited by itself:
+ * no error, a non-zero exit code, or more output than the cap. A spawn
+ * failure carries a system code instead ("ENOENT", "EAGAIN"), and a child
+ * killed at the timeout or by a signal never finished saying anything.
+ */
+function ranToExit(error: ExecFileException | null): boolean {
+  if (!error) {
+    return true;
+  }
+  if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+    return true;
+  }
+  return typeof error.code === "number" && error.killed !== true;
 }
 
 function startupExitError(code: number | null, signal: NodeJS.Signals | null): Error {

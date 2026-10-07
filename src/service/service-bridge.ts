@@ -19,5 +19,10 @@ export interface ServiceBridge {
    * reconnect forward. Optional: simulators and remote services ignore it.
    */
   wake?(reason: string): void;
+  /**
+   * Leaves the Error state and returns to Disconnected without connecting.
+   * Routing is already torn down in Error, so this only resets the status.
+   */
+  clearError?(): Promise<void>;
   dispose?(): Promise<void>;
 }

@@ -6,14 +6,25 @@ import type { AppSettings, AppStore, CustomTheme, PlatformTarget, RuntimeStatus 
  * never act on it - the native helper crashed at start-up - so a stored `false`
  * from that build records nothing the user decided.
  */
-export const STORE_SCHEMA_VERSION = 2;
+export const STORE_SCHEMA_VERSION = 3;
 export const RUSSIA_INSIDE_PROXY_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst";
 export const RUSSIA_OUTSIDE_DIRECT_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst";
 
-export const DEFAULT_CUSTOM_THEME: CustomTheme = {
+/**
+ * Version 3 moves the signal colours to the "Night Signal" palette. Stores
+ * that still hold the version 2 defaults are migrated to these values; colours
+ * a user picked are kept.
+ */
+export const LEGACY_DEFAULT_SIGNAL_COLORS = {
   accent: { r: 246, g: 139, b: 0 },
   success: { r: 31, g: 145, b: 97 },
-  danger: { r: 207, g: 63, b: 75 },
+  danger: { r: 207, g: 63, b: 75 }
+} as const;
+
+export const DEFAULT_CUSTOM_THEME: CustomTheme = {
+  accent: { r: 246, g: 160, b: 25 },
+  success: { r: 52, g: 208, b: 138 },
+  danger: { r: 242, g: 85, b: 90 },
   background: { r: 237, g: 240, b: 244 },
   surface: { r: 248, g: 249, b: 251 },
   text: { r: 23, g: 24, b: 32 },
@@ -40,7 +51,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   xrayConsentAccepted: false,
   showXrayWarningOnEnter: true,
   xrayRiskBannerExpanded: true,
-  tunDataplaneEnabled: true
+  tunDataplaneEnabled: true,
+  notifyTunnelChanges: true,
+  notifyUpdateDownloaded: true,
+  notifyStillRunningInTray: true,
+  notifyOnlyWhenHidden: true,
+  stillRunningNoticeShown: false
 };
 
 export function createDefaultStore(): AppStore {

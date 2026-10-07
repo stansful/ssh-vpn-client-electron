@@ -5,7 +5,8 @@
 // system-proxy listener and the TUN dataplane are two front doors onto the same
 // rule set, and a user who moves between them must not see routing change.
 // Every ordering decision below is annotated with the TypeScript behaviour it
-// mirrors; the one deliberate difference is UDP, explained on Verdict.
+// mirrors; the deliberate differences are UDP, explained on Verdict, and the
+// transport's extra ports, explained on Config.ProtectedPorts.
 package dataplane
 
 import (
@@ -91,9 +92,31 @@ type Config struct {
 	// whatever the rules say. A host that resolved to several addresses
 	// contributes all of them.
 	ProtectedEndpoints []netip.AddrPort
+	// ProtectedPorts are further ports of the same servers that the transport
+	// uses: a Hysteria 2 client hops its QUIC across a whole range of them, and
+	// any one captured would be proxied back into Xray. They apply to the
+	// addresses of ProtectedEndpoints only, whatever the protocol.
+	//
+	// The host route installed for each server is what normally keeps these
+	// flows out of the adapter; this guard covers the cases where there is no
+	// such route. The TypeScript policy has no equivalent because Xray's own
+	// sockets never pass through the system-proxy listener.
+	ProtectedPorts []PortRange
 	// UDPSupported reports whether the active transport can carry datagrams.
 	// Xray can (UDP ASSOCIATE); the SSH connection protocol cannot.
 	UDPSupported bool
+}
+
+// PortRange is an inclusive span of ports, First <= Last. A single port is a
+// range whose ends are equal.
+type PortRange struct {
+	First uint16
+	Last  uint16
+}
+
+// Contains reports whether port falls inside the range.
+func (r PortRange) Contains(port uint16) bool {
+	return r.First <= port && port <= r.Last
 }
 
 // Policy compiles one routing revision into the lookup structures the hot path
@@ -131,7 +154,8 @@ func (p *Policy) Config() Config {
 func (p *Policy) Decide(flow Flow) Decision {
 	// The transport's own endpoint first, before anything can select it. This
 	// mirrors TrafficPolicy.isProtectedSshConnection, which runs ahead of the
-	// matcher and cannot be overridden by a process rule.
+	// matcher and cannot be overridden by a process rule. It also covers the
+	// server's hop ports, which the TypeScript never sees.
 	if p.isProtectedEndpoint(flow.Destination) {
 		return Decision{Verdict: VerdictDirect, Reason: "protected-ssh-connection"}
 	}
@@ -232,11 +256,21 @@ func (p *Policy) NamesMatter() bool {
 }
 
 func (p *Policy) isProtectedEndpoint(destination netip.AddrPort) bool {
+	address := destination.Addr().Unmap()
 	for _, protected := range p.config.ProtectedEndpoints {
-		if !protected.IsValid() || protected.Port() != destination.Port() {
+		if !protected.IsValid() || protected.Addr().Unmap() != address {
 			continue
 		}
-		if protected.Addr().Unmap() == destination.Addr().Unmap() {
+		if protected.Port() == destination.Port() || p.isProtectedPort(destination.Port()) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Policy) isProtectedPort(port uint16) bool {
+	for _, protected := range p.config.ProtectedPorts {
+		if protected.Contains(port) {
 			return true
 		}
 	}

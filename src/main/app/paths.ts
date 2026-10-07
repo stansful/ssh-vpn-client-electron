@@ -16,6 +16,33 @@ export function resolveUserDataPath(name: string, platform: NodeJS.Platform = pr
   return path.join(configHome, name);
 }
 
+/** Where everything lives inside the app's data folder. */
+export interface AppDataLayout {
+  dataDirectory: string;
+  storageDirectory: string;
+  storePath: string;
+  logDirectory: string;
+  mainLogPath: string;
+  routingDirectory: string;
+  xrayRuntimeDirectory: string;
+  updatesDirectory: string;
+}
+
+export function resolveAppDataLayout(dataDirectory: string): AppDataLayout {
+  const storageDirectory = path.join(dataDirectory, "storage");
+  const logDirectory = path.join(dataDirectory, "logs");
+  return {
+    dataDirectory,
+    storageDirectory,
+    storePath: path.join(storageDirectory, "app-store.v1.json"),
+    logDirectory,
+    mainLogPath: path.join(logDirectory, "main.log"),
+    routingDirectory: path.join(dataDirectory, "routing"),
+    xrayRuntimeDirectory: path.join(dataDirectory, "xray"),
+    updatesDirectory: path.join(dataDirectory, "updates")
+  };
+}
+
 export function resolveXrayExecutablePath({
   packaged,
   resourcesPath,

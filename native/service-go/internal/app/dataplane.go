@@ -35,6 +35,10 @@ type DataplaneStartPayload struct {
 	// resolve again - possibly to a different answer.
 	ProtectedAddresses []string `json:"protectedAddresses"`
 	ProtectedPort      int      `json:"protectedPort"`
+	// ProtectedPorts lists the other ports of the same server the transport
+	// sends to, as ports and ranges: "443,20000-30000". Only Hysteria 2 port
+	// hopping sends it; it is empty for every other transport.
+	ProtectedPorts string `json:"protectedPorts"`
 	// UDPSupported reports whether the transport can carry datagrams. Xray can;
 	// the SSH connection protocol cannot, and a selected process's UDP is then
 	// dropped rather than leaked.
@@ -73,7 +77,7 @@ func (a *App) handleStartDataplane(ctx context.Context, command protocol.Command
 			return a.ok(command.ID, protocol.Accepted(), diagnostic("info", "TUN dataplane routing policy updated."))
 		}
 		// A different signature means the transport reconnected, moved its
-		// loopback proxy, or changed which servers must stay excluded.
+		// loopback proxy, or changed which servers or ports must stay excluded.
 		// Keeping the running dataplane would forward selected flows to a port
 		// nothing is listening on, or leave a stale host route behind.
 		runner := a.dataplane
@@ -168,6 +172,9 @@ func (p DataplaneStartPayload) infrastructureSignature() string {
 	return strings.Join([]string{
 		strings.TrimSpace(p.TunnelProxyEndpoint),
 		strconv.Itoa(p.ProtectedPort),
+		// The hop ports install no route of their own, but a new list means a
+		// new server profile, the same as a new protectedPort.
+		strings.TrimSpace(p.ProtectedPorts),
 		strings.Join(addresses, ","),
 		strconv.FormatBool(p.EnforceIPv6),
 		strconv.FormatBool(p.UDPSupported),
@@ -188,6 +195,13 @@ func (p DataplaneStartPayload) compile() (*dataplane.Policy, netip.AddrPort, []n
 		return nil, netip.AddrPort{}, nil, errors.New("tunnelProxyEndpoint must be on loopback")
 	}
 	if err := validateRouting(p.RoutingMode, p.RoutingRules, p.RoutingProxyDomains); err != nil {
+		return nil, netip.AddrPort{}, nil, err
+	}
+	// A list that cannot be read is refused rather than skipped: the transport
+	// would come up with its hop ports unguarded and only fail where the host
+	// route is missing, which is the one place nobody is looking.
+	protectedPorts, err := parsePortList(p.ProtectedPorts)
+	if err != nil {
 		return nil, netip.AddrPort{}, nil, err
 	}
 
@@ -211,7 +225,44 @@ func (p DataplaneStartPayload) compile() (*dataplane.Policy, netip.AddrPort, []n
 		ProxyDomains:       p.RoutingProxyDomains,
 		DirectDomains:      p.RoutingDirectDomains,
 		ProtectedEndpoints: protectedEndpoints,
+		ProtectedPorts:     protectedPorts,
 		UDPSupported:       p.UDPSupported,
 	})
 	return policy, endpoint, protectedAddresses, nil
+}
+
+// parsePortList reads a comma-separated list of ports and inclusive ranges,
+// "443,20000-30000", in the form hysteria2-link.ts normalises a link's ports
+// to. Like that parser it tolerates spaces and puts a reversed range in order.
+// An empty list protects no extra ports.
+func parsePortList(list string) ([]dataplane.PortRange, error) {
+	if strings.TrimSpace(list) == "" {
+		return nil, nil
+	}
+	items := strings.Split(list, ",")
+	ranges := make([]dataplane.PortRange, 0, len(items))
+	for _, item := range items {
+		rawFirst, rawLast, isRange := strings.Cut(item, "-")
+		if !isRange {
+			rawLast = rawFirst
+		}
+		first, firstOK := parsePort(rawFirst)
+		last, lastOK := parsePort(rawLast)
+		if !firstOK || !lastOK {
+			return nil, fmt.Errorf("protectedPorts contains %q: expected a port or a range of ports between 1 and 65535", strings.TrimSpace(item))
+		}
+		if first > last {
+			first, last = last, first
+		}
+		ranges = append(ranges, dataplane.PortRange{First: first, Last: last})
+	}
+	return ranges, nil
+}
+
+func parsePort(raw string) (uint16, bool) {
+	value, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 16)
+	if err != nil || value == 0 {
+		return 0, false
+	}
+	return uint16(value), true
 }

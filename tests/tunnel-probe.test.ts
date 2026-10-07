@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryDirectTcpIpChannel } from "../src/core/network/memory-direct-channel.js";
 import type { DirectTcpIpChannel } from "../src/core/network/local-tcp-proxy.js";
-import { buildTlsClientHello, probeTunnelEndpoint } from "../src/core/network/tunnel-probe.js";
+import { buildTlsClientHello, passedTunnelCheck, probeTunnelEndpoint } from "../src/core/network/tunnel-probe.js";
 
 /** A channel that answers a write on the next tick, the way a peer would. */
 class ScriptedChannel extends MemoryDirectTcpIpChannel {
@@ -104,6 +104,67 @@ describe("tunnel probe", () => {
     const failing = new ScriptedChannel("silence");
     await probeTunnelEndpoint(open(failing), { host: "youtube.com", port: 443 }, { timeoutMs: 25 }).catch(() => undefined);
     await expect(failing.write(Buffer.from("x"))).rejects.toThrow(/closed/u);
+  });
+});
+
+describe("tunnel check latency and notes", () => {
+  it("measures latency from asking the tunnel for a connection to the first answer", async () => {
+    const channel = new ScriptedChannel(serverHello);
+    const result = await probeTunnelEndpoint(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return channel;
+    }, { host: "youtube.com", port: 443 });
+
+    expect(result.latencyMs).toBeGreaterThanOrEqual(25);
+    expect(result.latencyMs).toBeGreaterThanOrEqual(result.openMs);
+    expect(result.latencyMs).toBe(result.openMs + (result.responseMs ?? 0));
+  });
+
+  // Waiting out a silent port's timeout says nothing about how fast the
+  // tunnel is, so its latency is only the time to open the connection.
+  it("does not count the silence of an unverified endpoint as latency", async () => {
+    const result = await probeTunnelEndpoint(
+      open(new ScriptedChannel("silence")),
+      { host: "db.example.org", port: 5432 },
+      { timeoutMs: 60, openReachesTarget: true }
+    );
+
+    expect(result.outcome).toBe("unverified");
+    expect(result.latencyMs).toBe(result.openMs);
+    expect(result.latencyMs).toBeLessThan(60);
+  });
+
+  // Xray's SOCKS inbound answers CONNECT before its outbound reaches anything,
+  // so that open time is a loopback handshake, not a tunnel round trip.
+  it("reports no latency for a silent endpoint when opening proves nothing about the far end", async () => {
+    const silent = await probeTunnelEndpoint(open(new ScriptedChannel("silence")), { host: "8.8.8.8", port: 53 }, { timeoutMs: 25 });
+
+    expect(silent.outcome).toBe("unverified");
+    expect(silent.latencyMs).toBeUndefined();
+    const passed = passedTunnelCheck("8.8.8.8:53", "2026-10-06T12:04:18.000Z", 25, silent);
+    expect(passed).toMatchObject({ ok: true, note: true });
+    expect(passed).not.toHaveProperty("latencyMs");
+  });
+
+  it("reports a pass with its latency, and a note when the endpoint stayed silent", async () => {
+    const at = "2026-10-06T12:04:18.000Z";
+    const answered = await probeTunnelEndpoint(open(new ScriptedChannel(serverHello)), { host: "youtube.com", port: 443 });
+    const silent = await probeTunnelEndpoint(
+      open(new ScriptedChannel("silence")),
+      { host: "db.example.org", port: 5432 },
+      { timeoutMs: 25, openReachesTarget: true }
+    );
+
+    const passed = passedTunnelCheck("youtube.com:443", at, 184, answered);
+    expect(passed).toEqual({
+      endpoint: "youtube.com:443",
+      ok: true,
+      at,
+      message: `Tunnel check succeeded for youtube.com:443 in 184 ms: ${answered.detail}.`,
+      latencyMs: answered.latencyMs
+    });
+    expect(passed).not.toHaveProperty("note");
+    expect(passedTunnelCheck("db.example.org:5432", at, 25, silent)).toMatchObject({ ok: true, note: true, latencyMs: silent.latencyMs });
   });
 });
 

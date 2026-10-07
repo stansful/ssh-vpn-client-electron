@@ -1,22 +1,17 @@
-export interface ConfirmationRequest {
-  title: string;
-  message: string;
-  confirmLabel?: string;
-  pendingLabel?: string;
-  onConfirm: () => void | Promise<void>;
+export interface ConfirmationViewState<TOptions> {
+  options: TOptions;
+  /** The confirmed action is running; Cancel, Esc and the scrim wait. */
+  pending: boolean;
+  /** The last attempt failed; the dialog stays open so the user can retry or cancel. */
+  error?: unknown;
 }
 
-export interface ConfirmationViewState {
-  title: string;
-  message: string;
-  confirmLabel: string;
-  pendingLabel: string;
+interface ActiveConfirmation<TOptions> {
+  options: TOptions;
+  onConfirm?: () => void | Promise<void>;
+  resolve: (confirmed: boolean) => void;
   pending: boolean;
-}
-
-interface ActiveConfirmation {
-  request: ConfirmationRequest;
-  pending: boolean;
+  error?: unknown;
 }
 
 /**
@@ -24,26 +19,38 @@ interface ActiveConfirmation {
  * guard is intentionally separate from React state so rapid double-clicks
  * cannot run a destructive action twice before the button rerenders.
  */
-export class AsyncConfirmationController {
-  private active: ActiveConfirmation | undefined;
+export class AsyncConfirmationController<TOptions> {
+  private active: ActiveConfirmation<TOptions> | undefined;
 
-  constructor(private readonly publish: (state: ConfirmationViewState | undefined) => void) {}
+  constructor(private readonly publish: (state: ConfirmationViewState<TOptions> | undefined) => void) {}
 
-  request(request: ConfirmationRequest): boolean {
+  /**
+   * Opens a confirmation. Resolves `true` once the action ran (or, without an
+   * action, once the user confirmed) and `false` when cancelled or when another
+   * confirmation is already open.
+   */
+  request(options: TOptions, onConfirm?: () => void | Promise<void>): Promise<boolean> {
     if (this.active) {
-      return false;
+      return Promise.resolve(false);
     }
-    this.active = { request, pending: false };
-    this.publishState();
-    return true;
+    return new Promise<boolean>((resolve) => {
+      this.active = { options, onConfirm, resolve, pending: false };
+      this.publishState();
+    });
+  }
+
+  get isOpen(): boolean {
+    return this.active !== undefined;
   }
 
   cancel(): boolean {
-    if (!this.active || this.active.pending) {
+    const active = this.active;
+    if (!active || active.pending) {
       return false;
     }
     this.active = undefined;
     this.publish(undefined);
+    active.resolve(false);
     return true;
   }
 
@@ -54,16 +61,24 @@ export class AsyncConfirmationController {
     }
 
     active.pending = true;
+    active.error = undefined;
     this.publishState();
     try {
-      await active.request.onConfirm();
-      return true;
-    } finally {
+      await active.onConfirm?.();
+    } catch (error) {
       if (this.active === active) {
-        this.active = undefined;
-        this.publish(undefined);
+        active.pending = false;
+        active.error = error;
+        this.publishState();
       }
+      return false;
     }
+    if (this.active === active) {
+      this.active = undefined;
+      this.publish(undefined);
+    }
+    active.resolve(true);
+    return true;
   }
 
   private publishState(): void {
@@ -72,12 +87,6 @@ export class AsyncConfirmationController {
       this.publish(undefined);
       return;
     }
-    this.publish({
-      title: active.request.title,
-      message: active.request.message,
-      confirmLabel: active.request.confirmLabel ?? "Confirm",
-      pendingLabel: active.request.pendingLabel ?? "Working...",
-      pending: active.pending
-    });
+    this.publish({ options: active.options, pending: active.pending, error: active.error });
   }
 }

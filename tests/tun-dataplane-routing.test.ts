@@ -131,6 +131,46 @@ describe("TUN routing", () => {
       // Xray's SOCKS inbound speaks UDP ASSOCIATE, so Discord voice and QUIC
       // are carried instead of dropped.
       expect(started.udpSupported).toBe(true);
+      // Only port hopping dials more than one server port.
+      expect(started).not.toHaveProperty("protectedPorts");
+      expect(applies).toHaveLength(0);
+    });
+  });
+
+  it("keeps every port a Hysteria 2 profile hops across off the adapter", async () => {
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane();
+      const service = createXrayService(applies, dataplane);
+      const internals = service as unknown as XrayInternals;
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const base = xrayConnectRequest();
+      const request: ProxyConnectRequest = {
+        ...base,
+        profile: {
+          ...base.profile,
+          protocol: "hysteria2",
+          port: 443,
+          hopPorts: "443,20000-30000",
+          transport: "hysteria"
+        },
+        tunDataplaneEnabled: true
+      };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+
+      expect(dataplane.started).toHaveLength(1);
+      const started = dataplane.started[0];
+      expect(started.protectedAddresses).toEqual(["203.0.113.9"]);
+      // With hopping Xray starts on a random port from the list, not on the
+      // profile's port, then hops across the rest; a port missing here would
+      // route the transport into its own adapter. protectedPort is only the
+      // port the link names first.
+      expect(started.protectedPort).toBe(443);
+      expect(started.protectedPorts).toBe("443,20000-30000");
+      // QUIC is UDP, which is why it can hop at all.
+      expect(started.udpSupported).toBe(true);
       expect(applies).toHaveLength(0);
     });
   });

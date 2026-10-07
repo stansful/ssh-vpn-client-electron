@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ParsedProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport } from "../../shared/types.js";
+import { isHysteria2Scheme, parseHysteria2Link } from "./hysteria2-link.js";
+
+export const UNSUPPORTED_PROXY_SCHEME_MESSAGE = "Only vless://, vmess://, trojan://, and hysteria2:// links are supported.";
 
 const MAX_LINK_LENGTH = 64 * 1024;
 const MAX_IMPORT_LINES = 10_000;
@@ -65,6 +68,9 @@ export function parseProxyShareLink(rawUri: string): ParsedProxyProfile {
   if (protocol === "vmess") {
     return parseVmess(rawUri);
   }
+  if (protocol === "hysteria2") {
+    return parseHysteria2(rawUri);
+  }
   return parseUriProtocol(rawUri, protocol);
 }
 
@@ -74,10 +80,32 @@ function detectProtocol(rawUri: string): ProxyProtocol {
   if (protocol === "vless" || protocol === "vmess" || protocol === "trojan") {
     return protocol;
   }
-  throw new Error("Only vless://, vmess://, and trojan:// links are supported.");
+  if (isHysteria2Scheme(protocol)) {
+    return "hysteria2";
+  }
+  throw new Error(UNSUPPORTED_PROXY_SCHEME_MESSAGE);
 }
 
-function parseUriProtocol(rawUri: string, protocol: Exclude<ProxyProtocol, "vmess">): ParsedProxyProfile {
+/** hysteria2:// and hy2:// are one protocol: same metadata, same fingerprint. Always QUIC + TLS. */
+function parseHysteria2(rawUri: string): ParsedProxyProfile {
+  const link = parseHysteria2Link(rawUri);
+  return {
+    name: link.name,
+    protocol: "hysteria2",
+    host: link.host,
+    port: link.port,
+    ...(link.hopPorts ? { hopPorts: link.hopPorts } : {}),
+    // With a pin, insecure=1 is fine: the pin is what gets checked.
+    ...(link.insecure && link.pinnedCertSha256.length === 0 ? { insecureWithoutPin: true } : {}),
+    transport: "hysteria",
+    security: "tls",
+    flow: "",
+    rawUri,
+    fingerprint: fingerprint(link.canonical)
+  };
+}
+
+function parseUriProtocol(rawUri: string, protocol: Exclude<ProxyProtocol, "vmess" | "hysteria2">): ParsedProxyProfile {
   let url: URL;
   try {
     url = new URL(rawUri);
@@ -188,10 +216,9 @@ function normalizeTransport(value: string): ProxyTransport {
   if (normalized === "kcp") {
     return "mkcp";
   }
-  if (normalized === "h2" || normalized === "http2") {
-    return "http";
-  }
-  if (normalized === "tcp" || normalized === "ws" || normalized === "grpc" || normalized === "xhttp" || normalized === "mkcp" || normalized === "http" || normalized === "hysteria") {
+  // HTTP/2 (h2, http) went the way of QUIC: Xray 26 removed the transport and
+  // refuses any config that uses it, so such a profile can't run.
+  if (normalized === "tcp" || normalized === "ws" || normalized === "grpc" || normalized === "xhttp" || normalized === "mkcp" || normalized === "hysteria") {
     return normalized;
   }
   if (normalized === "httpupgrade" || normalized === "http-upgrade" || normalized === "http_upgrade") {

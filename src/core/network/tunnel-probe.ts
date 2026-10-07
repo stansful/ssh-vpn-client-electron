@@ -1,6 +1,7 @@
 import { generateKeyPairSync, randomBytes } from "node:crypto";
 import net from "node:net";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "./local-tcp-proxy.js";
+import type { TunnelCheckResult } from "../../shared/types.js";
 
 /** What the far end proved about the tunnel. */
 export type TunnelProbeOutcome = "tls" | "tls-alert" | "http" | "bytes" | "unverified";
@@ -11,13 +12,28 @@ export interface TunnelProbeResult {
   detail: string;
   /** How long the transport took to report the connection as open. */
   openMs: number;
-  /** How long the far end took to answer, when it answered. */
+  /** How long the far end took to answer once the connection was open (sending the probe included), when it answered. */
   responseMs?: number;
+  /**
+   * The round trip the user sees as the check's latency: from asking the
+   * tunnel for a connection to the first answer. A silent endpoint never
+   * answers, so for it this is only the time the tunnel took to open the
+   * connection - waiting out the silence says nothing about speed - and only
+   * when that open waited for the far end at all (see `openReachesTarget`).
+   */
+  latencyMs?: number;
 }
 
 export interface TunnelProbeOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  /**
+   * `openChannel` resolves only once the far end accepted the TCP connection,
+   * so the time it takes is a real round trip: true for an SSH direct-tcpip
+   * channel, false for Xray's SOCKS inbound, which answers as soon as it has
+   * picked an outbound. Without it a silent endpoint reports no latency.
+   */
+  openReachesTarget?: boolean;
 }
 
 const DEFAULT_PROBE_TIMEOUT_MS = 12_000;
@@ -53,30 +69,34 @@ export async function probeTunnelEndpoint(
   const startedAt = Date.now();
   try {
     const channel = await openChannel(controller.signal);
-    const openMs = Date.now() - startedAt;
+    // One clock reading splits the round trip, so open + response is exactly the latency.
+    const openedAt = Date.now();
+    const openMs = openedAt - startedAt;
     try {
       const probe = buildProbe(target);
       if (probe.request.length > 0) {
         await channel.write(probe.request);
       }
-      const respondedAt = Date.now();
       const response = await readFirstResponse(channel, controller.signal);
       if (!response) {
         if (probe.kind === "silent") {
           return {
             outcome: "unverified",
             detail: `${describeTarget(target)} sent nothing, which port ${target.port} is not expected to; the tunnel opened the connection but could not be verified end to end`,
-            openMs
+            openMs,
+            ...(options.openReachesTarget ? { latencyMs: openMs } : {})
           };
         }
         throw new Error(
           `The tunnel opened a connection to ${describeTarget(target)} but nothing came back within ${Math.round(timeoutMs / 1000)}s. Traffic is entering the tunnel and not reaching the server.`
         );
       }
+      const answeredAt = Date.now();
       return {
         ...classifyResponse(response, probe.kind, target),
         openMs,
-        responseMs: Date.now() - respondedAt
+        responseMs: answeredAt - openedAt,
+        latencyMs: answeredAt - startedAt
       };
     } finally {
       await channel.close().catch(() => undefined);
@@ -85,6 +105,22 @@ export async function probeTunnelEndpoint(
     clearTimeout(deadline);
     options.signal?.removeEventListener("abort", abortOuter);
   }
+}
+
+/**
+ * The result a passed probe reports. Both transports build it here so their
+ * checks read the same: the latency for the badge, and a note when the pass
+ * rests only on the tunnel opening the connection.
+ */
+export function passedTunnelCheck(endpoint: string, at: string, elapsedMs: number, probe: TunnelProbeResult): TunnelCheckResult {
+  return {
+    endpoint,
+    ok: true,
+    at,
+    message: `Tunnel check succeeded for ${endpoint} in ${elapsedMs} ms: ${probe.detail}.`,
+    ...(probe.latencyMs === undefined ? {} : { latencyMs: probe.latencyMs }),
+    ...(probe.outcome === "unverified" ? { note: true } : {})
+  };
 }
 
 interface Probe {

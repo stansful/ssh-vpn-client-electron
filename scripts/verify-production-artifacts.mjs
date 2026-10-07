@@ -76,12 +76,6 @@ function createTargets(version) {
       output: `shadow-ssh-${version}-windows-portable-${arch}.exe`,
       format: "pe"
     }));
-    targets.push(createPackageTarget({
-      platform: "win",
-      label: `Windows ${arch} NSIS installer`,
-      output: `shadow-ssh-${version}-windows-installer-${arch}.exe`,
-      format: "pe"
-    }));
   }
 
   for (const arch of ["x64", "arm64"]) {

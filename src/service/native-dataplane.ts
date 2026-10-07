@@ -26,6 +26,11 @@ export interface NativeDataplaneOptions {
    * packaged resources folder of a portable build is not.
    */
   userDataDirectory?: string;
+  /**
+   * Called whenever the adapter starts or stops carrying traffic, including
+   * when the helper dies under it, so the status shown to the user follows.
+   */
+  onActiveChange?: (active: boolean) => void;
 }
 
 /**
@@ -105,7 +110,7 @@ export class NativeDataplaneController implements DataplaneController {
     const started = (this.starting ?? Promise.resolve()).catch(() => undefined).then(async () => {
       const client = await this.connect();
       await client.startDataplane(request);
-      this.active = true;
+      this.setActive(true);
     });
     this.starting = started.catch(() => undefined);
     await started;
@@ -115,14 +120,22 @@ export class NativeDataplaneController implements DataplaneController {
   async stop(): Promise<void> {
     const client = this.client;
     if (!client?.running || !this.active) {
-      this.active = false;
+      this.setActive(false);
       return;
     }
     try {
       await client.stopDataplane();
     } finally {
-      this.active = false;
+      this.setActive(false);
     }
+  }
+
+  private setActive(active: boolean): void {
+    if (this.active === active) {
+      return;
+    }
+    this.active = active;
+    this.options.onActiveChange?.(active);
   }
 
   /**
@@ -164,7 +177,7 @@ export class NativeDataplaneController implements DataplaneController {
         // than stopping, so this is a warning the user must see and not a
         // silent fallback.
         if (this.active) {
-          this.active = false;
+          this.setActive(false);
           this.options.onDiagnostic?.("error", "TUN dataplane stopped unexpectedly: " + error.message);
         }
       }

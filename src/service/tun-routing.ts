@@ -23,7 +23,14 @@ export const TUN_ADAPTER_NAME = "Shadow SSH";
  */
 export const WINTUN_SEARCH_DIRECTORIES_ENV = "SHADOW_SSH_WINTUN_DIRS";
 
-export function wintunSearchDirectories(userDataDirectory?: string): string[] {
+export interface WintunSearchEnvironment {
+  /** Defaults to `PORTABLE_EXECUTABLE_DIR`; an empty string means none. */
+  portableExecutableDirectory?: string;
+  /** Defaults to the folder of `process.execPath`. */
+  executableDirectory?: string;
+}
+
+export function wintunSearchDirectories(userDataDirectory?: string, environment: WintunSearchEnvironment = {}): string[] {
   const directories: string[] = [];
   const add = (directory: string | undefined): void => {
     const trimmed = directory?.trim();
@@ -35,8 +42,8 @@ export function wintunSearchDirectories(userDataDirectory?: string): string[] {
   // electron-builder's portable target sets this to the folder holding the
   // executable the user actually double-clicked - the one place they would
   // naturally drop the file.
-  add(process.env.PORTABLE_EXECUTABLE_DIR);
-  add(path.dirname(process.execPath));
+  add(environment.portableExecutableDirectory ?? process.env.PORTABLE_EXECUTABLE_DIR);
+  add(environment.executableDirectory ?? path.dirname(process.execPath));
   add(userDataDirectory);
   return directories;
 }

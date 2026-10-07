@@ -177,6 +177,7 @@ export class SshLiveClient {
   /** Set by a runtime write, cleared by the next inbound packet: one-way traffic while true. */
   private unansweredOutbound = false;
   private silentSendProbeTimer: NodeJS.Timeout | undefined;
+  private verifiedHostKeyFingerprint: string | undefined;
 
   private constructor(
     private readonly transport: SshSocketTransport,
@@ -194,6 +195,11 @@ export class SshLiveClient {
   /** The address this session's TCP socket is connected to. */
   get serverAddress(): string | undefined {
     return this.transport.remoteAddress;
+  }
+
+  /** OpenSSH-style `SHA256:…` fingerprint of the host key whose signature this session verified. */
+  get hostKeyFingerprint(): string | undefined {
+    return this.verifiedHostKeyFingerprint;
   }
 
   static async connect(options: SshLiveClientOptions): Promise<SshLiveClient> {
@@ -672,6 +678,7 @@ export class SshLiveClient {
 
     const kexReply = await this.waitForPayload((payload) => messageNumber(payload) === 31, this.operationTimeoutMs());
     const complete = this.session.completeKex(kexReply);
+    this.verifiedHostKeyFingerprint ??= complete.serverHostKeyFingerprint;
     const inbound: PacketProtectionConfig = {
       cipherName: kexInit.negotiated.encryptionServerToClient as PacketProtectionConfig["cipherName"],
       encryptionKey: complete.transportKeys.encryptionKeyServerToClient,

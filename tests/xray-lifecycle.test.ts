@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +9,7 @@ import type { WindowsSystemProxyManager } from "../src/core/network/windows-syst
 import type { ProxyConnectRequest, RuntimeStatus } from "../src/shared/types.js";
 
 const runtime = vi.hoisted(() => ({
+  detectXrayVersion: vi.fn(),
   reserveDistinctLocalTcpPorts: vi.fn(),
   terminateProcess: vi.fn(),
   waitForProcessStartup: vi.fn()
@@ -29,6 +32,7 @@ describe("Xray service lifecycle", () => {
     ]);
     runtime.waitForProcessStartup.mockResolvedValue(undefined);
     runtime.terminateProcess.mockResolvedValue(undefined);
+    runtime.detectXrayVersion.mockResolvedValue("26.3.27");
   });
 
   afterEach(async () => {
@@ -826,7 +830,199 @@ describe("Xray service lifecycle", () => {
     expect(processHandle.stdout.resume).toHaveBeenCalled();
     expect(processHandle.stderr.resume).toHaveBeenCalled();
   });
+
+  it("starts a Hysteria 2 profile with a config the bundled Xray accepts", async () => {
+    const processHandle = new FakeXrayProcess();
+    const configs: WrittenXrayConfig[] = [];
+    spawnCapturingConfig(processHandle, configs);
+    const service = createService("hysteria2");
+    const statusMessages: string[] = [];
+    service.onEvent((event) => {
+      if (event.type === "status-changed") {
+        statusMessages.push(event.status.message);
+      }
+    });
+    const diagnostics = collectDiagnostics(service);
+
+    await service.connect(hysteria2Request(
+      "hy2",
+      "hysteria2://hy-secret-auth@hy.example.com:443/?sni=hy.example.com&insecure=1&obfs=salamander&obfs-password=mask-secret#hy2"
+    ));
+
+    expect(service.getStatus()).toMatchObject({ state: "Connected", activeConfigId: "hy2", realTunnelAvailable: true });
+    expect(statusMessages).toContain("Starting Hysteria 2 profile hy2.");
+    expect(runtime.detectXrayVersion).toHaveBeenCalledWith(process.execPath);
+    expect(configs).toHaveLength(1);
+    expect(configs[0].outbounds[0].protocol).toBe("hysteria");
+    // This Xray fails the whole config on allowInsecure, so insecure=1 must
+    // not leak into it.
+    expect(JSON.stringify(configs[0])).not.toContain("allowInsecure");
+    expect(diagnostics).toContainEqual({
+      level: "info",
+      message: expect.stringContaining("Xray connect requested for Hysteria 2 hy.example.com:443, transport=hysteria, security=tls")
+    });
+    // The certificate is verified after all, which a self-signed server fails.
+    expect(diagnostics).toContainEqual({
+      level: "warning",
+      message: "This link asks to skip certificate checks (insecure=1), which the bundled Xray can’t do, so the server’s certificate is checked as usual. If the server uses a self-signed certificate, add its pinSHA256 to the link."
+    });
+    expect(diagnostics).toContainEqual({ level: "info", message: "Xray runtime 26.3.27 started for Hysteria 2 hy.example.com:443." });
+    expect(JSON.stringify(diagnostics)).not.toContain("hy-secret-auth");
+    expect(JSON.stringify(diagnostics)).not.toContain("mask-secret");
+    await service.dispose();
+  });
+
+  it("shapes Hysteria 2 port hopping for the Xray version the binary reports", async () => {
+    const link = `hysteria2://auth@hy.example.com:443,20000-30000/?sni=hy.example.com&insecure=1&pinSHA256=${"ab".repeat(32)}#hop`;
+    const configs: WrittenXrayConfig[] = [];
+    spawnCapturingConfig(new FakeXrayProcess(), configs);
+    spawnCapturingConfig(new FakeXrayProcess(), configs);
+    runtime.detectXrayVersion.mockResolvedValueOnce("26.9.9").mockResolvedValueOnce(undefined);
+    const service = createService("hysteria2-hop");
+    const diagnostics = collectDiagnostics(service);
+
+    await service.connect(hysteria2Request("hop", link, "443,20000-30000"));
+    await service.connect(hysteria2Request("hop", link, "443,20000-30000"));
+
+    // 26.9.9 moved hopping into a udphop mask and ignores the old field...
+    expect(configs[0].outbounds[0].streamSettings?.finalmask?.udp?.[0]).toMatchObject({
+      type: "udphop",
+      settings: { remotePorts: "443,20000-30000" }
+    });
+    expect(configs[0].outbounds[0].streamSettings?.finalmask?.quicParams?.udpHop).toBeUndefined();
+    // ...while a binary that cannot say gets the bundled 26.3.27 shape, which
+    // rejects that mask.
+    expect(configs[1].outbounds[0].streamSettings?.finalmask?.quicParams?.udpHop).toMatchObject({ ports: "443,20000-30000" });
+    expect(configs[1].outbounds[0].streamSettings?.finalmask?.udp).toBeUndefined();
+    expect(diagnostics.some((entry) =>
+      entry.message.startsWith("Xray connect requested for Hysteria 2 hy.example.com:443,20000-30000, transport=hysteria")
+    )).toBe(true);
+    expect(diagnostics).toContainEqual({ level: "info", message: "Xray runtime 26.9.9 started for Hysteria 2 hy.example.com:443,20000-30000." });
+    expect(diagnostics).toContainEqual({ level: "info", message: "Xray runtime started for Hysteria 2 hy.example.com:443,20000-30000." });
+    // The pin accepts the certificate insecure=1 was meant for.
+    expect(diagnostics.some((entry) => entry.message.includes("insecure=1"))).toBe(false);
+    await service.dispose();
+  });
+
+  it("names the reason Xray printed when it rejects its config at startup", async () => {
+    const processHandle = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(processHandle);
+    runtime.waitForProcessStartup.mockImplementationOnce(async () => {
+      // The exit is seen first; the line explaining it is still in the pipe.
+      processHandle.exitCode = 23;
+      setTimeout(() => {
+        processHandle.stdout.emit(
+          "data",
+          "Failed to start: main: failed to load config files: [/tmp/xray-config.json] > infra/conf: failed to build outbound config with tag proxy > infra/conf: bad hysteriaSettings {\"auth\":\"hunter2\"}\n"
+        );
+        processHandle.emit("close", 23, null);
+      }, 5);
+      throw new Error("Xray runtime exited during startup with code 23.");
+    });
+    const service = createService("startup-reason");
+    const diagnostics = collectDiagnostics(service);
+
+    await service.connect(proxyRequest("rejected"));
+
+    expect(service.getStatus()).toMatchObject({
+      state: "Error",
+      reconnectAttempt: 0,
+      message: "Xray runtime exited during startup with code 23: infra/conf: failed to build outbound config with tag proxy > infra/conf: bad hysteriaSettings {\"auth\":\"<redacted>\"}"
+    });
+    expect(diagnostics).toContainEqual({ level: "error", message: expect.stringMatching(/^Xray: Failed to start: main: failed to load config files/u) });
+    expect(JSON.stringify(diagnostics)).not.toContain("hunter2");
+    expect(runtime.terminateProcess).toHaveBeenCalledWith(processHandle);
+    // The close belonged to the startup that already reported it: no restart.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(service.getStatus()).toMatchObject({ state: "Error", reconnectAttempt: 0 });
+    await service.dispose();
+  });
+
+  it("keeps the plain exit message when Xray printed no reason", async () => {
+    const processHandle = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(processHandle);
+    runtime.waitForProcessStartup.mockImplementationOnce(async () => {
+      processHandle.exitCode = 1;
+      processHandle.emit("close", 1, null);
+      throw new Error("Xray runtime exited during startup with code 1.");
+    });
+    const service = createService("startup-no-reason");
+
+    await service.connect(proxyRequest("silent"));
+
+    expect(service.getStatus()).toMatchObject({ state: "Error", message: "Xray runtime exited during startup with code 1." });
+    await service.dispose();
+  });
+
+  it("adds the UDP hint only when a Hysteria 2 tunnel check fails", async () => {
+    const service = createService("hysteria2-check");
+    const connectOnClosedPort = async (request: ProxyConnectRequest): Promise<void> => {
+      runtime.reserveDistinctLocalTcpPorts.mockResolvedValueOnce([
+        { host: "127.0.0.1", port: await closedLocalPort() },
+        { host: "127.0.0.1", port: 32001 }
+      ]);
+      childProcess.spawn.mockReturnValueOnce(new FakeXrayProcess());
+      await service.connect(request);
+    };
+
+    await connectOnClosedPort(hysteria2Request("check", "hysteria2://auth@hy.example.com:443/?sni=hy.example.com#check"));
+    const hysteria = await service.checkTunnel("example.com:443");
+
+    expect(hysteria.ok).toBe(false);
+    const hint = "Hysteria 2 runs over UDP (QUIC): the network may block UDP to the server or its ports, or the link’s password (auth), certificate pin (pinSHA256) or obfs password may be wrong.";
+    expect(hysteria.message.endsWith(` ${hint}`)).toBe(true);
+    expect(hysteria.message.slice(0, -hint.length - 1)).toMatch(/[.!?]$/u);
+    // Xray logs the dial failure at [Info], below the runtime's "warning"
+    // level, so there is no reason in the Activity log to send anyone to.
+    expect(hysteria.message).not.toContain("Activity log");
+
+    await connectOnClosedPort(proxyRequest("vless-check"));
+    const vless = await service.checkTunnel("example.com:443");
+
+    expect(vless.ok).toBe(false);
+    expect(vless.message).not.toContain("Hysteria 2");
+    await service.dispose();
+  });
 });
+
+interface WrittenXrayConfig {
+  outbounds: Array<{
+    protocol: string;
+    streamSettings?: {
+      finalmask?: {
+        udp?: Array<{ type: string; settings?: Record<string, unknown> }>;
+        quicParams?: { udpHop?: Record<string, unknown> };
+      };
+    };
+  }>;
+}
+
+/** Hands out `processHandle` on the next spawn, keeping the config Xray was started with. */
+function spawnCapturingConfig(processHandle: FakeXrayProcess, configs: WrittenXrayConfig[]): void {
+  childProcess.spawn.mockImplementationOnce((_executable: string, args: string[]) => {
+    configs.push(JSON.parse(readFileSync(args[2], "utf8")) as WrittenXrayConfig);
+    return processHandle;
+  });
+}
+
+function collectDiagnostics(service: XrayServiceBridge): Array<{ level: string; message: string }> {
+  const entries: Array<{ level: string; message: string }> = [];
+  service.onEvent((event) => {
+    if (event.type === "diagnostics-appended") {
+      entries.push({ level: event.entry.level, message: event.entry.message });
+    }
+  });
+  return entries;
+}
+
+/** A loopback port nothing listens on, so a SOCKS connect to it is refused at once. */
+async function closedLocalPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return typeof address === "object" && address ? address.port : 1;
+}
 
 class FakeOutput extends EventEmitter {
   readonly resume = vi.fn(() => this);
@@ -892,6 +1088,23 @@ function proxyRequest(id: string): ProxyConnectRequest {
     secrets: {
       rawUri: "vless://11111111-1111-4111-8111-111111111111@example.com:443?type=tcp&security=tls#test"
     }
+  };
+}
+
+function hysteria2Request(id: string, rawUri: string, hopPorts?: string): ProxyConnectRequest {
+  const request = proxyRequest(id);
+  return {
+    ...request,
+    profile: {
+      ...request.profile,
+      protocol: "hysteria2",
+      host: "hy.example.com",
+      port: 443,
+      ...(hopPorts ? { hopPorts } : {}),
+      transport: "hysteria",
+      security: "tls"
+    },
+    secrets: { rawUri }
   };
 }
 

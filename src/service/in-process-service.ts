@@ -8,6 +8,7 @@ import { DEFAULT_KEX_INIT } from "../core/ssh/messages.js";
 import type { ConnectRequest, DiagnosticsEntry, RoutingRule, RoutingUpdateRequest, RuntimeStatus, SshConfig, TerminalLine, TunnelCheckResult } from "../shared/types.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type { ServiceBridge } from "./service-bridge.js";
+import { formatServiceTarget } from "./live-ssh-service.js";
 
 export class InProcessServiceBridge implements ServiceBridge {
   private readonly events = new EventEmitter();
@@ -46,6 +47,8 @@ export class InProcessServiceBridge implements ServiceBridge {
     this.setStatus({
       state: "Connecting",
       activeConfigId: request.config.id,
+      activeConfigName: request.config.name,
+      activeTarget: formatServiceTarget(request.config.host, request.config.port),
       message: `Connecting to ${request.config.name} with ${request.routingMode}.`,
       reconnectAttempt: 0,
       connectedAt: undefined
@@ -87,11 +90,29 @@ export class InProcessServiceBridge implements ServiceBridge {
     this.setStatus({
       state: "Disconnected",
       activeConfigId: undefined,
+      activeConfigName: undefined,
+      activeTarget: undefined,
       message: "Disconnected.",
       connectedAt: undefined,
       reconnectAttempt: 0
     });
     this.appendDiagnostic("info", "Disconnected by user.");
+  }
+
+  async clearError(): Promise<void> {
+    if (this.status.state !== "Error") {
+      return;
+    }
+    this.disconnectRequested = true;
+    this.setStatus({
+      state: "Disconnected",
+      activeConfigId: undefined,
+      activeConfigName: undefined,
+      activeTarget: undefined,
+      message: "Disconnected.",
+      connectedAt: undefined,
+      reconnectAttempt: 0
+    });
   }
 
   async checkTunnel(endpoint: string): Promise<TunnelCheckResult> {
@@ -188,7 +209,7 @@ async function checkTcpEndpoint(endpoint: string): Promise<TunnelCheckResult> {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host: parsed.host, port: parsed.port, timeout: 4000 });
     let settled = false;
-    const finish = (ok: boolean, message: string): void => {
+    const finish = (ok: boolean, message: string, latencyMs?: number): void => {
       if (settled) {
         return;
       }
@@ -198,11 +219,13 @@ async function checkTcpEndpoint(endpoint: string): Promise<TunnelCheckResult> {
         endpoint,
         ok,
         at: new Date().toISOString(),
-        message
+        message,
+        ...(latencyMs === undefined ? {} : { latencyMs })
       });
     };
 
-    socket.once("connect", () => finish(true, "connected"));
+    const startedAt = Date.now();
+    socket.once("connect", () => finish(true, "connected", Date.now() - startedAt));
     socket.once("timeout", () => finish(false, "timeout"));
     socket.once("error", (error) => finish(false, error.message));
   });

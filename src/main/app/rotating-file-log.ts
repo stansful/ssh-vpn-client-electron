@@ -93,6 +93,23 @@ export class RotatingFileLog {
     });
   }
 
+  /** The log and each archive, newest first, with their sizes on disk. */
+  describeFiles(): Promise<Array<{ path: string; size: number; exists: boolean }>> {
+    return this.enqueue(() =>
+      Promise.all(
+        Array.from({ length: this.backupCount + 1 }, async (_, index) => {
+          const candidate = index === 0 ? this.filePath : `${this.filePath}.${index}`;
+          try {
+            const info = await stat(candidate);
+            return { path: candidate, size: info.size, exists: true };
+          } catch {
+            return { path: candidate, size: 0, exists: false };
+          }
+        })
+      )
+    );
+  }
+
   /** Flushes and releases the lazy append handle during application shutdown. */
   close(): Promise<void> {
     return this.enqueue(() => this.closeAppendHandle());

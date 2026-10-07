@@ -34,6 +34,7 @@ const api: ShadowSshApi = {
   refreshRoutingDirectList: () => ipcRenderer.invoke(IPC_CHANNELS.refreshRoutingDirectList),
   clearDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.clearDiagnostics),
   readLogFile: () => ipcRenderer.invoke(IPC_CHANNELS.readLogFile),
+  getLogFileInfo: () => ipcRenderer.invoke(IPC_CHANNELS.getLogFileInfo),
   clearLogFile: () => ipcRenderer.invoke(IPC_CHANNELS.clearLogFile),
   listProcesses: () => ipcRenderer.invoke(IPC_CHANNELS.listProcesses),
   connect: () => ipcRenderer.invoke(IPC_CHANNELS.connect),
@@ -47,7 +48,14 @@ const api: ShadowSshApi = {
   downloadUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.downloadUpdate),
   revealDownloadedUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.revealDownloadedUpdate),
   copyText: (text: string) => ipcRenderer.invoke(IPC_CHANNELS.copyText, text),
+  readClipboardText: () => ipcRenderer.invoke(IPC_CHANNELS.readClipboardText),
   openExternal: (url: string) => ipcRenderer.invoke(IPC_CHANNELS.openExternal, url),
+  dismissConnectionError: () => ipcRenderer.invoke(IPC_CHANNELS.dismissConnectionError),
+  dismissAttention: (id?: string) => ipcRenderer.invoke(IPC_CHANNELS.dismissAttention, id),
+  openLogFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openLogFolder),
+  openDataFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openDataFolder),
+  recoverStorage: (action: "start-fresh") => ipcRenderer.invoke(IPC_CHANNELS.recoverStorage, action),
+  quitApp: () => ipcRenderer.invoke(IPC_CHANNELS.quitApp),
   onServiceEvent: (callback: (event: RendererEvent) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: RendererEvent): void => {
       callback(payload);

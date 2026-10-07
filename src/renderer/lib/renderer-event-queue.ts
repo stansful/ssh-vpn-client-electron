@@ -108,8 +108,29 @@ export class BoundedRendererEventQueue {
   }
 }
 
-function isReplaceableStateEvent(
-  event: RendererEvent
-): event is Extract<RendererEvent, { type: "status-changed" | "tunnel-check-result" | "update-download-changed" }> {
-  return event.type === "status-changed" || event.type === "tunnel-check-result" || event.type === "update-download-changed";
+type ReplaceableStateEvent = Extract<
+  RendererEvent,
+  {
+    type:
+      | "status-changed"
+      | "tunnel-check-result"
+      | "update-download-changed"
+      | "attention-changed"
+      | "active-transport-changed"
+      | "tunnel-check-changed"
+      | "snapshot-invalidated";
+  }
+>;
+
+/** Events that carry a whole state value: only the latest one matters. */
+function isReplaceableStateEvent(event: RendererEvent): event is ReplaceableStateEvent {
+  return (
+    event.type === "status-changed" ||
+    event.type === "tunnel-check-result" ||
+    event.type === "update-download-changed" ||
+    event.type === "attention-changed" ||
+    event.type === "active-transport-changed" ||
+    event.type === "tunnel-check-changed" ||
+    event.type === "snapshot-invalidated"
+  );
 }

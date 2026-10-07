@@ -25,6 +25,46 @@ export function validateSshServerFingerprint(value: string, allowDiscovery = tru
   return { ok: true };
 }
 
+export const CHECK_ENDPOINT_FORMAT_MESSAGE = "Enter host:port without https:// or a path — for example youtube.com:443.";
+const CHECK_ENDPOINT_HOST_LABEL = /^[\p{L}\p{N}_](?:[\p{L}\p{N}_-]{0,61}[\p{L}\p{N}_])?$/u;
+
+/**
+ * The tunnel check opens a raw TCP connection to `host:port`, so anything a
+ * URL would carry - a scheme, a path, credentials - is a sign the user pasted
+ * a link and would be checking something other than they think.
+ */
+export function validateCheckEndpoint(value: string): ValidationResult {
+  const endpoint = value.trim();
+  if (!endpoint) {
+    return { ok: false, message: "Endpoint is required. Use host:port." };
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(endpoint) || /[/?#@\\]/u.test(endpoint)) {
+    return { ok: false, message: CHECK_ENDPOINT_FORMAT_MESSAGE };
+  }
+  const bracketed = endpoint.match(/^\[([^\]]+)\](?::(.*))?$/u);
+  const plain = bracketed ? undefined : endpoint.match(/^([^:]+)(?::(.*))?$/u);
+  const host = bracketed?.[1] ?? plain?.[1];
+  const rawPort = bracketed ? bracketed[2] : plain?.[2];
+  if (host === undefined || (bracketed ? !isValidIpv6(host) : !isValidCheckEndpointHost(host))) {
+    return { ok: false, message: "Endpoint must use host:port, for example youtube.com:443." };
+  }
+  if (rawPort === undefined || !/^\d{1,5}$/u.test(rawPort) || Number(rawPort) < 1 || Number(rawPort) > 65535) {
+    return { ok: false, message: "Endpoint must use host:port with a valid TCP port." };
+  }
+  return { ok: true };
+}
+
+function isValidCheckEndpointHost(host: string): boolean {
+  if (isValidIpv4(host)) {
+    return true;
+  }
+  const name = host.endsWith(".") ? host.slice(0, -1) : host;
+  if (!name || name.length > 253 || /^[\d.]+$/u.test(name)) {
+    return false;
+  }
+  return name.split(".").every((label) => CHECK_ENDPOINT_HOST_LABEL.test(label));
+}
+
 export function validateDomainPattern(value: string): ValidationResult {
   const pattern = value.trim().toLowerCase();
   if (!pattern) {

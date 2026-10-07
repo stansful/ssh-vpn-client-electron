@@ -1,0 +1,98 @@
+/* ==========================================================================
+   Connect (Main.dc.html, ConnectStates.dc.html, Compact.dc.html, endpoint
+   dialog from Dialogs.dc.html). Page-local classes use the cn- prefix.
+   ========================================================================== */
+
+/* Hero: the swapped copy block keeps the column's spacing and alignment */
+.cn-copy { display: flex; flex-direction: column; gap: 10px; min-width: 0; align-items: inherit; }
+.cn-pick { margin-top: 8px; width: 100%; max-width: 420px; }
+.cn-actions { margin-top: 6px; }
+.hero:focus { outline: none; }
+.hero:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* Raw technical text under a plain sentence */
+.cn-code {
+  display: inline-block; max-width: 100%;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+  padding: 5px 9px; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--line); color: var(--text-2);
+  overflow-wrap: anywhere; text-align: left; white-space: pre-wrap;
+  max-height: 120px; overflow: auto;
+}
+.cn-inline {
+  font-family: var(--font-mono); font-size: 12px;
+  padding: 1px 5px; border-radius: 5px;
+  background: color-mix(in oklab, var(--text) 7%, transparent);
+  overflow-wrap: anywhere;
+}
+.cn-hintline { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; color: var(--text-3); line-height: 1.45; text-align: left; text-wrap: pretty; }
+.cn-hintline .ic { margin-top: 1px; }
+
+/* "Reason from Xray" block in the error state */
+.cn-reason {
+  display: flex; flex-direction: column; gap: 6px;
+  width: 100%; max-width: 420px;
+  padding: 11px 13px; border-radius: var(--r-md);
+  background: var(--danger-soft); border: 1px solid var(--danger-line);
+  text-align: left;
+}
+.cn-reason-label { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--danger-text); }
+.cn-reason-text { font-family: var(--font-mono); font-size: 12.5px; color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; max-height: 120px; overflow: auto; }
+.cn-reason .link-btn { align-self: flex-start; }
+
+/* First run: the picker becomes the first step */
+.cn-picker-empty { border-style: dashed; background: transparent; }
+.cn-picker-empty:hover { border-color: var(--accent-line); background: var(--accent-soft); }
+.cn-picker-empty .avatar { background: var(--accent-soft); color: var(--accent-text); }
+.cn-picker-empty .picker-sub, .picker .cn-picker-count { font-family: var(--font-ui); }
+
+/* Facts: the copy button sits at the end of the proxy cell */
+.cn-fact-copy { margin-left: auto; }
+.cn-facts .fact-value .link-btn { font-size: 12.5px; }
+@container hero (max-width: 627px) {
+  .cn-facts .fact:first-child { grid-column: 1 / -1; }
+}
+
+/* Tunnel check card */
+.cn-check { gap: 14px; }
+.cn-check-text { margin: 0; font-size: 13.5px; line-height: 1.5; text-wrap: pretty; overflow-wrap: anywhere; }
+.cn-check-meta { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-3); overflow-wrap: anywhere; }
+.cn-check-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: auto; padding-top: 2px; }
+.cn-check .callout { padding: 10px 12px; }
+.cn-check .callout > .ic { width: 15px; height: 15px; margin-top: 2px; }
+.cn-steps-intro { font-size: 13px; }
+.cn-steps { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 7px; font-size: 13px; color: var(--text-2); }
+.cn-steps li { display: flex; align-items: flex-start; gap: 9px; text-wrap: pretty; overflow-wrap: anywhere; }
+.cn-steps li::before { content: ""; flex: 0 0 auto; width: 5px; height: 5px; margin-top: 8px; border-radius: 50%; background: var(--text-3); }
+
+/* Endpoint dialog: "How it's checked" */
+.cn-method { display: flex; align-items: flex-start; gap: 12px; padding: 12px; border-radius: var(--r-md); border: 1px solid var(--line); background: var(--surface-2); }
+.cn-method-copy { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-size: 13px; color: var(--text-2); text-wrap: pretty; }
+.cn-method-head { gap: 8px; }
+.cn-method .card-icon { width: 32px; height: 32px; border-radius: 10px; }
+
+/* Recent activity */
+.cn-feed-empty { margin: 0; }
+
+/* Server terminal */
+.cn-term { padding: 0; gap: 0; }
+.cn-term-head {
+  display: flex; align-items: center; gap: 14px;
+  width: 100%; padding: 16px 22px;
+  border: 0; background: none; color: inherit; cursor: pointer; text-align: left;
+  border-radius: var(--r-lg);
+}
+.cn-term-titles { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; }
+.cn-term-body { padding: 0 22px 20px; }
+.cn-term .term { height: 220px; }
+.cn-term .callout { padding: 11px 12px; }
+.cn-term .term-input input::placeholder { color: var(--term-dim); }
+.cn-term .term-input input[disabled] { cursor: not-allowed; }
+.cn-term-foot { justify-content: space-between; }
+.term .cn-old { opacity: .5; }
+
+@container app (max-width: 560px) {
+  .cn-term-head { padding: 14px 16px; gap: 12px; }
+  .cn-term-head .card-icon { display: none; }
+  .cn-term-body { padding: 0 16px 16px; }
+}
