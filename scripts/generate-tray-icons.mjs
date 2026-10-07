@@ -1,102 +1,74 @@
 import { Buffer } from "node:buffer";
-import { deflateSync } from "node:zlib";
-import { writeFile } from "node:fs/promises";
+import { deflateSync, inflateSync } from "node:zlib";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { renderSvg } from "./svg-template-raster.mjs";
 
+// Renders the macOS menu-bar template (resources/icons/trayTemplate.svg, a 16x16 viewBox) to its
+// 1x and 2x PNGs. `--check` only verifies that the committed PNGs still match the SVG.
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const iconsDir = path.join(root, "resources", "icons");
-
-async function writeTemplatePng(output, size, dpi) {
-  const pixels = Buffer.alloc(size * size * 4);
-  const samples = 8;
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      let covered = 0;
-      for (let sampleY = 0; sampleY < samples; sampleY += 1) {
-        for (let sampleX = 0; sampleX < samples; sampleX += 1) {
-          const pointX = ((x + (sampleX + 0.5) / samples) * 16) / size;
-          const pointY = ((y + (sampleY + 0.5) / samples) * 16) / size;
-          covered += templateContains(pointX, pointY) ? 1 : 0;
-        }
-      }
-      const offset = (y * size + x) * 4;
-      pixels[offset] = 0;
-      pixels[offset + 1] = 0;
-      pixels[offset + 2] = 0;
-      pixels[offset + 3] = Math.round((covered * 255) / (samples * samples));
-    }
-  }
-  await writeFile(output, encodeRgbaPng({ width: size, height: size, pixels }, dpi));
-}
-
-function templateContains(x, y) {
-  const shield = pointInPolygon(x, y, OUTER_SHIELD) && !pointInPolygon(x, y, INNER_SHIELD);
-  const keyOuter =
-    circleContains(x, y, 5.6, 6.15, 1.75) ||
-    roundedRectContains(x, y, 6.65, 5.25, 5.2, 2.05, 0.58) ||
-    roundedRectContains(x, y, 9.25, 6.15, 1.9, 2.7, 0.45);
-  const keyHole = circleContains(x, y, 5.6, 6.15, 0.58);
-  return shield || (keyOuter && !keyHole);
-}
-
-const OUTER_SHIELD = [
-  [8, 1.05], [14.2, 3.15], [14.2, 7], [14, 8.55], [13.4, 10.15], [12.3, 11.8], [10.7, 13.25],
-  [8, 14.85], [5.3, 13.25], [3.7, 11.8], [2.6, 10.15], [2, 8.55], [1.8, 7], [1.8, 3.15]
+const source = path.join(iconsDir, "trayTemplate.svg");
+const outputs = [
+  { file: path.join(iconsDir, "trayTemplate.png"), size: 16, dpi: 72 },
+  { file: path.join(iconsDir, "trayTemplate@2x.png"), size: 32, dpi: 144 }
 ];
-const INNER_SHIELD = [
-  [8, 2.5], [12.7, 4], [12.7, 7.02], [12.5, 8.25], [12, 9.5], [11.05, 10.9], [9.7, 12.15],
-  [8, 13.2], [6.3, 12.15], [4.95, 10.9], [4, 9.5], [3.5, 8.25], [3.3, 7.02], [3.3, 4]
-];
+const checkOnly = process.argv.includes("--check");
 
-await Promise.all([
-  writeTemplatePng(path.join(iconsDir, "trayTemplate.png"), 16, 72),
-  writeTemplatePng(path.join(iconsDir, "trayTemplate@2x.png"), 32, 144)
-]);
-
-console.log("wrote resources/icons/trayTemplate.png");
-console.log("wrote resources/icons/trayTemplate@2x.png");
-
-function pointInPolygon(x, y, polygon) {
-  let inside = false;
-  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
-    const [x1, y1] = polygon[index];
-    const [x2, y2] = polygon[previous];
-    if ((y1 > y) !== (y2 > y) && x < ((x2 - x1) * (y - y1)) / (y2 - y1) + x1) {
-      inside = !inside;
-    }
+const svg = await readFile(source, "utf8");
+const stale = [];
+for (const output of outputs) {
+  const image = renderSvg(svg, output.size);
+  if (image.width !== output.size || image.height !== output.size) {
+    throw new Error(`trayTemplate.svg must have a square 16x16 viewBox; got ${image.width}x${image.height} at ${output.size} px.`);
   }
-  return inside;
+  if (maxEdgeAlpha(image) !== 0) {
+    throw new Error(`trayTemplate.svg leaves ink in the outer pixel ring at ${output.size} px; keep the glyph inside 1..15.`);
+  }
+  const name = path.relative(root, output.file);
+  if (checkOnly) {
+    if (!(await matchesPng(output.file, image))) {
+      stale.push(name);
+    }
+    continue;
+  }
+  await writeFile(output.file, encodeTemplatePng(image, output.dpi));
+  console.log(`wrote ${name}`);
 }
 
-function circleContains(x, y, centerX, centerY, radius) {
-  return (x - centerX) ** 2 + (y - centerY) ** 2 <= radius ** 2;
+if (stale.length > 0) {
+  console.error(`${stale.join(", ")} out of date with trayTemplate.svg; run npm run icons:tray`);
+  process.exit(1);
+}
+if (checkOnly) {
+  console.log("tray template PNGs match trayTemplate.svg");
 }
 
-function roundedRectContains(x, y, left, top, width, height, radius) {
-  const clampedX = Math.max(left + radius, Math.min(x, left + width - radius));
-  const clampedY = Math.max(top + radius, Math.min(y, top + height - radius));
-  return (
-    x >= left &&
-    x <= left + width &&
-    y >= top &&
-    y <= top + height &&
-    (x - clampedX) ** 2 + (y - clampedY) ** 2 <= radius ** 2
-  );
+function maxEdgeAlpha({ width, height, alpha }) {
+  let maximum = 0;
+  for (let x = 0; x < width; x += 1) {
+    maximum = Math.max(maximum, alpha[x], alpha[(height - 1) * width + x]);
+  }
+  for (let y = 0; y < height; y += 1) {
+    maximum = Math.max(maximum, alpha[y * width], alpha[y * width + width - 1]);
+  }
+  return maximum;
 }
 
-function encodeRgbaPng(image, dpi) {
-  const rowLength = image.width * 4;
-  const raw = Buffer.alloc((rowLength + 1) * image.height);
-  for (let y = 0; y < image.height; y += 1) {
-    const rawOffset = y * (rowLength + 1);
-    raw[rawOffset] = 0;
-    image.pixels.copy(raw, rawOffset + 1, y * rowLength, (y + 1) * rowLength);
+/** Black, alpha-only RGBA: macOS tints template images for the menu-bar appearance. */
+function encodeTemplatePng({ width, height, alpha }, dpi) {
+  const rowLength = width * 4;
+  const raw = Buffer.alloc((rowLength + 1) * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      raw[y * (rowLength + 1) + 1 + x * 4 + 3] = alpha[y * width + x];
+    }
   }
 
   const header = Buffer.alloc(13);
-  header.writeUInt32BE(image.width, 0);
-  header.writeUInt32BE(image.height, 4);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
   header[8] = 8;
   header[9] = 6;
 
@@ -113,6 +85,51 @@ function encodeRgbaPng(image, dpi) {
     pngChunk("IDAT", deflateSync(raw)),
     pngChunk("IEND", Buffer.alloc(0))
   ]);
+}
+
+/** Compares against a PNG this script wrote (8-bit RGBA, unfiltered rows); ±1 absorbs float drift between Node versions. */
+async function matchesPng(file, { width, height, alpha }) {
+  let input;
+  try {
+    input = await readFile(file);
+  } catch {
+    return false;
+  }
+  let offset = 8;
+  let header;
+  const data = [];
+  while (offset < input.length) {
+    const length = input.readUInt32BE(offset);
+    const type = input.subarray(offset + 4, offset + 8).toString("ascii");
+    const body = input.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") header = body;
+    if (type === "IDAT") data.push(body);
+    offset += 12 + length;
+  }
+  if (!header || header.readUInt32BE(0) !== width || header.readUInt32BE(4) !== height || header[8] !== 8 || header[9] !== 6) {
+    return false;
+  }
+  const raw = inflateSync(Buffer.concat(data));
+  const rowLength = width * 4;
+  if (raw.length !== (rowLength + 1) * height) {
+    return false;
+  }
+  for (let y = 0; y < height; y += 1) {
+    const row = y * (rowLength + 1);
+    if (raw[row] !== 0) {
+      return false;
+    }
+    for (let x = 0; x < width; x += 1) {
+      const pixel = row + 1 + x * 4;
+      if (raw[pixel] !== 0 || raw[pixel + 1] !== 0 || raw[pixel + 2] !== 0) {
+        return false;
+      }
+      if (Math.abs(raw[pixel + 3] - alpha[y * width + x]) > 1) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 function pngChunk(type, data) {

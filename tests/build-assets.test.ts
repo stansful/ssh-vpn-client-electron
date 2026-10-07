@@ -101,6 +101,15 @@ describe("build assets", () => {
     expect(macResources).toContain("trayTemplate@2x.png");
   });
 
+  it("renders the macOS menu-bar template PNGs from trayTemplate.svg", () => {
+    expect(packageJson.scripts["package:prepare"]).toContain("icons:tray");
+
+    const check = spawnSync(process.execPath, ["scripts/generate-tray-icons.mjs", "--check"], { encoding: "utf8" });
+
+    expect(check.error).toBeUndefined();
+    expect(check.status, check.stderr).toBe(0);
+  });
+
   it("uses multi-size DIB Windows icons instead of a single PNG-in-ICO", () => {
     const ico = readIco("resources/icons/icon.ico");
 

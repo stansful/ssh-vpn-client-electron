@@ -1,6 +1,6 @@
 {
   "name": "shadow-ssh-desktop",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "private": true,
   "description": "Desktop client for shadow-ssh with Electron, TypeScript, and a platform-ready service boundary.",
   "type": "module",
@@ -25,7 +25,7 @@
     "build:node": "npm run clean:node && tsc -p tsconfig.node.json",
     "prebuild": "npm run clean:dist",
     "build": "npm run typecheck && vite build && tsc -p tsconfig.node.json",
-    "package:prepare": "npm run native:build-service && npm run build",
+    "package:prepare": "npm run native:build-service && npm run icons:tray && npm run build",
     "build:dev-exe": "cross-env NODE_ENV=development SHADOW_SSH_BUILD_CHANNEL=development npm run package:prepare && npm run pack:dev-win-exe-x64 && npm run pack:dev-win-exe-arm64",
     "build:prod": "npm run build:prod-all",
     "build:prod-all": "npm run clean:release && cross-env NODE_ENV=production SHADOW_SSH_BUILD_CHANNEL=production npm run package:prepare && npm run pack:prod-all && npm run verify:prod-artifacts && npm run release:prune",
