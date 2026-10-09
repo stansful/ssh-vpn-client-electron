@@ -124,6 +124,33 @@ describe("browser preview API", () => {
     expect(fixed.store.proxyProfiles.find((profile) => profile.id === selfSigned?.id)).not.toHaveProperty("insecureWithoutPin");
   });
 
+  it("renames a profile in place and brings back its link's name for a blank one", async () => {
+    const api = createBrowserPreviewApi();
+    const before = await api.loadSnapshot();
+    const seeded = before.store.proxyProfiles.find((profile) => profile.name === "trojan-tokyo")!;
+
+    const renamed = await api.renameProxyProfile(seeded.id, "  Tokyo\nhome  ");
+    expect(renamed.store.proxyProfiles.find((profile) => profile.id === seeded.id)).toMatchObject({ name: "Tokyo home", fingerprint: seeded.fingerprint, isPinned: true });
+    expect((await api.renameProxyProfile(seeded.id, " ")).store.proxyProfiles.find((profile) => profile.id === seeded.id)?.name).toBe("trojan-tokyo");
+
+    const link = "vless://11111111-1111-4111-8111-111111111111@example.org:443?security=tls&type=ws";
+    const imported = await api.importProxyProfiles({ text: link, source: "clipboard" });
+    const added = imported.snapshot.store.proxyProfiles.find((profile) => profile.host === "example.org")!;
+    await api.renameProxyProfile(added.id, "Mine");
+    const restored = await api.renameProxyProfile(added.id, "");
+    expect(restored.store.proxyProfiles.find((profile) => profile.id === added.id)?.name).toBe("vless-example.org:443");
+
+    await expect(api.renameProxyProfile("missing", "Name")).rejects.toThrow("Xray profile does not exist.");
+  });
+
+  it("copies a profile link without handing it to the renderer", async () => {
+    const api = createBrowserPreviewApi();
+    const { store } = await api.loadSnapshot();
+
+    await expect(api.copyProxyProfileLink(store.proxyProfiles[0]!.id)).resolves.toBe(true);
+    await expect(api.copyProxyProfileLink("missing")).rejects.toThrow("Xray profile does not exist.");
+  });
+
   it("clears attention with Activity and reports log files with their archives", async () => {
     const api = createBrowserPreviewApi();
     const loaded = await api.loadSnapshot();

@@ -201,3 +201,16 @@ export function normalizeRuleValue(type: RoutingRuleType, value: string): string
   }
   return trimmed;
 }
+
+export const MAX_PROXY_PROFILE_NAME_LENGTH = 64;
+
+/**
+ * A profile name is one line of display text: control characters (newlines
+ * and tabs too) and the Unicode line and paragraph separators become spaces,
+ * and it is cut to 64 code points so a surrogate pair is never split.
+ * Returns "" for a blank name.
+ */
+export function normalizeProxyProfileName(input: string): string {
+  const flattened = input.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ").trim();
+  return Array.from(flattened).slice(0, MAX_PROXY_PROFILE_NAME_LENGTH).join("").trimEnd();
+}

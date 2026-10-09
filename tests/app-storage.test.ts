@@ -1,5 +1,5 @@
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -534,6 +534,7 @@ describe("AppStorage recovery", () => {
       () => storage.upsertProxyProfile({ name: "", rawUri: "vless://id@proxy.example.com:443?type=tcp&security=tls#a" }),
       () => storage.selectProxyProfile("missing"),
       () => storage.toggleProxyProfilePin("missing"),
+      () => storage.renameProxyProfile("missing", "name"),
       () => storage.deleteProxyProfile("missing"),
       () => storage.deleteUnpinnedProxyProfiles(),
       () => storage.updateRoutingProxyList(createDefaultStore().routingProxyList),
@@ -1064,6 +1065,156 @@ describe("AppStorage Hysteria 2 profiles", () => {
     expect(result).toMatchObject({ imported: 0, updated: 2 });
     expect(store.proxyProfiles.find((profile) => profile.name === "plain")).not.toHaveProperty("insecureWithoutPin");
     expect(store.proxyProfiles.find((profile) => profile.name === "self-signed")).toMatchObject({ insecureWithoutPin: true });
+  });
+});
+
+describe("AppStorage proxy profile rename", () => {
+  const cleanupDirs: string[] = [];
+  const NAMED = "vless://11111111-1111-4111-8111-111111111111@named.example.com:443?type=tcp&security=tls#Amsterdam";
+  const UNNAMED = "vless://11111111-1111-4111-8111-111111111111@unnamed.example.com:443?type=tcp&security=tls";
+
+  afterEach(async () => {
+    await Promise.all(cleanupDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  async function storageWith(text: string, sourceUrl?: string) {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    const { store } = await storage.importProxyProfiles(sourceUrl ? { text, source: "remote", sourceUrl } : { text, source: "clipboard" });
+    return { dir, storage, profiles: store.proxyProfiles };
+  }
+
+  it("saves one trimmed line of at most 64 characters and leaves the link, selection and pin alone", async () => {
+    const { dir, storage, profiles: [before] } = await storageWith(NAMED);
+
+    const store = await storage.renameProxyProfile(before!.id, "  Home\tserver\n#1\u0085 a\u0000b  ");
+    const renamed = store.proxyProfiles[0]!;
+    expect(renamed).toEqual({ ...before, name: "Home server #1  a b", updatedAt: renamed.updatedAt });
+    expect(Date.parse(renamed.updatedAt)).toBeGreaterThanOrEqual(Date.parse(before!.updatedAt));
+    expect(storage.resolveProxySecrets(renamed).rawUri).toBe(NAMED);
+
+    const emoji = await storage.renameProxyProfile(before!.id, "😀".repeat(70));
+    expect(emoji.proxyProfiles[0]?.name).toBe("😀".repeat(64));
+    const cut = await storage.renameProxyProfile(before!.id, `${"x".repeat(63)} yz`);
+    expect(cut.proxyProfiles[0]?.name).toBe("x".repeat(63));
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    expect(reopened.getStore().proxyProfiles[0]?.name).toBe("x".repeat(63));
+  });
+
+  it("brings back the link's own name, or protocol-host:port, for a blank name", async () => {
+    const { storage, profiles } = await storageWith([NAMED, UNNAMED].join("\n"));
+    const [named, unnamed] = profiles;
+    await storage.renameProxyProfile(named!.id, "Custom");
+    await storage.renameProxyProfile(unnamed!.id, "Custom");
+
+    await storage.renameProxyProfile(named!.id, "   ");
+    const store = await storage.renameProxyProfile(unnamed!.id, "\n\t");
+
+    expect(store.proxyProfiles.map((profile) => profile.name)).toEqual(["Amsterdam", "vless-unnamed.example.com:443"]);
+  });
+
+  it("does not write the store when the name stays the same", async () => {
+    const { dir, storage, profiles: [profile] } = await storageWith(NAMED);
+    await storage.renameProxyProfile(profile!.id, "Custom");
+    const storePath = path.join(dir, "app-store.v1.json");
+    const before = await stat(storePath);
+
+    const store = await storage.renameProxyProfile(profile!.id, " Custom ");
+    const after = await stat(storePath);
+
+    expect(store.proxyProfiles[0]?.name).toBe("Custom");
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it("refuses a profile that does not exist and a name that is not text", async () => {
+    const { storage, profiles: [profile] } = await storageWith(NAMED);
+
+    await expect(storage.renameProxyProfile("missing", "Custom")).rejects.toThrow("Proxy profile does not exist.");
+    await expect(storage.renameProxyProfile(profile!.id, 42 as unknown as string)).rejects.toThrow("Proxy profile name is invalid.");
+    expect(() => storage.readProxyProfileShareLink("missing")).toThrow("Proxy profile does not exist.");
+  });
+
+  it("keeps the new name when its public list is refreshed with the same link", async () => {
+    const sourceUrl = "https://lists.example.com/public.txt";
+    const { storage, profiles: [profile] } = await storageWith(NAMED, sourceUrl);
+    await storage.renameProxyProfile(profile!.id, "My server");
+
+    const { store, result } = await storage.importProxyProfiles({ text: NAMED, source: "remote", sourceUrl });
+
+    expect(result).toMatchObject({ imported: 0, updated: 1 });
+    expect(store.proxyProfiles).toHaveLength(1);
+    expect(store.proxyProfiles[0]).toMatchObject({ id: profile!.id, name: "My server", isStale: false, fingerprint: profile!.fingerprint });
+  });
+
+  it("copies the saved link with the profile's current name written in", async () => {
+    const { storage, profiles: [profile] } = await storageWith(NAMED);
+    expect(storage.readProxyProfileShareLink(profile!.id)).toBe(NAMED);
+
+    await storage.renameProxyProfile(profile!.id, "Home server");
+
+    expect(storage.readProxyProfileShareLink(profile!.id)).toBe(NAMED.replace("#Amsterdam", "#Home%20server"));
+    expect(storage.resolveProxySecrets(storage.getStore().proxyProfiles[0]!).rawUri).toBe(NAMED);
+  });
+
+  it("brings back a long or multi-line link name as import saved it, so Copy link returns the saved link", async () => {
+    const longName = "🇳🇱 Amsterdam | 1 Gbps | Netflix, YouTube, ChatGPT | t.me/SomeChannel-2026 #12";
+    const long = `vless://11111111-1111-4111-8111-111111111111@long.example.com:443?type=tcp&security=tls#${encodeURIComponent(longName)}`;
+    const lines = "vless://11111111-1111-4111-8111-111111111111@lines.example.com:443?type=tcp&security=tls#Line%0Atwo%09three";
+    const { storage, profiles } = await storageWith([long, lines].join("\n"));
+    expect(profiles.map((profile) => profile.name)).toEqual([longName, "Line\ntwo\tthree"]);
+
+    for (const [index, profile] of profiles.entries()) {
+      await storage.renameProxyProfile(profile.id, "Mine");
+      const store = await storage.renameProxyProfile(profile.id, "");
+
+      expect(store.proxyProfiles[index]?.name).toBe(profile.name);
+      expect(storage.readProxyProfileShareLink(profile.id)).toBe([long, lines][index]);
+    }
+  });
+
+  it("falls back to protocol-host:port for a blank name when the saved link can't be read", async () => {
+    const { dir, storage, profiles: [profile] } = await storageWith(NAMED);
+    await storage.renameProxyProfile(profile!.id, "Custom");
+    // The development secret key is bound to the folder, as after an app folder move.
+    const moved = await makeTempDir(cleanupDirs);
+    for (const file of ["app-store.v1.json", "secret-store.v1.json"]) {
+      await copyFile(path.join(dir, file), path.join(moved, file));
+    }
+    const reopened = new AppStorage(moved);
+    await reopened.init();
+    expect(() => reopened.readProxyProfileShareLink(profile!.id)).toThrow();
+
+    const store = await reopened.renameProxyProfile(profile!.id, "");
+
+    expect(store.proxyProfiles[0]?.name).toBe("vless-named.example.com:443");
+  });
+
+  it("writes the name into a vmess link's ps through the saved secret", async () => {
+    const payload = { v: "2", ps: "Tokyo", add: "vmess.example.com", port: "443", id: "11111111-1111-4111-8111-111111111111", aid: "0", net: "ws", type: "none", path: "/ws", tls: "tls" };
+    const link = `vmess://${Buffer.from(JSON.stringify(payload), "utf8").toString("base64")}`;
+    const { storage, profiles: [profile] } = await storageWith(link);
+
+    await storage.renameProxyProfile(profile!.id, "Home server");
+    const copied = storage.readProxyProfileShareLink(profile!.id);
+
+    expect(JSON.parse(Buffer.from(copied.slice("vmess://".length), "base64").toString("utf8"))).toEqual({ ...payload, ps: "Home server" });
+    expect(storage.resolveProxySecrets(storage.getStore().proxyProfiles[0]!).rawUri).toBe(link);
+  });
+
+  it("copies the saved link as it is when the new name can't be written into it", async () => {
+    // At the 64 KiB link limit, a longer name would make the link unreadable.
+    const head = "vless://11111111-1111-4111-8111-111111111111@big.example.com:443?type=tcp&security=tls&padding=";
+    const big = `${head}${"a".repeat(64 * 1024 - head.length - 2)}#a`;
+    const { storage, profiles: [profile] } = await storageWith(big);
+
+    await storage.renameProxyProfile(profile!.id, "Home server");
+
+    expect(storage.getStore().proxyProfiles[0]?.name).toBe("Home server");
+    expect(storage.readProxyProfileShareLink(profile!.id)).toBe(big);
   });
 });
 

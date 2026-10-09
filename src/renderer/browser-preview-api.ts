@@ -38,7 +38,7 @@ import type {
   UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "../shared/types.js";
-import { validateRoutingRuleValue } from "../shared/validation.js";
+import { normalizeProxyProfileName, validateRoutingRuleValue } from "../shared/validation.js";
 import { linkFingerprint, parseShareLink, type LinkPreview } from "./components/pages/profiles/link-preview.js";
 
 /**
@@ -94,6 +94,8 @@ class BrowserPreview {
   private readonly ready: Promise<void>;
   private startupFailure: string | undefined;
   private autoConnect: AutoConnectNotice | undefined;
+  /** The name each profile's link carries, by profile id: the preview keeps no links, and a blank rename restores it. */
+  private readonly linkNames: Map<string, string>;
 
   constructor(private readonly scenario: string, private readonly platform: DesktopPlatform, loggingEnabled: boolean) {
     const today = startOfToday();
@@ -107,6 +109,8 @@ class BrowserPreview {
       isDevBuild: true
     };
     this.store = scenario === "empty" ? emptyStore(loggingEnabled) : seedStore(today, loggingEnabled);
+    // Every seeded link carries its profile's name.
+    this.linkNames = new Map(this.store.proxyProfiles.map((profile) => [profile.id, profile.name]));
     if (scenario === "blocked") {
       this.store = { ...this.store, routingRules: this.store.routingRules.map((rule) => ({ ...rule, enabled: false })), routingProxyList: { ...this.store.routingProxyList, enabled: false } };
     }
@@ -795,6 +799,36 @@ class BrowserPreview {
         };
         return this.snapshot();
       },
+      renameProxyProfile: async (id, name) => {
+        this.assertWritable();
+        const profile = this.store.proxyProfiles.find((candidate) => candidate.id === id);
+        if (!profile) {
+          throw new Error("Xray profile does not exist.");
+        }
+        // As in main, a blank name brings back the link's name as import gave it.
+        const nextName = normalizeProxyProfileName(name) || this.linkNames.get(id) || `${profile.protocol}-${profile.host}:${profile.port}`;
+        if (nextName !== profile.name) {
+          this.store = {
+            ...this.store,
+            proxyProfiles: this.store.proxyProfiles.map((candidate) =>
+              candidate.id === id ? { ...candidate, name: nextName, updatedAt: new Date().toISOString() } : candidate
+            )
+          };
+          if (this.xrayRuntime.activeConfigId === id) {
+            this.setStatus("xray", { activeConfigName: nextName });
+            if (this.activeTransport === "xray" && this.lastTunnelCheck?.transport === "xray") {
+              this.lastTunnelCheck = { ...this.lastTunnelCheck, targetName: nextName };
+            }
+          }
+        }
+        return this.snapshot();
+      },
+      copyProxyProfileLink: async (id) => {
+        if (!this.store.proxyProfiles.some((profile) => profile.id === id)) {
+          throw new Error("Xray profile does not exist.");
+        }
+        return true;
+      },
       deleteProxyProfile: async (id) => {
         this.assertWritable();
         if (this.activeTransport === "xray" && this.xrayRuntime.activeConfigId === id) {
@@ -1092,6 +1126,7 @@ class BrowserPreview {
       input.source ?? existing?.source ?? "manual",
       existing
     );
+    this.linkNames.set(profile.id, link.name);
     this.store = {
       ...this.store,
       proxyProfiles: existing ? this.store.proxyProfiles.map((candidate) => (candidate.id === profile.id ? profile : candidate)) : [...this.store.proxyProfiles, profile],
@@ -1129,11 +1164,14 @@ class BrowserPreview {
         profiles[existingIndex] = makeProfile({ ...link, flow: "", rawUri: line, fingerprint, name: existing.name || link.name }, input.source, existing, {
           sourceUrl: input.sourceUrl
         });
+        this.linkNames.set(existing.id, link.name);
         result.updated += 1;
         continue;
       }
       byFingerprint.set(fingerprint, profiles.length);
-      profiles.push(makeProfile({ ...link, flow: "", rawUri: line, fingerprint }, input.source, undefined, { sourceUrl: input.sourceUrl }));
+      const profile = makeProfile({ ...link, flow: "", rawUri: line, fingerprint }, input.source, undefined, { sourceUrl: input.sourceUrl });
+      this.linkNames.set(profile.id, link.name);
+      profiles.push(profile);
       result.imported += 1;
     }
     const now = new Date().toISOString();

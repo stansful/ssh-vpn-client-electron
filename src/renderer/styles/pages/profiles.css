@@ -89,7 +89,8 @@
 .pf-body, .pf-foot { position: relative; z-index: 1; pointer-events: none; }
 .pf-foot button { pointer-events: auto; }
 .pf-body { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-.pf-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+/* As tall as the status badge, so neither the badge nor the rename field changes a card's height */
+.pf-head { display: flex; align-items: center; gap: 10px; min-width: 0; min-height: 24px; }
 .pf-name { flex: 1 1 auto; font-weight: 600; font-size: 15px; letter-spacing: -.01em; }
 .pf-addr { display: block; font-size: 12.5px; color: var(--text-2); }
 .pf-head, .pf-addr, .pf-tags { transition: opacity var(--t-slow) var(--ease-out); }
@@ -162,9 +163,26 @@
 .pf-pin .ic { width: 15px; height: 15px; transition: fill var(--t-mid) var(--ease-out); }
 .pf-pin[aria-pressed="true"] .ic { fill: currentColor; }
 .pf-pin-ic { display: inline-grid; animation: pf-pop var(--t-slow) var(--ease-spring) both; }
-.pf-del:hover { color: var(--danger-text); }
-.pf-del[aria-disabled="true"] { opacity: .5; }
-.pf-del[aria-disabled="true"]:hover { background: transparent; color: var(--text-2); }
+/* Inline rename: the input takes the place of the name and badge; 30px with
+   -3px margins keeps the head at 24px, so the card height never changes */
+.pf-name-input {
+  pointer-events: auto;
+  flex: 1 1 auto; min-width: 0;
+  height: 30px; margin: -3px 0 -3px -8px; padding: 0 7px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--accent);
+  background: var(--bg-2);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  color: var(--text);
+  font-size: 15px; font-weight: 600; letter-spacing: -.01em;
+  outline: none;
+  animation: fade var(--t-fast) var(--ease-out) both;
+}
+[data-theme="light"] .pf-name-input { background: var(--surface); }
+.pf-name-input::placeholder { color: var(--text-3); font-weight: 500; }
+.pf-card[data-editing="true"], .pf-card[data-editing="true"]:hover { transform: none; }
+.pf-hit[disabled] { cursor: default; }
+.pf-edit-acts { display: inline-flex; gap: 6px; flex: 0 0 auto; }
 
 /* ---------- Below the grid ---------- */
 .pf-more { display: flex; flex-direction: column; align-items: center; gap: 10px; padding-top: 6px; }

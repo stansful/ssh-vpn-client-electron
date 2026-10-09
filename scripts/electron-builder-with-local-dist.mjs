@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -86,6 +86,12 @@ const builderEnvironment = {
   ...process.env,
   ELECTRON_BUILDER_CACHE: process.env.ELECTRON_BUILDER_CACHE || path.join(root, ".cache", "electron-builder")
 };
+if (platformFlag === "--linux" && process.platform !== "win32" && !builderEnvironment.APPIMAGE_TOOLS_PATH) {
+  const toolsPath = prepareAppImageTools(builderEnvironment.ELECTRON_BUILDER_CACHE);
+  if (toolsPath) {
+    builderEnvironment.APPIMAGE_TOOLS_PATH = toolsPath;
+  }
+}
 const child = spawn(process.execPath, [builderCli, ...builderArgs], {
   cwd: root,
   env: builderEnvironment,
@@ -105,6 +111,63 @@ child.on("exit", (code, signal) => {
   }
   process.exit(code ?? 1);
 });
+
+/**
+ * electron-builder squashes AppImages with zstd at mksquashfs' default level
+ * (15) and 128 KiB blocks and has no option for either. It does take its tools
+ * from APPIMAGE_TOOLS_PATH and always passes `-comp zstd` last, so a wrapper
+ * that appends the level and block size makes the AppImage ~10 MB smaller.
+ * The cached tools are bash dispatchers that resolve their own directory,
+ * hence exec wrappers rather than symlinks.
+ */
+function prepareAppImageTools(builderCache) {
+  const version = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).build?.toolsets?.appimage;
+  const toolsetRoot = path.join(builderCache, `appimage@${version}`);
+  const toolsName = existsSync(toolsetRoot)
+    ? readdirSync(toolsetRoot).find(
+      (name) => name.startsWith("appimage-tools-runtime-") && !name.endsWith(".state") && isCompleteExtraction(path.join(toolsetRoot, `${name}.state`))
+    )
+    : undefined;
+  if (!version || !toolsName) {
+    console.warn("[electron-builder] AppImage tools are not cached yet; this AppImage uses the default zstd level and block size.");
+    return null;
+  }
+  const realTools = path.join(toolsetRoot, toolsName);
+  const wrapperTools = path.join(root, ".cache", "appimage-tools-zstd19");
+  // electron-builder refuses an APPIMAGE_TOOLS_PATH with shell metacharacters.
+  if (/[;&|`$<>"'\\]/u.test(wrapperTools)) {
+    console.warn("[electron-builder] The checkout path has shell metacharacters; this AppImage uses the default zstd level and block size.");
+    return null;
+  }
+  rmSync(wrapperTools, { recursive: true, force: true });
+  mkdirSync(wrapperTools, { recursive: true });
+  const writeWrapper = (tool, script) => {
+    const wrapperPath = path.join(wrapperTools, tool);
+    writeFileSync(wrapperPath, `#!/usr/bin/env bash\n${script}\n`);
+    chmodSync(wrapperPath, 0o755);
+  };
+  const mksquashfs = shellQuote(path.join(realTools, "mksquashfs"));
+  writeWrapper(
+    "mksquashfs",
+    `case " $* " in\n  *" -comp zstd "*) exec ${mksquashfs} "$@" -Xcompression-level 19 -b 1M ;;\nesac\nexec ${mksquashfs} "$@"`
+  );
+  writeWrapper("desktop-file-validate", `exec ${shellQuote(path.join(realTools, "desktop-file-validate"))} "$@"`);
+  symlinkSync(path.join(realTools, "runtimes"), path.join(wrapperTools, "runtimes"));
+  symlinkSync(path.join(realTools, "lib"), path.join(wrapperTools, "lib"));
+  return wrapperTools;
+}
+
+function isCompleteExtraction(stateFile) {
+  try {
+    return JSON.parse(readFileSync(stateFile, "utf8")).state === "complete";
+  } catch {
+    return false;
+  }
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
 
 function hasExpectedElectronVersion(electronDist) {
   if (!existsSync(electronDist)) {

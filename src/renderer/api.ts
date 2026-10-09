@@ -20,6 +20,8 @@ function createMissingPreloadApi(): ShadowSshApi {
     refreshProxyProfiles: reject,
     selectProxyProfile: reject,
     toggleProxyProfilePin: reject,
+    renameProxyProfile: reject,
+    copyProxyProfileLink: reject,
     deleteProxyProfile: reject,
     deleteUnpinnedProxyProfiles: reject,
     updateSettings: reject,

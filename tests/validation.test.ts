@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CHECK_ENDPOINT_FORMAT_MESSAGE,
+  normalizeProxyProfileName,
   validateCheckEndpoint,
   validateDomainPattern,
   validateIpOrCidr,
@@ -94,5 +95,12 @@ describe("tunnel check endpoint validation", () => {
         message: "Endpoint must use host:port, for example youtube.com:443."
       });
     }
+  });
+});
+
+describe("proxy profile name", () => {
+  it("keeps one line: control characters and Unicode line and paragraph separators become spaces", () => {
+    expect(normalizeProxyProfileName(" Home\u2028server\u2029#1\r\nB ")).toBe("Home server #1  B");
+    expect(normalizeProxyProfileName("\u2028 \u2029")).toBe("");
   });
 });

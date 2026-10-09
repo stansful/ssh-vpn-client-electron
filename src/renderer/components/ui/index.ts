@@ -43,6 +43,7 @@ export {
 export { CopyButton, type CopyButtonProps } from "./CopyButton.js";
 export { CLIPBOARD_TEXT_LIMIT, copyTextWithFeedback, useCopyFeedback, usePasteFromClipboard } from "./useClipboard.js";
 export { ListboxAction, Select, type ListboxActionProps, type ListboxOption, type SelectProps } from "./Listbox.js";
+export { ActionMenu, type ActionMenuItem, type ActionMenuProps } from "./Menu.js";
 export { Modal, overlayRoot, type ModalProps } from "./Modal.js";
 export { ConfirmDialog, ConfirmHost, type ConfirmDialogProps } from "./ConfirmDialog.js";
 export { ToastViewport } from "./Toast.js";

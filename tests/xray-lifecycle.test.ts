@@ -80,6 +80,34 @@ describe("Xray service lifecycle", () => {
     await service.dispose();
   });
 
+  it("renames the running profile without a reconnect and keeps the new name for a restart", async () => {
+    const processHandle = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(processHandle).mockReturnValueOnce(new FakeXrayProcess());
+    const service = createService("rename");
+    await service.connect(proxyRequest("profile"));
+    const names: Array<string | undefined> = [];
+    service.onEvent((event) => {
+      if (event.type === "status-changed") {
+        names.push(event.status.activeConfigName);
+      }
+    });
+
+    service.renameActiveProfile("other", "Not this one");
+    service.renameActiveProfile("profile", "Renamed");
+    service.renameActiveProfile("profile", "Renamed");
+
+    expect(names).toEqual(["Renamed"]);
+    expect(service.getStatus()).toMatchObject({ state: "Connected", activeConfigId: "profile", activeConfigName: "Renamed" });
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+
+    processHandle.emit("close", 1, null);
+    await vi.waitFor(() => expect(service.getStatus().state).toBe("Reconnecting"));
+    service.wake("test");
+    await vi.waitFor(() => expect(service.getStatus()).toMatchObject({ state: "Connected", activeConfigName: "Renamed" }));
+    expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+    await service.dispose();
+  });
+
   it("waits for both listeners before applying PAC and reporting Connected", async () => {
     const startup = deferred<void>();
     const processHandle = new FakeXrayProcess();

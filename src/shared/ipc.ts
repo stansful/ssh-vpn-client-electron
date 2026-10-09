@@ -33,6 +33,8 @@ export const IPC_CHANNELS = {
   refreshProxyProfiles: "shadow-ssh:refresh-proxy-profiles",
   selectProxyProfile: "shadow-ssh:select-proxy-profile",
   toggleProxyProfilePin: "shadow-ssh:toggle-proxy-profile-pin",
+  renameProxyProfile: "shadow-ssh:rename-proxy-profile",
+  copyProxyProfileLink: "shadow-ssh:copy-proxy-profile-link",
   deleteProxyProfile: "shadow-ssh:delete-proxy-profile",
   deleteUnpinnedProxyProfiles: "shadow-ssh:delete-unpinned-proxy-profiles",
   updateSettings: "shadow-ssh:update-settings",
@@ -103,6 +105,16 @@ export interface ShadowSshApi {
   refreshProxyProfiles(): Promise<{ snapshot: AppSnapshot; result: ImportProxyProfilesResult }>;
   selectProxyProfile(id: string): Promise<AppSnapshot>;
   toggleProxyProfilePin(id: string): Promise<AppSnapshot>;
+  /**
+   * Renames a profile; a blank name brings back the one its link carries.
+   * The saved link and its fingerprint stay as they are.
+   */
+  renameProxyProfile(id: string, name: string): Promise<AppSnapshot>;
+  /**
+   * The main process writes the profile's link, with its current name in it,
+   * to the clipboard; the link itself never reaches the renderer.
+   */
+  copyProxyProfileLink(id: string): Promise<boolean>;
   deleteProxyProfile(id: string): Promise<AppSnapshot>;
   deleteUnpinnedProxyProfiles(): Promise<AppSnapshot>;
   updateSettings(patch: Partial<AppSettings>): Promise<AppSnapshot>;

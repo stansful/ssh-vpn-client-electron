@@ -4,6 +4,7 @@ import { access, chmod, mkdir, open, rename, rm, stat, writeFile } from "node:fs
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { withShareLinkName } from "../../core/proxy/share-link-name.js";
 import { parseProxyShareLink, parseProxyShareLinks } from "../../core/proxy/share-link-parser.js";
 import { assertSshPrivateKeyText, detectSshKeyMetadata, normalizeSshPrivateKeyText } from "../../core/ssh/private-key.js";
 import {
@@ -16,7 +17,7 @@ import {
   RUSSIA_OUTSIDE_DIRECT_LIST_URL,
   STORE_SCHEMA_VERSION
 } from "../../shared/defaults.js";
-import { validateCheckEndpoint, validateSshServerFingerprint } from "../../shared/validation.js";
+import { normalizeProxyProfileName, validateCheckEndpoint, validateSshServerFingerprint } from "../../shared/validation.js";
 import type {
   ImportProxyProfilesInput,
   ImportProxyProfilesResult,
@@ -728,6 +729,31 @@ export class AppStorage {
     return this.getStore();
   }
 
+  /**
+   * Changes only the name: the link, its fingerprint and its source stay as
+   * imported, so a refresh of its list still finds the profile (and keeps the
+   * name). A blank name brings back the one import gave the link.
+   */
+  async renameProxyProfile(id: string, name: string): Promise<AppStore> {
+    this.assertWritable();
+    if (typeof id !== "string" || typeof name !== "string") {
+      throw new Error("Proxy profile name is invalid.");
+    }
+    const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
+    if (!existing) {
+      throw new Error("Proxy profile does not exist.");
+    }
+    const nextName = normalizeProxyProfileName(name) || this.linkProfileName(existing);
+    if (nextName === existing.name) {
+      return this.getStore();
+    }
+    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
+      profile.id === id ? { ...profile, name: nextName, updatedAt: new Date().toISOString() } : profile
+    );
+    await this.persistStore();
+    return this.getStore();
+  }
+
   async deleteProxyProfile(id: string): Promise<AppStore> {
     this.assertWritable();
     const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
@@ -776,6 +802,35 @@ export class AppStorage {
       throw new Error("SSH key does not exist.");
     }
     return privateKey;
+  }
+
+  /** The profile's link with its current name written in, for main-process clipboard copy. */
+  readProxyProfileShareLink(id: string): string {
+    const profile = this.store.proxyProfiles.find((candidate) => candidate.id === id);
+    if (!profile) {
+      throw new Error("Proxy profile does not exist.");
+    }
+    const rawUri = this.resolveProxySecrets(profile).rawUri;
+    try {
+      return withShareLinkName(rawUri, profile.name);
+    } catch {
+      // The link as saved still connects; only its name differs.
+      return rawUri;
+    }
+  }
+
+  /**
+   * The name import gives the saved link, unchanged (so Copy link hands back
+   * the link as saved), or the parser's protocol-host:port when the link has
+   * none or can't be read (a keychain reset, an app folder moved).
+   */
+  private linkProfileName(profile: ProxyProfile): string {
+    const fallback = `${profile.protocol}-${profile.host}:${profile.port}`;
+    try {
+      return parseProxyShareLink(this.resolveProxySecrets(profile).rawUri).name || fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   private async saveSecret(kind: SecretKind, value: string, existingId?: string, persist = true): Promise<string> {

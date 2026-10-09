@@ -1,6 +1,6 @@
 {
   "name": "shadow-ssh-desktop",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "private": true,
   "description": "Desktop client for shadow-ssh with Electron, TypeScript, and a platform-ready service boundary.",
   "type": "module",
@@ -135,6 +135,8 @@
     "appId": "app.shadowssh.desktop",
     "productName": "Shadow SSH",
     "compression": "maximum",
+    "afterPack": "./scripts/after-pack-prune.mjs",
+    "afterAllArtifactBuild": "./scripts/convert-dmg-ulmo.mjs",
     "toolsets": {
       "nsis": "1.2.1",
       "appimage": "1.0.3"
@@ -286,7 +288,11 @@
       ]
     },
     "deb": {
-      "artifactName": "shadow-ssh-${version}-linux-package-${arch}.${ext}"
+      "artifactName": "shadow-ssh-${version}-linux-package-${arch}.${ext}",
+      "fpm": [
+        "--deb-compression-level",
+        "9"
+      ]
     }
   }
 }

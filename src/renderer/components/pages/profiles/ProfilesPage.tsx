@@ -1,4 +1,4 @@
-import { ChevronDown, Filter, Info, Plus, Search, Upload, X } from "lucide-react";
+import { ChevronDown, Copy, Filter, Info, Plus, Search, Upload, X } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition, type CSSProperties } from "react";
 import { api } from "../../../api.js";
 import { useAppData } from "../../../hooks/useAppData.js";
@@ -13,6 +13,8 @@ import { ImportLinksDialog } from "./ImportLinksDialog.js";
 import { ProfileCard } from "./ProfileCard.js";
 import {
   bulkRemoveCopy,
+  copiedLinkCopy,
+  copyLinkFailedCopy,
   countProfiles,
   currentSelection,
   describeRefreshFailure,
@@ -28,6 +30,8 @@ import {
   removeBlockedCopy,
   removedOneCopy,
   removedUnpinnedCopy,
+  renamedNotice,
+  renameFailedTitle,
   resultsSummary,
   sessionWouldStop,
   summarizeRefresh,
@@ -70,6 +74,13 @@ function withPin(snapshot: AppSnapshot, id: string, pinned: boolean): AppSnapsho
   return withProfiles(snapshot, (profile) => (profile.id === id && profile.isPinned !== pinned ? { ...profile, isPinned: pinned } : profile));
 }
 
+/** Optimistic rename. With `from`, only while the profile still has that name (a later rename wins). */
+function withName(snapshot: AppSnapshot, id: string, name: string, from?: string): AppSnapshot {
+  return withProfiles(snapshot, (profile) =>
+    profile.id === id && profile.name !== name && (from === undefined || profile.name === from) ? { ...profile, name } : profile
+  );
+}
+
 type Removal = { kind: "one"; profile: ProxyProfile } | { kind: "bulk" };
 
 /**
@@ -78,7 +89,7 @@ type Removal = { kind: "one"; profile: ProxyProfile } | { kind: "bulk" };
  */
 export function ProfilesPage({ intent }: PageProps): JSX.Element {
   const app = useAppData();
-  const { snapshot, store, runtime, activeTransport, run, toast, setSnapshot, navigate, updateSettings } = app;
+  const { snapshot, store, runtime, activeTransport, environment, run, toast, setSnapshot, navigate, updateSettings } = app;
   const { clearIntent } = useNavigation();
 
   const [query, setQuery] = useState("");
@@ -94,7 +105,18 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
   const [removing, setRemoving] = useState(false);
   const [removeError, setRemoveError] = useState<unknown>();
   const [exiting, setExiting] = useState<{ list: readonly ProxyProfile[]; ids: ReadonlySet<string> }>();
+  // `seq` re-renders the live text, so a second identical notice is read out too.
+  const [renameNotice, setRenameNotice] = useState({ text: "", seq: 0 });
+  // Search text of cards renamed during this search, from before the rename: they keep
+  // matching it until the search changes, so the grid doesn't reflow under the click
+  // that saved the name or drop the card Enter hands focus back to.
+  const [renamedInSearch, setRenamedInSearch] = useState<ReadonlyMap<string, string>>();
   const [morePending, startMore] = useTransition();
+
+  const changeQuery = useCallback((next: string): void => {
+    setQuery(next);
+    setRenamedInSearch(undefined);
+  }, []);
 
   const profiles = store.proxyProfiles;
   const session = useMemo(
@@ -104,8 +126,8 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
   );
 
   // Latest values for stable callbacks (cards are memoized).
-  const latest = useRef({ store, session, refreshing, removing });
-  latest.current = { store, session, refreshing, removing };
+  const latest = useRef({ store, session, refreshing, removing, query: deferredQuery });
+  latest.current = { store, session, refreshing, removing, query: deferredQuery };
   const exitTimer = useRef<number>();
   useEffect(() => () => window.clearTimeout(exitTimer.current), []);
 
@@ -124,8 +146,13 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
 
   const searchIndex = useMemo(() => new Map(profiles.map((profile) => [profile.id, profileSearchText(profile)])), [profiles]);
   const visible = useMemo(
-    () => filterProfiles(displayProfiles, filter, deferredQuery, (profile) => searchIndex.get(profile.id) ?? profileSearchText(profile)),
-    [deferredQuery, displayProfiles, filter, searchIndex]
+    () =>
+      filterProfiles(displayProfiles, filter, deferredQuery, (profile) => {
+        const text = searchIndex.get(profile.id) ?? profileSearchText(profile);
+        const before = renamedInSearch?.get(profile.id);
+        return before === undefined ? text : `${text}\n${before}`;
+      }),
+    [deferredQuery, displayProfiles, filter, renamedInSearch, searchIndex]
   );
 
   // "Show more" resets when the search, the filter or the number of profiles changes.
@@ -147,6 +174,8 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
   }, [morePending, shown]);
 
   const selectedId = store.selectedProxyProfileId;
+  // F2 is a rename habit on Windows and Linux; on macOS it works but isn't hinted.
+  const renameKeyHint = environment.platform === "windows" || environment.platform === "linux";
 
   const playExit = useCallback((list: readonly ProxyProfile[], ids: readonly string[], then: () => void): void => {
     window.clearTimeout(exitTimer.current);
@@ -226,6 +255,51 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
       });
     },
     [run, setSnapshot]
+  );
+
+  const renameProfile = useCallback(
+    (profile: ProxyProfile, name: string): void => {
+      if (name === profile.name) {
+        return;
+      }
+      if (latest.current.query.trim()) {
+        setRenamedInSearch((current) => (current?.has(profile.id) ? current : new Map(current).set(profile.id, profileSearchText(profile))));
+      }
+      // A blank name waits for the main process, which reads the name in the link.
+      if (name) {
+        setSnapshot((current) => withName(current, profile.id, name));
+      }
+      void run(() => api.renameProxyProfile(profile.id, name), { background: true, errorTitle: renameFailedTitle(profile) }).then((result) => {
+        if (!result) {
+          if (name) {
+            setSnapshot((current) => withName(current, profile.id, profile.name, name));
+          }
+          return;
+        }
+        const renamed = result.store.proxyProfiles.find((candidate) => candidate.id === profile.id);
+        if (renamed && renamed.name !== profile.name) {
+          setRenameNotice((current) => ({ text: renamedNotice(renamed.name), seq: current.seq + 1 }));
+        }
+      });
+    },
+    [run, setSnapshot]
+  );
+
+  // The main process writes the link to the clipboard; it never reaches this page.
+  const copyLink = useCallback(
+    (profile: ProxyProfile): void => {
+      void run(() => api.copyProxyProfileLink(profile.id), { background: true, silent: true, rethrow: true })
+        .then((copied) => {
+          if (!copied) {
+            throw new Error("The clipboard didn’t accept the link. Try again.");
+          }
+          toast({ id: "profile-copy-link", tone: "success", icon: Copy, ...copiedLinkCopy(profile) });
+        })
+        .catch((error: unknown) => {
+          toast({ id: "profile-copy-link", tone: "error", ...copyLinkFailedCopy(error) });
+        });
+    },
+    [run, toast]
   );
 
   const askRemove = useCallback(
@@ -376,7 +450,7 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
         <div className="pf-lib">
           <ProfilesToolbar
             query={query}
-            onQueryChange={setQuery}
+            onQueryChange={changeQuery}
             filter={filter}
             onFilterChange={setFilter}
             counts={counts}
@@ -422,9 +496,12 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
                   session={session}
                   index={index}
                   leaving={Boolean(exiting?.ids.has(profile.id))}
+                  renameKeyHint={renameKeyHint}
                   onSelect={selectProfile}
                   onTogglePin={togglePin}
                   onRemove={askRemove}
+                  onRename={renameProfile}
+                  onCopyLink={copyLink}
                 />
               ))}
             </div>
@@ -437,7 +514,7 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
               title={<span className="break">{noMatchCopy(filter, trimmedQuery).title}</span>}
               action={
                 <>
-                  <Button size="sm" icon={X} onClick={() => setQuery("")}>
+                  <Button size="sm" icon={X} onClick={() => changeQuery("")}>
                     Clear search
                   </Button>
                   {filter !== "all" ? (
@@ -523,6 +600,9 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
         onConfirm={() => void confirmRemoval()}
         onCancel={closeRemoval}
       />
+      <span className="sr-only" aria-live="polite">
+        <span key={renameNotice.seq}>{renameNotice.text}</span>
+      </span>
     </>
   );
 }

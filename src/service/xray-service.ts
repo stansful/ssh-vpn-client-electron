@@ -327,6 +327,22 @@ export class XrayServiceBridge {
     });
   }
 
+  /**
+   * A profile was renamed. The session it runs takes the new name at once -
+   * the name is only a label, so Xray keeps running - and so does a restart.
+   */
+  renameActiveProfile(profileId: string, name: string): void {
+    if (this.disposed) {
+      return;
+    }
+    if (this.lastRequest?.profile.id === profileId) {
+      this.lastRequest = { ...this.lastRequest, profile: { ...this.lastRequest.profile, name } };
+    }
+    if (this.status.activeConfigId === profileId && this.status.activeConfigName !== name) {
+      this.setStatus({ activeConfigName: name });
+    }
+  }
+
   connect(request: ProxyConnectRequest): Promise<void> {
     if (this.disposed) {
       return Promise.reject(new Error("Xray service has been disposed."));

@@ -10,6 +10,7 @@ import {
 import { Buffer } from "node:buffer";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { prunedRuntimeFiles } from "./after-pack-prune.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageMetadata = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
@@ -140,6 +141,7 @@ function verifyWindowsBundle(releaseRoot, unpackedDirectory, arch) {
   // TUN routing is unavailable without it, and the app fails over to the
   // proxy path quietly enough that a build could ship this way unnoticed.
   verifyArchitecture(path.join(bundleRoot, "resources", "native", "windows", arch, "wintun.dll"), arch);
+  rejectPrunedRuntime(bundleRoot, "win32");
 }
 
 function verifyMacBundle(releaseRoot, unpackedDirectory, arch) {
@@ -151,6 +153,7 @@ function verifyMacBundle(releaseRoot, unpackedDirectory, arch) {
     arch
   );
   verifyArchitecture(path.join(bundleRoot, "Resources", "xray", "macos", arch, "xray"), arch);
+  rejectPrunedRuntime(bundleRoot, "darwin");
 }
 
 function verifyLinuxBundle(releaseRoot, unpackedDirectory, arch) {
@@ -162,6 +165,16 @@ function verifyLinuxBundle(releaseRoot, unpackedDirectory, arch) {
     arch
   );
   verifyArchitecture(path.join(bundleRoot, "resources", "xray", "linux", arch, "xray"), arch);
+  rejectPrunedRuntime(bundleRoot, "linux");
+}
+
+/** The afterPack hook removes these; a bundle that still has them was packed without it. */
+function rejectPrunedRuntime(bundleRoot, platform) {
+  for (const relativePath of prunedRuntimeFiles(platform)) {
+    if (existsSync(path.join(bundleRoot, relativePath))) {
+      throw new Error(`${displayPath(path.join(bundleRoot, relativePath))} should have been pruned by scripts/after-pack-prune.mjs`);
+    }
+  }
 }
 
 function verifyBinaryPackage(filePath, format) {

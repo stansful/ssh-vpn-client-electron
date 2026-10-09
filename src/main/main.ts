@@ -30,6 +30,7 @@ import { defaultServiceEndpoint } from "../service/local-ipc-protocol.js";
 import { NativeProcessServiceBridge } from "../service/native-process-client.js";
 import { LiveSshServiceBridge } from "../service/live-ssh-service.js";
 import { XrayServiceBridge } from "../service/xray-service.js";
+import { applicationMenuTemplate } from "./app/app-menu.js";
 import { createMainWindow, fitWindowSize, type CrashPageTunnel } from "./app/main-window.js";
 import { resolveAppDataLayout, resolveUserDataPath, resolveXrayExecutablePath } from "./app/paths.js";
 import { PortableUpdateController } from "./app/portable-update-controller.js";
@@ -252,7 +253,8 @@ await ensureExplicitUserDataPath();
 await writeMainLog(`Main module loaded. pid=${process.pid}, platform=${process.platform}, arch=${process.arch}, userData=${explicitUserDataPath}`);
 
 await app.whenReady();
-Menu.setApplicationMenu(null);
+const applicationMenu = applicationMenuTemplate(process.platform);
+Menu.setApplicationMenu(applicationMenu ? Menu.buildFromTemplate(applicationMenu) : null);
 await writeMainLog(
   `Application ready. packaged=${app.isPackaged}, resourcesPath=${formatRuntimePath(process.resourcesPath)}, dirname=${formatRuntimePath(__dirname)}, electronUserData=${app.getPath("userData")}`
 );
@@ -851,6 +853,22 @@ function registerIpcHandlers(): void {
     const store = await storage.toggleProxyProfilePin(id);
     return createSnapshot(store);
   });
+  handleTrustedIpc(IPC_CHANNELS.renameProxyProfile, async (_event, id: string, name: string) => {
+    const store = await storage.renameProxyProfile(id, name);
+    const renamed = store.proxyProfiles.find((profile) => profile.id === id);
+    if (renamed) {
+      // The running session, the tray and the last check result take the new name without a reconnect.
+      xrayService.renameActiveProfile(id, renamed.name);
+      if (activeTransport === "xray" && lastTunnelCheck?.transport === "xray" && xrayService.getStatus().activeConfigId === id) {
+        lastTunnelCheck = { ...lastTunnelCheck, targetName: renamed.name };
+      }
+    }
+    return createSnapshot(store);
+  });
+  handleTrustedIpc(IPC_CHANNELS.copyProxyProfileLink, (_event, id: string) => {
+    clipboard.writeText(storage.readProxyProfileShareLink(id));
+    return true;
+  });
   handleTrustedIpc(IPC_CHANNELS.deleteProxyProfile, async (_event, id: string) => {
     if (activeTransport === "xray" && xrayService.getStatus().activeConfigId === id) {
       await disconnectActiveTransport();
@@ -1256,7 +1274,9 @@ async function connectProxy(options: ConnectOptions = {}): Promise<boolean> {
       return;
     }
     setActiveTransport("xray");
-    await xrayService.connect(request);
+    // A rename saved while this connect waited its turn names the session (and its restarts) too.
+    const name = storage.getStore().proxyProfiles.find((candidate) => candidate.id === profile.id)?.name;
+    await xrayService.connect(name && name !== profile.name ? { ...request, profile: { ...profile, name } } : request);
     if (!transportMutations.isCurrent(generation)) {
       await xrayService.disconnect();
       return;
@@ -1605,7 +1625,8 @@ async function performTunnelCheck(transport: GlobalTab, endpoint: string): Promi
       void writeMainLog(`Dropped a ${transport} tunnel check result for ${result.endpoint}: the session it checked is no longer running.`);
       return;
     }
-    lastTunnelCheck = stampTunnelCheck(transport, result, ticket.targetName);
+    // Same session (accepts), so its current name: a rename during the probe shows at once.
+    lastTunnelCheck = stampTunnelCheck(transport, result, sessionName(transport) ?? ticket.targetName);
     broadcast({ type: "tunnel-check-result", result: lastTunnelCheck });
     scheduleTrayRefresh();
   });

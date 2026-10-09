@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   bulkRemoveCopy,
+  copiedLinkCopy,
+  copyLinkFailedCopy,
   countProfiles,
   currentSelection,
   describeRefreshFailure,
@@ -15,6 +17,8 @@ import {
   removeBlockedCopy,
   removedOneCopy,
   removedUnpinnedCopy,
+  renamedNotice,
+  renameFailedTitle,
   resultsSummary,
   savedProfileCopy,
   singleRemoveCopy,
@@ -145,11 +149,12 @@ describe("Xray session and cards", () => {
       badge: { text: "Connected", tone: "ok", glyph: "dot" },
       state: { label: "Connected now", tone: "ok", glyph: "dot" },
       removeBlocked: true,
-      removeLabel: "Remove de-fra-reality (disconnect Xray first)",
-      removeTitle: "Connected now. Disconnect Xray to remove this profile."
+      removeNote: "Disconnect Xray first"
     });
     const starting = presentProfileCard(fra, { selectedId: "fra", session: { phase: "connecting", profileId: "fra" } });
-    expect(starting).toMatchObject({ inUse: false, badge: { text: "Connecting…", glyph: "spinner" }, removeBlocked: true });
+    expect(starting).toMatchObject({ inUse: false, badge: { text: "Connecting…", glyph: "spinner" }, removeBlocked: true, removeNote: "Disconnect Xray first" });
+    // Another profile's session doesn't block this one.
+    expect(presentProfileCard(fra, { session: { phase: "connected", profileId: "ams" } })).toMatchObject({ removeBlocked: false, removeNote: undefined });
     expect(removeBlockedCopy(fra, { phase: "connected", profileId: "fra" }).message).toBe(
       "de-fra-reality is carrying your traffic right now. Disconnect on Connect, then remove it."
     );
@@ -354,11 +359,41 @@ describe("saving and removing", () => {
 
   it("names the profile being removed and where the selection goes", () => {
     expect(singleRemoveCopy(gone)).toMatchObject({ title: "Remove “public-23”?", meta: "45.12.33.1:8443 · Public", footnote: "If it’s still in the public list, the next refresh brings it back." });
-    expect(singleRemoveCopy(ams).footnote).toBe("To get it back, add its link again. Links can’t be viewed or exported after saving.");
+    expect(singleRemoveCopy(ams).footnote).toBe("To get it back, add its link again. Copy it first with ⋯ → Copy link if you might need it.");
     expect(singleRemoveCopy(hel).meta).toBe("hel.example.net:443,20000-30000 · Imported");
     expect(removedOneCopy(fra, store([fra, ams], "fra"), store([ams], "ams"))).toEqual({
       title: "Profile removed",
       message: "de-fra-reality is no longer in your library. Connect now uses nl-ams-ws."
     });
+  });
+});
+
+describe("renaming and copying links", () => {
+  it("names the card's action menu after the profile", () => {
+    expect(presentProfileCard(ams, {})).toMatchObject({ moreLabel: "More actions for nl-ams-ws", menuLabel: "Actions for nl-ams-ws", removeBlocked: false });
+    expect(renameFailedTitle(ams)).toBe("Couldn’t rename nl-ams-ws");
+    expect(renamedNotice("Amsterdam · WS")).toBe("Renamed to Amsterdam · WS.");
+  });
+
+  it("warns that a copied link carries credentials, except for public profiles", () => {
+    expect(copiedLinkCopy(ams)).toEqual({
+      title: "Link copied",
+      message: "Anyone with the link to nl-ams-ws can connect through it, so share it only with people you trust. Your clipboard isn’t cleared automatically."
+    });
+    expect(copiedLinkCopy(fra).message).toMatch(/^Anyone with the link to de-fra-reality/u);
+    expect(copiedLinkCopy(gone)).toEqual({ title: "Link copied", message: "public-23 is from the public list." });
+  });
+
+  it("explains a link that can't be decrypted and keeps the raw error for details", () => {
+    const decrypt = new Error("Error invoking remote method 'shadow-ssh:copy-proxy-profile-link': Error: Error while decrypting the ciphertext provided to safeStorage.decryptString.");
+    expect(copyLinkFailedCopy(decrypt)).toEqual({
+      title: "Couldn’t copy the link",
+      message: "Saved links can’t be read after the app folder moves to another PC or the system keychain is reset. Add the link again to replace this profile.",
+      details: decrypt.message
+    });
+    expect(copyLinkFailedCopy(new Error("Secret record is missing.")).message).toMatch(/^Saved links can’t be read/u);
+    expect(copyLinkFailedCopy(new Error("Invalid encrypted secret payload.")).message).toMatch(/^Saved links can’t be read/u);
+    const missing = new Error("Error invoking remote method 'shadow-ssh:copy-proxy-profile-link': Error: Proxy profile does not exist.");
+    expect(copyLinkFailedCopy(missing)).toEqual({ title: "Couldn’t copy the link", message: "Proxy profile does not exist.", details: missing.message });
   });
 });

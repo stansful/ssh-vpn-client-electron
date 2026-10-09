@@ -807,6 +807,30 @@ span.orb-btn:hover, span.orb-btn:active { transform: none; }
 .lb-opt-action { padding: 9px 10px; color: var(--accent-text); font-weight: 600; font-size: 13px; }
 .lb-opt-action .ic { width: 15px; height: 15px; }
 
+/* Action menu (role="menu", Menu.tsx): the same .menu surface, items are
+   commands rather than options; data-align="end" opens under a ⋯ button */
+.menu[data-align="end"] { transform-origin: top right; }
+.menu[data-align="end"][data-side="top"] { transform-origin: bottom right; }
+.menu-item {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; min-height: 36px; padding: 7px 10px;
+  border: 0; border-radius: 10px;
+  background: transparent; color: var(--text);
+  font-size: 13.5px; font-weight: 500; text-align: left;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease-out);
+}
+.menu-item > .ic { color: var(--text-2); }
+.menu-item:hover, .menu-item[data-active="true"], .menu-item:focus-visible { outline: none; background: var(--surface-2); }
+.menu-item-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.menu-item-end { margin-left: auto; flex: 0 0 auto; }
+.menu-item.is-danger, .menu-item.is-danger > .ic { color: var(--danger-text); }
+.menu-item.is-danger:hover, .menu-item.is-danger[data-active="true"], .menu-item.is-danger:focus-visible { background: var(--danger-soft); }
+.menu-item[aria-disabled="true"] { cursor: not-allowed; }
+.menu-item[aria-disabled="true"] > .ic, .menu-item[aria-disabled="true"] .menu-item-label { opacity: .55; }
+.menu-item.is-danger[aria-disabled="true"]:hover, .menu-item.is-danger[aria-disabled="true"][data-active="true"], .menu-item.is-danger[aria-disabled="true"]:focus-visible { background: var(--surface-2); }
+.menu-sep { height: 1px; margin: 2px 4px; background: var(--line); flex: 0 0 auto; }
+
 /* Collapsible (grid-rows trick) */
 .collapse { display: grid; grid-template-rows: 0fr; transition: grid-template-rows var(--t-slow) var(--ease-out); }
 .collapse > * { overflow: hidden; min-height: 0; }

@@ -166,9 +166,13 @@ export interface ProfileCardView {
   hitTitle: string;
   pinLabel: string;
   pinTitle: string;
+  /** The ⋯ button's accessible name. */
+  moreLabel: string;
+  /** Names the action menu. */
+  menuLabel: string;
   removeBlocked: boolean;
-  removeLabel: string;
-  removeTitle: string;
+  /** Why Remove is disabled in the menu, while Xray uses the profile. */
+  removeNote?: string;
 }
 
 const SESSION_BADGE: Record<XraySessionPhase, NonNullable<ProfileCardView["badge"]>> = {
@@ -233,15 +237,20 @@ export function presentProfileCard(profile: ProxyProfile, context: { selectedId?
     hitTitle: insecure ? `${profile.name} · ${address}\n${insecure.text}` : `${profile.name} · ${address}`,
     pinLabel: profile.isPinned ? "Pinned" : "Pin",
     pinTitle: profile.isPinned ? "Pinned: kept when you remove unpinned profiles. Click to unpin." : "Pin to keep it when you remove unpinned profiles",
+    moreLabel: `More actions for ${profile.name}`,
+    menuLabel: `Actions for ${profile.name}`,
     removeBlocked: Boolean(ownSession),
-    removeLabel: ownSession ? `Remove ${profile.name} (disconnect Xray first)` : `Remove ${profile.name}`,
-    removeTitle: ownSession
-      ? ownSession === "connected"
-        ? "Connected now. Disconnect Xray to remove this profile."
-        : "In use by Connect right now. Disconnect Xray to remove this profile."
-      : "Remove profile"
+    removeNote: ownSession ? "Disconnect Xray first" : undefined
   };
 }
+
+/** The inline rename field on a card. */
+export const RENAME_FIELD_COPY = {
+  label: "Profile name",
+  placeholder: "Taken from the link if empty",
+  title: "Enter saves · Esc cancels",
+  help: "Enter saves, Escape cancels."
+} as const;
 
 export interface ToastCopy {
   title: string;
@@ -276,6 +285,46 @@ export function removeBlockedCopy(profile: ProxyProfile, session: XraySession | 
         ? `${profile.name} is carrying your traffic right now. Disconnect on Connect, then remove it.`
         : `${profile.name} is in use by Connect right now. Disconnect on Connect, then remove it.`
   };
+}
+
+// ---------- rename and copy link ----------
+
+export function renameFailedTitle(profile: Pick<ProxyProfile, "name">): string {
+  return `Couldn’t rename ${profile.name}`;
+}
+
+/** Read out once a rename is saved. */
+export function renamedNotice(name: string): string {
+  return `Renamed to ${name}.`;
+}
+
+/**
+ * Toast after Copy link. The link carries the profile's credentials and stays
+ * on the clipboard; a public-list link is free to share anyway.
+ */
+export function copiedLinkCopy(profile: Pick<ProxyProfile, "name" | "source">): ToastCopy {
+  return {
+    title: "Link copied",
+    message:
+      profile.source === "remote"
+        ? `${profile.name} is from the public list.`
+        : `Anyone with the link to ${profile.name} can connect through it, so share it only with people you trust. Your clipboard isn’t cleared automatically.`
+  };
+}
+
+/** Error toast when Copy link fails; a saved link that can't be decrypted gets its own explanation. */
+export function copyLinkFailedCopy(error: unknown): ToastCopy & { details?: string } {
+  const title = "Couldn’t copy the link";
+  const raw = errorText(error).trim();
+  if (/decrypt|secret record is missing|encrypted secret|secure storage|fallback secret/iu.test(raw)) {
+    return {
+      title,
+      message: "Saved links can’t be read after the app folder moves to another PC or the system keychain is reset. Add the link again to replace this profile.",
+      details: raw
+    };
+  }
+  const described = describeError(error);
+  return { title, message: described.message, details: described.technical };
 }
 
 // ---------- results bar, empty states, paging ----------
@@ -628,7 +677,7 @@ export function singleRemoveCopy(profile: ProxyProfile): { title: string; descri
     footnote:
       profile.source === "remote"
         ? "If it’s still in the public list, the next refresh brings it back."
-        : "To get it back, add its link again. Links can’t be viewed or exported after saving."
+        : "To get it back, add its link again. Copy it first with ⋯ → Copy link if you might need it."
   };
 }
 

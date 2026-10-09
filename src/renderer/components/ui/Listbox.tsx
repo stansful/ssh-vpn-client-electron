@@ -79,8 +79,9 @@ interface MenuPosition {
   side: "bottom" | "top";
 }
 
-const MENU_GAP = 6;
-const VIEWPORT_MARGIN = 12;
+// Popover gap from its trigger and inset from the window edges; ActionMenu places itself with them too.
+export const MENU_GAP = 6;
+export const VIEWPORT_MARGIN = 12;
 /**
  * Options rendered per step. A library can hold thousands of Xray profiles;
  * rendering them all would stall the menu on open, so the list grows as it is
