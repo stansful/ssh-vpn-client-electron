@@ -1,11 +1,30 @@
 import { checkGitHubAppUpdate, downloadUpdateAsset } from "../../core/update/github-app-update.js";
 import type { AppStorage } from "../storage/app-storage.js";
 import type { FetchImplementation } from "../../shared/http-fetch.js";
-import type { AppUpdateDownload, AppUpdateInfo, PlatformTarget } from "../../shared/types.js";
+import type { AppUpdateDownload, AppUpdateFormat, AppUpdateInfo, RuntimeArch } from "../../shared/types.js";
 
 const PROGRESS_NOTIFICATION_INTERVAL_MS = 250;
 
-export class PortableUpdateController {
+export interface UpdateCheckOptions {
+  currentVersion: string;
+  /** What replaces this build; undefined where in-app updates aren't offered. */
+  format: AppUpdateFormat | undefined;
+  /**
+   * The architecture to offer: the machine's own. An x64 build translated on
+   * an arm64 Mac or PC (Rosetta, Windows emulation) is offered the arm64 file.
+   */
+  arch: RuntimeArch;
+  /** The running build's architecture, offered when the release lacks `arch`. */
+  buildArch: RuntimeArch;
+  storage: AppStorage;
+  force: boolean;
+}
+
+/**
+ * Finds, downloads and verifies the release file that replaces this build;
+ * installing it stays with the person.
+ */
+export class AppUpdateController {
   private updateInfo: AppUpdateInfo | undefined;
   private updateDownload: AppUpdateDownload = { state: "idle", downloadedBytes: 0 };
   private activeDownload: Promise<void> | undefined;
@@ -26,21 +45,11 @@ export class PortableUpdateController {
     return structuredClone(this.updateDownload);
   }
 
-  async check({
-    currentVersion,
-    platformTarget,
-    storage,
-    force
-  }: {
-    currentVersion: string;
-    platformTarget: PlatformTarget;
-    storage: AppStorage;
-    force: boolean;
-  }): Promise<AppUpdateInfo> {
+  async check(options: UpdateCheckOptions): Promise<AppUpdateInfo> {
     if (this.activeCheck) {
       return this.activeCheck;
     }
-    const operation = this.performCheck({ currentVersion, platformTarget, storage, force });
+    const operation = this.performCheck(options);
     this.activeCheck = operation;
     try {
       return await operation;
@@ -51,26 +60,16 @@ export class PortableUpdateController {
     }
   }
 
-  private async performCheck({
-    currentVersion,
-    platformTarget,
-    storage,
-    force
-  }: {
-    currentVersion: string;
-    platformTarget: PlatformTarget;
-    storage: AppStorage;
-    force: boolean;
-  }): Promise<AppUpdateInfo> {
+  private async performCheck({ currentVersion, format, arch, buildArch, storage, force }: UpdateCheckOptions): Promise<AppUpdateInfo> {
     if (this.activeDownload) {
       await this.activeDownload;
     }
-    if (platformTarget.platform !== "windows") {
+    if (!format) {
       this.updateInfo = {
         available: false,
         currentVersion,
         checkedAt: new Date().toISOString(),
-        message: "Portable auto-update currently targets Windows x64/arm64 assets."
+        message: "In-app updates aren’t available on this system."
       };
       return this.updateInfo;
     }
@@ -78,7 +77,9 @@ export class PortableUpdateController {
     const settings = storage.getSettings();
     let result = await checkGitHubAppUpdate({
       currentVersion,
-      arch: platformTarget.arch,
+      format,
+      arch,
+      fallbackArch: buildArch,
       eTag: settings.updateCheckCache?.eTag,
       force,
       fetchImpl: this.fetchImpl
@@ -89,7 +90,9 @@ export class PortableUpdateController {
       // of turning a still-available update into `available: false` on 304.
       result = await checkGitHubAppUpdate({
         currentVersion,
-        arch: platformTarget.arch,
+        format,
+        arch,
+        fallbackArch: buildArch,
         force: true,
         fetchImpl: this.fetchImpl
       });
@@ -204,5 +207,5 @@ export class PortableUpdateController {
 }
 
 function assetIdentity(asset: AppUpdateInfo["asset"]): string | undefined {
-  return asset ? `${asset.version}:${asset.arch}:${asset.name}:${asset.digest ?? ""}` : undefined;
+  return asset ? `${asset.version}:${asset.format}:${asset.arch}:${asset.name}:${asset.digest ?? ""}` : undefined;
 }

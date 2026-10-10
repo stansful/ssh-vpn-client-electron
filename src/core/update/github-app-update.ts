@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readdir, rename, rm } from "node:fs/promises";
+import { chmod, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { FetchImplementation } from "../../shared/http-fetch.js";
-import type { AppUpdateAsset, AppUpdateInfo, RuntimeArch } from "../../shared/types.js";
+import type { AppUpdateAsset, AppUpdateFormat, AppUpdateInfo, DesktopPlatform, RuntimeArch } from "../../shared/types.js";
 
 const RELEASE_API_URL = "https://api.github.com/repos/stansful/ssh-vpn-client-electron/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX = "https://github.com/stansful/ssh-vpn-client-electron/releases/download/";
@@ -11,7 +11,15 @@ const MAX_RELEASE_RESPONSE_BYTES = 1024 * 1024;
 const MAX_UPDATE_DOWNLOAD_BYTES = 160 * 1024 * 1024;
 const UPDATE_CHECK_TIMEOUT_MS = 30 * 1000;
 const UPDATE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
-const PORTABLE_UPDATE_FILE_PATTERN = /^shadow-ssh-\d+\.\d+\.\d+-windows-portable-(?:x64|arm64)\.exe$/u;
+/**
+ * Every release file this updater downloads, named by the `artifactName`
+ * settings in package.json. electron-builder spells x64 as x86_64 for an
+ * AppImage and as amd64 for a .deb.
+ */
+const UPDATE_FILE_PATTERN =
+  /^shadow-ssh-\d+\.\d+\.\d+-(?:windows-portable-(?:x64|arm64)\.exe|macos-dmg-(?:x64|arm64)\.dmg|linux-portable-(?:x86_64|arm64)\.AppImage|linux-package-(?:amd64|arm64)\.deb)$/u;
+/** `<release file>.<pid>.<uuid>.part`, left behind when the app quit or crashed mid-download. */
+const UPDATE_PART_PATTERN = new RegExp(`${UPDATE_FILE_PATTERN.source.slice(0, -1)}\\.\\d+\\.[0-9a-f-]{36}\\.part$`, "u");
 
 interface GitHubAsset {
   name?: string;
@@ -29,7 +37,11 @@ interface GitHubRelease {
 
 export interface CheckAppUpdateOptions {
   currentVersion: string;
+  format: AppUpdateFormat;
+  /** The architecture to offer first: the machine's own, even for a translated x64 build. */
   arch: RuntimeArch;
+  /** Offered when the release has no file for `arch`: the running build's own architecture. */
+  fallbackArch?: RuntimeArch;
   eTag?: string;
   force?: boolean;
   timeoutMs?: number;
@@ -95,6 +107,7 @@ async function readGitHubAppUpdate(
       info: {
         available: false,
         currentVersion: options.currentVersion,
+        format: options.format,
         checkedAt,
         message: "No release changes since last update check."
       }
@@ -111,7 +124,11 @@ async function readGitHubAppUpdate(
     throw new Error("Latest release tag is not a strict SemVer version.");
   }
 
-  const asset = selectWindowsPortableAsset(release, latestVersion, options.arch);
+  const asset =
+    selectUpdateAsset(release, latestVersion, options.format, options.arch) ??
+    (options.fallbackArch && options.fallbackArch !== options.arch
+      ? selectUpdateAsset(release, latestVersion, options.format, options.fallbackArch)
+      : undefined);
   const comparison = compareSemver(latestVersion, normalizeVersion(options.currentVersion) ?? options.currentVersion);
   if (comparison <= 0) {
     return {
@@ -120,6 +137,7 @@ async function readGitHubAppUpdate(
       info: {
         available: false,
         currentVersion: options.currentVersion,
+        format: options.format,
         latestVersion,
         releaseUrl: release.html_url,
         publishedAt: release.published_at,
@@ -135,11 +153,12 @@ async function readGitHubAppUpdate(
       info: {
         available: false,
         currentVersion: options.currentVersion,
+        format: options.format,
         latestVersion,
         releaseUrl: release.html_url,
         publishedAt: release.published_at,
         checkedAt,
-        message: `Update ${latestVersion} is available, but no Windows ${options.arch} portable asset was found.`
+        message: `Update ${latestVersion} is available, but no ${describeUpdateFile(options.format, options.arch)} was found.`
       }
     };
   }
@@ -150,12 +169,13 @@ async function readGitHubAppUpdate(
     info: {
       available: true,
       currentVersion: options.currentVersion,
+      format: options.format,
       latestVersion,
       releaseUrl: release.html_url,
       publishedAt: release.published_at,
       asset,
       checkedAt,
-      message: `Update ${latestVersion} is available for Windows ${asset.arch}.`
+      message: `Update ${latestVersion} is available for ${UPDATE_FORMAT_OS[asset.format]} ${asset.arch}.`
     }
   };
 }
@@ -172,6 +192,9 @@ export async function downloadUpdateAsset(
     throw new Error("Update asset is larger than the allowed download limit.");
   }
   await mkdir(downloadDirectory, { recursive: true });
+  // Downloads run one at a time in a single app instance, so any partial file
+  // already here is abandoned; freeing it first also makes room for this one.
+  await removeMatchingFiles(downloadDirectory, (name) => UPDATE_PART_PATTERN.test(name)).catch(() => undefined);
   const outputPath = path.join(downloadDirectory, sanitizeFileName(asset.name));
   const temporaryPath = `${outputPath}.${process.pid}.${randomUUID()}.part`;
   const controller = new AbortController();
@@ -246,9 +269,14 @@ export async function downloadUpdateAsset(
         throw new Error("Downloaded update SHA-256 digest does not match the release metadata.");
       }
     }
+    if (asset.format === "linux-appimage") {
+      // An AppImage runs only with the execute bit, which a download lacks.
+      await chmod(temporaryPath, 0o755);
+    }
     await rm(outputPath, { force: true });
     await rename(temporaryPath, outputPath);
-    await removeSupersededUpdateFiles(downloadDirectory, path.basename(outputPath)).catch(() => undefined);
+    const keepFileName = path.basename(outputPath);
+    await removeMatchingFiles(downloadDirectory, (name) => name !== keepFileName && UPDATE_FILE_PATTERN.test(name)).catch(() => undefined);
     return outputPath;
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
@@ -261,11 +289,101 @@ export async function downloadUpdateAsset(
   }
 }
 
-export function selectWindowsPortableAsset(release: GitHubRelease, version: string, arch: RuntimeArch): AppUpdateAsset | undefined {
+const UPDATE_FORMAT_OS: Record<AppUpdateFormat, string> = {
+  "windows-portable": "Windows",
+  "macos-dmg": "macOS",
+  "linux-appimage": "Linux",
+  "linux-deb": "Linux"
+};
+
+/**
+ * The release file kind that replaces this build. On Linux the AppImage
+ * runtime exports APPIMAGE (and APPDIR, its mount point) to the app it
+ * mounted. A .deb build launched from some other AppImage inherits both, but
+ * its execPath then lies outside that APPDIR. APPDIR is built from TMPDIR
+ * verbatim, so it is compared canonically: execPath always is canonical.
+ * An AppImage extracted and started through its AppRun exports nothing, but
+ * AppRun still sits beside the executable, which a .deb install never has.
+ */
+export function resolveUpdateFormat(input: {
+  platform: DesktopPlatform;
+  execPath: string;
+  env: Record<string, string | undefined>;
+  realpath?: (value: string) => string;
+  fileExists?: (value: string) => boolean;
+}): AppUpdateFormat | undefined {
+  switch (input.platform) {
+    case "windows":
+      return "windows-portable";
+    case "macos":
+      return "macos-dmg";
+    case "linux": {
+      const { APPIMAGE: appImage, APPDIR: appDir } = input.env;
+      if (input.fileExists?.(path.posix.join(path.posix.dirname(input.execPath), "AppRun"))) {
+        return "linux-appimage";
+      }
+      if (!appImage) {
+        return "linux-deb";
+      }
+      if (!appDir) {
+        return "linux-appimage";
+      }
+      const canonical = (value: string): string => {
+        const resolved = path.posix.resolve(value);
+        try {
+          return input.realpath?.(resolved) ?? resolved;
+        } catch {
+          return resolved;
+        }
+      };
+      const relative = path.posix.relative(canonical(appDir), canonical(input.execPath));
+      const insideAppDir = relative !== "" && !relative.startsWith("../") && relative !== ".." && !path.posix.isAbsolute(relative);
+      return insideAppDir ? "linux-appimage" : "linux-deb";
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** The release file name for one version, format and architecture. */
+export function updateAssetFileName(version: string, format: AppUpdateFormat, arch: Extract<RuntimeArch, "x64" | "arm64">): string {
+  switch (format) {
+    case "windows-portable":
+      return `shadow-ssh-${version}-windows-portable-${arch}.exe`;
+    case "macos-dmg":
+      return `shadow-ssh-${version}-macos-dmg-${arch}.dmg`;
+    case "linux-appimage":
+      return `shadow-ssh-${version}-linux-portable-${arch === "x64" ? "x86_64" : "arm64"}.AppImage`;
+    case "linux-deb":
+      return `shadow-ssh-${version}-linux-package-${arch === "x64" ? "amd64" : "arm64"}.deb`;
+  }
+}
+
+/** "Windows x64 portable EXE", "macOS arm64 DMG", "Linux x64 AppImage", "Linux arm64 .deb package". */
+export function describeUpdateFile(format: AppUpdateFormat, arch: RuntimeArch): string {
+  const target = `${UPDATE_FORMAT_OS[format]} ${arch}`;
+  switch (format) {
+    case "windows-portable":
+      return `${target} portable EXE`;
+    case "macos-dmg":
+      return `${target} DMG`;
+    case "linux-appimage":
+      return `${target} AppImage`;
+    case "linux-deb":
+      return `${target} .deb package`;
+  }
+}
+
+export function selectUpdateAsset(
+  release: GitHubRelease,
+  version: string,
+  format: AppUpdateFormat,
+  arch: RuntimeArch
+): AppUpdateAsset | undefined {
   if (arch !== "x64" && arch !== "arm64") {
     return undefined;
   }
-  const expected = `shadow-ssh-${version}-windows-portable-${arch}.exe`;
+  const expected = updateAssetFileName(version, format, arch);
   const asset = release.assets?.find((candidate) => candidate.name === expected);
   if (
     !asset?.name ||
@@ -283,6 +401,7 @@ export function selectWindowsPortableAsset(release: GitHubRelease, version: stri
     name: asset.name,
     version,
     arch,
+    format,
     size: Number(asset.size),
     digest: asset.digest,
     downloadUrl: asset.browser_download_url
@@ -365,10 +484,10 @@ async function writeAll(handle: FileHandle, bytes: Buffer): Promise<void> {
   }
 }
 
-async function removeSupersededUpdateFiles(downloadDirectory: string, keepFileName: string): Promise<void> {
+async function removeMatchingFiles(downloadDirectory: string, matches: (name: string) => boolean): Promise<void> {
   const entries = await readdir(downloadDirectory, { withFileTypes: true });
   await Promise.all(entries.map(async (entry) => {
-    if (!entry.isFile() || entry.name === keepFileName || !PORTABLE_UPDATE_FILE_PATTERN.test(entry.name)) {
+    if (!entry.isFile() || !matches(entry.name)) {
       return;
     }
     await rm(path.join(downloadDirectory, entry.name), { force: true });

@@ -204,7 +204,7 @@ export function useSystemToasts(snapshot: AppSnapshot | undefined, toasts: Toast
     toasts.toast({
       id: "update-downloaded",
       tone: "success",
-      ...updateDownloadedCopy(snapshot.updateDownload?.filePath, snapshot.updateInfo?.asset?.name)
+      ...updateDownloadedCopy(snapshot.updateDownload?.filePath, snapshot.updateInfo?.asset?.name, snapshot.updateInfo?.asset?.format)
     });
     // Announced app-wide so a download that finishes on another page is still seen.
   }, [downloadState]);

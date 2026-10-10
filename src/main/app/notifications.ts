@@ -1,5 +1,5 @@
 import { Notification } from "electron";
-import type { AppSettings } from "../../shared/types.js";
+import type { AppSettings, AppUpdateFormat } from "../../shared/types.js";
 
 export interface DesktopNotifierOptions {
   appName: string;
@@ -17,6 +17,8 @@ export interface DesktopNotifierOptions {
 export interface DownloadedUpdateDetails {
   fileName?: string;
   sizeBytes?: number;
+  /** Picks the install step; without it the file is simply run. */
+  format?: AppUpdateFormat;
 }
 
 type NotificationSlot = "tunnel" | "update" | "still-running";
@@ -138,7 +140,7 @@ export class DesktopNotifier {
     const later = { text: "Later" };
     this.show("update", {
       title: `Update ${version} downloaded`,
-      body: `${file ? `${file}. ` : ""}Quit ${this.options.appName}, then run the new file.`,
+      body: `${file ? `${file}. ` : ""}Quit ${this.options.appName}, then ${installStep(details.format, this.options.appName)}.`,
       buttons: reveal ? [reveal, later] : [],
       macButtons: reveal ? [reveal] : [],
       macCloseText: reveal ? "Later" : undefined
@@ -249,4 +251,18 @@ function closeQuietly(notification: Notification): void {
 
 function formatMegabytes(bytes: number): string {
   return `${Math.max(1, Math.round(bytes / (1024 * 1024)))} MB`;
+}
+
+/** What follows "Quit Shadow SSH, then …" for a downloaded update. */
+function installStep(format: AppUpdateFormat | undefined, appName: string): string {
+  switch (format) {
+    case "macos-dmg":
+      return `open the new file and drag ${appName} into Applications`;
+    case "linux-appimage":
+      return "run the new AppImage";
+    case "linux-deb":
+      return "install the new package";
+    default:
+      return "run the new file";
+  }
 }

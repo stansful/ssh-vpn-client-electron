@@ -1,4 +1,4 @@
-import type { AutoConnectNotice, DesktopPlatform, TunnelCheckResult } from "../../shared/types.js";
+import type { AppUpdateFormat, AutoConnectNotice, DesktopPlatform, TunnelCheckResult } from "../../shared/types.js";
 import { formatLatency } from "./format.js";
 import type { ReconnectReasonKind } from "./runtime-message.js";
 
@@ -64,8 +64,9 @@ export function backOnlineCopy(input: { targetName?: string; reason?: ReconnectR
   };
 }
 
-/** "<file> is ready to run." for the Update downloaded toast. */
-export function updateDownloadedCopy(filePath: string | undefined, assetName: string | undefined): NoticeCopy {
+/** "<file> is ready to run." (or "to install" for a DMG or .deb) for the Update downloaded toast. */
+export function updateDownloadedCopy(filePath: string | undefined, assetName: string | undefined, format?: AppUpdateFormat): NoticeCopy {
   const fileName = filePath?.split(/[\\/]/u).pop() || assetName || "The new version";
-  return { title: "Update downloaded", message: `${fileName} is ready to run.` };
+  const step = format === "macos-dmg" || format === "linux-deb" ? "install" : "run";
+  return { title: "Update downloaded", message: `${fileName} is ready to ${step}.` };
 }

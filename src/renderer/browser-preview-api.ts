@@ -10,6 +10,7 @@ import type {
   AppSnapshot,
   AppStore,
   AppUpdateDownload,
+  AppUpdateFormat,
   AppUpdateInfo,
   AttentionEvent,
   AutoConnectNotice,
@@ -117,18 +118,21 @@ class BrowserPreview {
     this.diagnostics = scenario === "empty" ? [] : seedDiagnostics(today);
     this.attention = scenario === "empty" ? [] : seedAttention(today);
     this.fileLog = seedLogFile(today);
+    const update = previewUpdateFile(platform, this.environment.arch === "arm64" ? "arm64" : "x64");
     this.updateInfo = {
       available: true,
       currentVersion: PREVIEW_VERSION,
+      format: update.format,
       latestVersion: "2.3.0",
-      releaseUrl: "https://github.com/stansful/ssh-vpn-client-electron/releases/tag/v2.3.0",
+      releaseUrl: "https://github.com/stansful/ssh-vpn-client-electron/releases/tag/2.3.0",
       publishedAt: new Date(today.getTime() - 26 * HOUR).toISOString(),
       asset: {
-        name: `shadow-ssh-2.3.0-${platform === "macos" ? "macos" : platform === "linux" ? "linux" : "windows"}-portable-x64.exe`,
+        name: update.name,
         version: "2.3.0",
-        arch: "x64",
-        size: 92_000_000,
-        downloadUrl: "https://github.com/stansful/ssh-vpn-client-electron/releases/download/v2.3.0/shadow-ssh-2.3.0-windows-portable-x64.exe"
+        arch: this.environment.arch === "arm64" ? "arm64" : "x64",
+        format: update.format,
+        size: update.size,
+        downloadUrl: `https://github.com/stansful/ssh-vpn-client-electron/releases/download/2.3.0/${update.name}`
       },
       checkedAt: new Date(today.getTime() + 12 * HOUR + 4 * 60_000).toISOString(),
       message: "Shadow SSH 2.3.0 is available."
@@ -986,7 +990,7 @@ class BrowserPreview {
           const downloadedBytes = Math.min(total, this.updateDownload.downloadedBytes + total / 12);
           const done = downloadedBytes >= total;
           this.updateDownload = done
-            ? { state: "downloaded", downloadedBytes: total, totalBytes: total, percent: 100, filePath: `${this.environment.dataDirectory}\\updates\\${this.updateInfo?.asset?.name ?? "update.exe"}` }
+            ? { state: "downloaded", downloadedBytes: total, totalBytes: total, percent: 100, filePath: [this.environment.dataDirectory, "updates", this.updateInfo?.asset?.name ?? "update.exe"].join(this.platform === "windows" ? "\\" : "/") }
             : { state: "downloading", downloadedBytes, totalBytes: total, percent: Math.round((downloadedBytes / total) * 100) };
           this.emit({ type: "update-download-changed", download: this.updateDownload });
           if (!done) {
@@ -1246,6 +1250,17 @@ function dataDirectoryFor(platform: DesktopPlatform): string {
     return "/home/alex/.config/Shadow SSH";
   }
   return "C:\\Users\\alex\\AppData\\Roaming\\Shadow SSH";
+}
+
+/** The release file a real build on this platform would be offered (the Linux preview plays an AppImage build). */
+function previewUpdateFile(platform: DesktopPlatform, arch: "x64" | "arm64"): { format: AppUpdateFormat; name: string; size: number } {
+  if (platform === "macos") {
+    return { format: "macos-dmg", name: `shadow-ssh-2.3.0-macos-dmg-${arch}.dmg`, size: 85_500_000 };
+  }
+  if (platform === "linux") {
+    return { format: "linux-appimage", name: `shadow-ssh-2.3.0-linux-portable-${arch === "x64" ? "x86_64" : "arm64"}.AppImage`, size: 103_000_000 };
+  }
+  return { format: "windows-portable", name: `shadow-ssh-2.3.0-windows-portable-${arch}.exe`, size: 92_000_000 };
 }
 
 function diagnostic(date: Date, level: DiagnosticsEntry["level"], message: string, source: DiagnosticsSource): DiagnosticsEntry {

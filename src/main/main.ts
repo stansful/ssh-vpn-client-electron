@@ -16,6 +16,7 @@ import {
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { AppStorage, StorageUnreadableError } from "./storage/app-storage.js";
 import { listActiveProcesses } from "./processes.js";
@@ -25,6 +26,7 @@ import { createDefaultRuntimeStatus, RUSSIA_INSIDE_PROXY_LIST_URL, RUSSIA_OUTSID
 import { IPC_CHANNELS, type RendererEvent, type ServiceEvent } from "../shared/ipc.js";
 import { parseDomainProxyList } from "../core/routing/domain-proxy-list.js";
 import { recoverWindowsSystemProxy, WindowsSystemProxyManager } from "../core/network/windows-system-proxy.js";
+import { resolveUpdateFormat } from "../core/update/github-app-update.js";
 import { LocalIpcServiceBridge } from "../service/local-ipc-client.js";
 import { defaultServiceEndpoint } from "../service/local-ipc-protocol.js";
 import { NativeProcessServiceBridge } from "../service/native-process-client.js";
@@ -33,7 +35,7 @@ import { XrayServiceBridge } from "../service/xray-service.js";
 import { applicationMenuTemplate } from "./app/app-menu.js";
 import { createMainWindow, fitWindowSize, type CrashPageTunnel } from "./app/main-window.js";
 import { resolveAppDataLayout, resolveUserDataPath, resolveXrayExecutablePath } from "./app/paths.js";
-import { PortableUpdateController } from "./app/portable-update-controller.js";
+import { AppUpdateController } from "./app/app-update-controller.js";
 import { RotatingFileLog } from "./app/rotating-file-log.js";
 import { fetchRoutingListText } from "./app/routing-list-fetch.js";
 import { hasSelectedRoutingTargets, routingMutationAction } from "./app/routing-targets.js";
@@ -213,7 +215,7 @@ const mainLogger = new RotatingFileLog(mainLogPath, {
 });
 const sharedSystemProxy = new WindowsSystemProxyManager({ pacDirectory: routingDataPath });
 const transportMutations = new TransportMutationCoordinator();
-const portableUpdates = new PortableUpdateController(
+const appUpdates = new AppUpdateController(
   updateDownloadPath,
   (download) => {
     broadcast({ type: "update-download-changed", download });
@@ -260,6 +262,13 @@ await writeMainLog(
 );
 
 const platformTarget = createPlatformTarget();
+const updateFormat = resolveUpdateFormat({
+  platform: platformTarget.platform,
+  execPath: process.execPath,
+  env: process.env,
+  realpath: realpathSync.native,
+  fileExists: existsSync
+});
 const appEnvironment: AppEnvironment = createAppEnvironment({
   version: app.getVersion(),
   platform: process.platform,
@@ -999,9 +1008,12 @@ function registerIpcHandlers(): void {
   handleTrustedIpc(IPC_CHANNELS.checkForUpdates, async (_event, force?: boolean) => {
     let update: AppUpdateInfo;
     try {
-      update = await portableUpdates.check({
+      update = await appUpdates.check({
         currentVersion: app.getVersion(),
-        platformTarget,
+        format: updateFormat,
+        // An x64 build under Rosetta or Windows-on-Arm emulation moves to the native arm64 build.
+        arch: app.runningUnderARM64Translation ? "arm64" : platformTarget.arch,
+        buildArch: platformTarget.arch,
         storage,
         force: Boolean(force)
       });
@@ -1011,12 +1023,12 @@ function registerIpcHandlers(): void {
     }
     if (update.available && update.latestVersion && update.latestVersion !== lastAnnouncedUpdateVersion) {
       lastAnnouncedUpdateVersion = update.latestVersion;
-      appendInfo(`Update ${update.latestVersion} is available for ${platformDisplayName()} ${appEnvironment.arch}.`, "update");
+      appendInfo(`Update ${update.latestVersion} is available for ${platformDisplayName()} ${update.asset?.arch ?? appEnvironment.arch}.`, "update");
     }
     return { snapshot: createSnapshot(), update };
   });
   handleTrustedIpc(IPC_CHANNELS.downloadUpdate, async () => {
-    await portableUpdates.downloadSelected();
+    await appUpdates.downloadSelected();
     return createSnapshot();
   });
   handleTrustedIpc(IPC_CHANNELS.revealDownloadedUpdate, () => revealDownloadedUpdate());
@@ -1677,8 +1689,8 @@ function createSnapshot(store: AppStore = storage.getStore()): AppSnapshot {
     tunnelCheckRunning: tunnelChecksInFlight > 0,
     ...(startupFailure ? { startupFailure } : {}),
     ...(autoConnectNotice ? { autoConnect: autoConnectNotice } : {}),
-    updateInfo: portableUpdates.info,
-    updateDownload: portableUpdates.download,
+    updateInfo: appUpdates.info,
+    updateDownload: appUpdates.download,
     storageHealth: { ...storageHealth },
     tunStatus: currentTunStatus(runtime, store.settings),
     environment: appEnvironment
@@ -1940,11 +1952,11 @@ function handleUpdateDownloadChanged(download: AppUpdateDownload): void {
   const previous = previousUpdateDownloadState;
   previousUpdateDownloadState = download.state;
   if (download.state === "downloaded" && previous !== "downloaded") {
-    const version = portableUpdates.info?.asset?.version ?? portableUpdates.info?.latestVersion ?? "";
+    const version = appUpdates.info?.asset?.version ?? appUpdates.info?.latestVersion ?? "";
     const fileName = download.filePath ? path.basename(download.filePath) : undefined;
     appendInfo(`Update ${version} downloaded${fileName ? `: ${fileName}` : ""}.`, "update");
     try {
-      desktopNotifier.notifyUpdateDownloaded(version, { fileName, sizeBytes: download.totalBytes });
+      desktopNotifier.notifyUpdateDownloaded(version, { fileName, sizeBytes: download.totalBytes, format: appUpdates.info?.asset?.format });
     } catch (error) {
       void writeMainLog(`Desktop notification failed: ${formatError(error)}`);
     }
@@ -1954,7 +1966,7 @@ function handleUpdateDownloadChanged(download: AppUpdateDownload): void {
 }
 
 function revealDownloadedUpdate(): boolean {
-  const filePath = portableUpdates.download.filePath;
+  const filePath = appUpdates.download.filePath;
   if (!filePath) {
     return false;
   }

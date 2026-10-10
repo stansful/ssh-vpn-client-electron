@@ -4,6 +4,7 @@ import type {
   AppSnapshot,
   AppStore,
   AppUpdateDownload,
+  AppUpdateFormat,
   AppUpdateInfo,
   CustomTheme,
   DesktopPlatform,
@@ -75,7 +76,7 @@ export interface PlatformCopy {
   /** Launch at sign-in is a Windows feature. */
   signInAvailable: boolean;
   signInDescription: string;
-  /** Only Windows downloads updates inside the app. */
+  /** Updates download inside the app on every known desktop. */
   updatesInApp: boolean;
   notificationsSub: string;
   notificationsHint: string;
@@ -106,7 +107,7 @@ export function platformCopy(platform: DesktopPlatform): PlatformCopy {
     signInDescription: windows
       ? "Starts with Windows straight to the tray, without opening the window. It runs without administrator rights, so TUN stays off: quit from the tray and run Shadow SSH as administrator when you need it."
       : "Available on Windows only.",
-    updatesInApp: windows,
+    updatesInApp: platform !== "unknown",
     notificationsSub: windows
       ? "Windows shows these when something happens while Shadow SSH is out of sight."
       : mac
@@ -120,7 +121,13 @@ export function platformCopy(platform: DesktopPlatform): PlatformCopy {
     stillRunningTitle: `Still running in the ${trayWord}`,
     stillRunningLabel: `Tell me once that Shadow SSH keeps running in the ${trayWord}`,
     stillRunningWhy: `Turn on “Keep running in the ${trayWord}” in General to use this.`,
-    updateNotificationDescription: windows ? "When a new version is ready to run." : "Updates download inside the app on Windows only.",
+    updateNotificationDescription: windows
+      ? "When a new version is ready to run."
+      : mac
+        ? "When a new version is ready to install."
+        : platform === "linux"
+          ? "When a new version finishes downloading."
+          : "Updates don’t download inside the app on this system.",
     successHint: `${windows ? "Protected" : "Proxy ready"} state and passed checks.`,
     fileManager: windows ? "File Explorer" : mac ? "Finder" : "Your file manager"
   };
@@ -361,6 +368,11 @@ export interface UpdatesPresentation {
   latestVersion?: string;
   /** "shadow-ssh-2.3.0-windows-portable-x64.exe · 92 MB". */
   fileLine?: string;
+  /**
+   * The callout once the file is downloaded: how to put it in place of this
+   * build. A .deb also gets a terminal command, shown in place of the path.
+   */
+  installed: { title: string; body: string; command?: string };
   download: {
     state: "idle" | "downloading" | "downloaded" | "failed";
     /** Whole percent, 0–100. */
@@ -440,13 +452,15 @@ export function presentUpdates(input: UpdatesInput): UpdatesPresentation {
   const checked = info ? formatWhen(info.checkedAt, now) : "";
   const checkedSentence = checked ? `Checked ${checked}.` : "";
 
-  if (input.platform !== "windows") {
+  const format = asset?.format ?? info?.format ?? defaultUpdateFormat(input.platform);
+  if (!format) {
     return {
       phase: "unsupported",
-      badge: { text: "Windows only", tone: "outline", dot: false },
-      title: "In-app updates are available on Windows",
+      badge: { text: "Not available", tone: "outline", dot: false },
+      title: "In-app updates aren’t available on this system",
       sub: "Download new versions from GitHub.",
       titleDanger: false,
+      installed: { title: "", body: "" },
       download: { ...download, state: "idle" },
       canDownload: false,
       downloadLabel: "",
@@ -472,6 +486,8 @@ export function presentUpdates(input: UpdatesInput): UpdatesPresentation {
 
   // The newer version stays on screen after a failed re-check: it still exists.
   const offerUpdate = Boolean(asset) && !checking;
+  // An x64 build that runs translated on an arm64 machine is offered the arm64 file.
+  const movesToArm64 = asset?.arch === "arm64" && input.arch === "x64";
   let title: string;
   let sub: string;
   let titleDanger = false;
@@ -495,13 +511,15 @@ export function presentUpdates(input: UpdatesInput): UpdatesPresentation {
       sub = "Shadow SSH looks for updates only when you press Check now.";
       break;
     case "available":
-      title = `Version ${latestVersion} is available for Windows ${asset!.arch}`;
-      sub = checkedSentence;
+      title = `Version ${latestVersion} is available for ${UPDATE_FORMAT_OS[format]} ${asset!.arch}`;
+      sub = `${movesToArm64 ? `${nativeBuildNote(format)} ` : ""}${checkedSentence}`.trim();
       break;
-    case "availableNoAsset":
+    case "availableNoAsset": {
+      const target = input.arch === "unknown" ? `${UPDATE_FORMAT_OS[format]} on this ${UPDATE_FORMAT_DEVICE[format]}` : `${UPDATE_FORMAT_OS[format]} ${input.arch}`;
       title = `Version ${latestVersion} is available`;
-      sub = `It has no portable file for Windows ${input.arch === "unknown" ? "on this PC" : input.arch} yet, so it can’t be downloaded here. ${checkedSentence}`.trim();
+      sub = `It has no ${UPDATE_FORMAT_FILE[format]} for ${target} yet, so it can’t be downloaded here. ${checkedSentence}`.trim();
       break;
+    }
     default:
       title = "You’re on the latest version";
       sub = `${input.currentVersion} is the newest release. ${checkedSentence}`.trim();
@@ -534,10 +552,105 @@ export function presentUpdates(input: UpdatesInput): UpdatesPresentation {
     titleDanger,
     latestVersion: offerUpdate || phase === "availableNoAsset" ? latestVersion : undefined,
     fileLine: offerUpdate && asset ? `${asset.name}${sizeSuffix}` : undefined,
+    installed: installCopy(format, latestVersion ?? "", platformCopy(input.platform).trayWord, download.filePath ?? asset?.name, movesToArm64),
     download: offerUpdate ? download : { ...download, state: downloading ? "downloading" : "idle" },
     canDownload,
     downloadLabel: !canDownload ? "" : downloadState === "failed" ? `Download again${sizeSuffix}` : `Download ${latestVersion}${sizeSuffix}`,
     check,
     navDot: offerUpdate && downloadState !== "downloaded"
   };
+}
+
+const UPDATE_FORMAT_OS: Record<AppUpdateFormat, string> = {
+  "windows-portable": "Windows",
+  "macos-dmg": "macOS",
+  "linux-appimage": "Linux",
+  "linux-deb": "Linux"
+};
+
+const UPDATE_FORMAT_DEVICE: Record<AppUpdateFormat, string> = {
+  "windows-portable": "PC",
+  "macos-dmg": "Mac",
+  "linux-appimage": "computer",
+  "linux-deb": "computer"
+};
+
+const UPDATE_FORMAT_FILE: Record<AppUpdateFormat, string> = {
+  "windows-portable": "portable file",
+  "macos-dmg": "DMG",
+  "linux-appimage": "AppImage",
+  "linux-deb": ".deb package"
+};
+
+/** Why an x64 build is offered the arm64 file: it runs translated on an arm64 machine. */
+function nativeBuildNote(format: AppUpdateFormat): string {
+  return format === "macos-dmg"
+    ? "It’s the Apple silicon build: this copy is the Intel one and runs through Rosetta."
+    : `It’s the Arm64 build, native to this ${UPDATE_FORMAT_DEVICE[format]}: this copy is the x64 one and runs under emulation.`;
+}
+
+/** Before the first check, the file kind is only known per platform; a Linux build reports AppImage or .deb with the check. */
+function defaultUpdateFormat(platform: DesktopPlatform): AppUpdateFormat | undefined {
+  switch (platform) {
+    case "windows":
+      return "windows-portable";
+    case "macos":
+      return "macos-dmg";
+    case "linux":
+      return "linux-appimage";
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * "Downloaded · 2.3.0 is ready to run" and how the downloaded file replaces
+ * this build. `file` is the downloaded path, or the release file name before
+ * the download finishes.
+ */
+function installCopy(
+  format: AppUpdateFormat,
+  version: string,
+  trayWord: string,
+  file: string | undefined,
+  movesToArm64: boolean
+): UpdatesPresentation["installed"] {
+  const lead = `Shadow SSH doesn’t install updates itself. Quit it from the ${trayWord}, then`;
+  const keep = "Your servers, keys and settings stay as they are.";
+  switch (format) {
+    case "macos-dmg":
+      return {
+        title: `Downloaded · ${version} is ready to install`,
+        // The Apple silicon app is a different executable, so the Keychain asks
+        // once before it hands over the key that encrypts saved secrets.
+        body: `${lead} open the downloaded file and drag Shadow SSH into Applications, replacing the old copy. ${keep}${
+          movesToArm64
+            ? " On its first start macOS asks once for your login password so the Apple silicon build can read saved passwords and keys: choose Always Allow."
+            : ""
+        }`
+      };
+    case "linux-appimage":
+      return {
+        title: `Downloaded · ${version} is ready to run`,
+        body: `${lead} run the downloaded AppImage in place of the old one: it’s already marked executable. ${keep}`
+      };
+    case "linux-deb":
+      return {
+        title: `Downloaded · ${version} is ready to install`,
+        body: `${lead} open the downloaded package in your software installer, or install it from a terminal. ${keep}`,
+        // apt reads an argument as a local file only when it is a path (`/…` or `./…`);
+        // quoting keeps the space in "Shadow SSH" inside it.
+        command: file ? `sudo apt install ${shellQuote(file.startsWith("/") ? file : `./${file}`)}` : undefined
+      };
+    default:
+      return {
+        title: `Downloaded · ${version} is ready to run`,
+        body: `${lead} run the downloaded file. ${keep}`
+      };
+  }
+}
+
+/** One POSIX shell word: single-quoted, with any single quote spelled '\''. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }

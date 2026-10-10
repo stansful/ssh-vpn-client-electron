@@ -16,8 +16,8 @@ const BADGE_DOT: Record<UpdatesPresentation["badge"]["tone"], string | undefined
 
 /**
  * Updates: checked only on request, downloaded in the background (never
- * blocks Connect), installed by the person. Windows only; elsewhere it points
- * to GitHub.
+ * blocks Connect), installed by the person. The release file matches the
+ * build: portable EXE, DMG, AppImage or .deb. An unknown OS is pointed to GitHub.
  */
 export function UpdatesSection(): JSX.Element {
   const { snapshot, environment, run, toast, navigate } = useAppData();
@@ -105,6 +105,8 @@ export function UpdatesSection(): JSX.Element {
   const busyBadge = view.badge.tone === "busy";
   const { download: dl } = view;
   const offered = view.fileLine !== undefined;
+  // A .deb shows its install command, which already names the file.
+  const calloutFile = view.installed.command ?? dl.filePath;
 
   return (
     <Card id={sectionElementId("updates")} className="st-section" rise={6} aria-labelledby="st-updates-h" tabIndex={-1}>
@@ -151,7 +153,7 @@ export function UpdatesSection(): JSX.Element {
         ) : (
           <div className="st-compact">
             <Icon icon={Info} size="sm" />
-            <span>In-app updates are available on Windows. Download new versions from GitHub.</span>
+            <span>In-app updates aren’t available on this system. Download new versions from GitHub.</span>
             <LinkButton icon={ExternalLink} onClick={openGitHub}>
               Open GitHub
             </LinkButton>
@@ -173,10 +175,9 @@ export function UpdatesSection(): JSX.Element {
       ) : null}
 
       {offered && dl.state === "downloaded" ? (
-        <Callout tone="ok" icon={Check} title={`Downloaded · ${view.latestVersion} is ready to run`} className="rise">
-          Shadow SSH doesn’t install updates itself. Quit it from the {copy.trayWord}, then run the downloaded file. Your servers, keys and settings stay as they
-          are.
-          {dl.filePath ? <span className="st-file st-callout-file">{dl.filePath}</span> : null}
+        <Callout tone="ok" icon={Check} title={view.installed.title} className="rise">
+          {view.installed.body}
+          {calloutFile ? <span className="st-file st-callout-file">{calloutFile}</span> : null}
         </Callout>
       ) : null}
 

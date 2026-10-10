@@ -235,6 +235,19 @@ describe("desktop notifications", () => {
     expect(onRevealUpdate).toHaveBeenCalledOnce();
   });
 
+  it("says how each downloaded file replaces the running build", () => {
+    const { notifier } = createNotifier();
+
+    notifier.notifyUpdateDownloaded("2.3.0", { format: "macos-dmg" });
+    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then open the new file and drag Shadow SSH into Applications.");
+    notifier.notifyUpdateDownloaded("2.3.0", { format: "linux-appimage" });
+    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then run the new AppImage.");
+    notifier.notifyUpdateDownloaded("2.3.0", { format: "linux-deb" });
+    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then install the new package.");
+    notifier.notifyUpdateDownloaded("2.3.0", { format: "windows-portable" });
+    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then run the new file.");
+  });
+
   it("uses the macOS close button for Later", () => {
     const { notifier } = createNotifier({ platform: "darwin" });
 

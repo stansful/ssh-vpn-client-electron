@@ -65,11 +65,15 @@ describe("platform copy", () => {
     expect(platformCopy("linux").freeMemoryWhy).toBe("Turn on “Keep running in the tray” to use this.");
   });
 
-  it("offers launch at sign-in and in-app updates on Windows only", () => {
+  it("offers launch at sign-in on Windows only and in-app updates on every known desktop", () => {
     expect(platformCopy("windows").signInAvailable).toBe(true);
     expect(platformCopy("macos").signInAvailable).toBe(false);
     expect(platformCopy("linux").signInDescription).toBe("Available on Windows only.");
-    expect(platformCopy("linux").updatesInApp).toBe(false);
+    expect(platformCopy("windows").updatesInApp).toBe(true);
+    expect(platformCopy("macos").updatesInApp).toBe(true);
+    expect(platformCopy("linux").updatesInApp).toBe(true);
+    expect(platformCopy("unknown").updatesInApp).toBe(false);
+    expect(platformCopy("macos").updateNotificationDescription).toBe("When a new version is ready to install.");
     expect(platformCopy("windows").successHint).toBe("Protected state and passed checks.");
     expect(platformCopy("macos").successHint).toBe("Proxy ready state and passed checks.");
   });
@@ -214,20 +218,103 @@ describe("updates presentation", () => {
       name: "shadow-ssh-2.3.0-windows-portable-x64.exe",
       version: "2.3.0",
       arch: "x64",
+      format: "windows-portable",
       size: 92_000_000,
       downloadUrl: "https://github.com/stansful/ssh-vpn-client-electron/releases/download/v2.3.0/shadow-ssh-2.3.0-windows-portable-x64.exe"
     },
+    format: "windows-portable",
     checkedAt: new Date(2026, 9, 6, 12, 4, 0).toISOString(),
     message: "Update 2.3.0 is available for Windows x64."
   };
   const base: UpdatesInput = { platform: "windows", arch: "x64", currentVersion: "2.2.0", checking: false, now };
 
-  it("points macOS and Linux to GitHub", () => {
-    const view = presentUpdates({ ...base, platform: "macos" });
+  it("points an unknown OS to GitHub", () => {
+    const view = presentUpdates({ ...base, platform: "unknown" });
     expect(view.phase).toBe("unsupported");
-    expect(view.badge).toEqual({ text: "Windows only", tone: "outline", dot: false });
+    expect(view.badge).toEqual({ text: "Not available", tone: "outline", dot: false });
     expect(view.canDownload).toBe(false);
     expect(view.navDot).toBe(false);
+
+    expect(presentUpdates({ ...base, platform: "macos" }).phase).toBe("notChecked");
+    expect(presentUpdates({ ...base, platform: "linux" }).phase).toBe("notChecked");
+  });
+
+  it("offers the DMG on macOS and says how to install it", () => {
+    const dmg = "shadow-ssh-2.3.0-macos-dmg-arm64.dmg";
+    const info: AppUpdateInfo = {
+      ...available,
+      format: "macos-dmg",
+      asset: { ...available.asset!, name: dmg, arch: "arm64", format: "macos-dmg", size: 85_500_000 }
+    };
+    const offered = presentUpdates({ ...base, platform: "macos", arch: "arm64", info });
+    expect(offered.phase).toBe("available");
+    expect(offered.title).toBe("Version 2.3.0 is available for macOS arm64");
+    expect(offered.fileLine).toBe(`${dmg} · 85.5 MB`);
+    expect(offered.canDownload).toBe(true);
+
+    // An Intel build under Rosetta is offered the Apple silicon DMG, and told why.
+    const rosetta = presentUpdates({ ...base, platform: "macos", arch: "x64", info });
+    expect(rosetta.title).toBe("Version 2.3.0 is available for macOS arm64");
+    expect(rosetta.sub).toBe("It’s the Apple silicon build: this copy is the Intel one and runs through Rosetta. Checked today at 12:04.");
+    expect(rosetta.installed.body).toContain("macOS asks once for your login password so the Apple silicon build can read saved passwords and keys: choose Always Allow.");
+    const windowsArm = presentUpdates({
+      ...base,
+      info: { ...available, asset: { ...available.asset!, name: "shadow-ssh-2.3.0-windows-portable-arm64.exe", arch: "arm64" } }
+    });
+    expect(windowsArm.sub).toBe("It’s the Arm64 build, native to this PC: this copy is the x64 one and runs under emulation. Checked today at 12:04.");
+
+    const done = presentUpdates({
+      ...base,
+      platform: "macos",
+      arch: "arm64",
+      info,
+      download: { state: "downloaded", downloadedBytes: 85_500_000, totalBytes: 85_500_000, filePath: `/Users/alex/updates/${dmg}` }
+    });
+    expect(done.installed.title).toBe("Downloaded · 2.3.0 is ready to install");
+    expect(done.installed.body).not.toContain("login password");
+    expect(done.installed.body).toBe(
+      "Shadow SSH doesn’t install updates itself. Quit it from the menu bar, then open the downloaded file and drag Shadow SSH into Applications, replacing the old copy. Your servers, keys and settings stay as they are."
+    );
+  });
+
+  it("tells a Linux build how to run an AppImage or install a .deb", () => {
+    const appImage = presentUpdates({
+      ...base,
+      platform: "linux",
+      info: { ...available, format: "linux-appimage", asset: { ...available.asset!, name: "shadow-ssh-2.3.0-linux-portable-x86_64.AppImage", format: "linux-appimage" } }
+    });
+    expect(appImage.title).toBe("Version 2.3.0 is available for Linux x64");
+    expect(appImage.installed.title).toBe("Downloaded · 2.3.0 is ready to run");
+    expect(appImage.installed.body).toContain("Quit it from the tray, then run the downloaded AppImage in place of the old one");
+
+    const debInfo: AppUpdateInfo = {
+      ...available,
+      format: "linux-deb",
+      asset: { ...available.asset!, name: "shadow-ssh-2.3.0-linux-package-amd64.deb", format: "linux-deb" }
+    };
+    const deb = presentUpdates({
+      ...base,
+      platform: "linux",
+      info: debInfo,
+      download: {
+        state: "downloaded",
+        downloadedBytes: 92_000_000,
+        totalBytes: 92_000_000,
+        filePath: "/home/o'neil/.config/Shadow SSH/updates/shadow-ssh-2.3.0-linux-package-amd64.deb"
+      }
+    });
+    expect(deb.installed.title).toBe("Downloaded · 2.3.0 is ready to install");
+    expect(deb.installed.body).toContain("open the downloaded package in your software installer, or install it from a terminal.");
+    // apt needs a path, and the folder name has a space in it.
+    expect(deb.installed.command).toBe("sudo apt install '/home/o'\\''neil/.config/Shadow SSH/updates/shadow-ssh-2.3.0-linux-package-amd64.deb'");
+    expect(presentUpdates({ ...base, platform: "linux", info: debInfo }).installed.command).toBe(
+      "sudo apt install './shadow-ssh-2.3.0-linux-package-amd64.deb'"
+    );
+    expect(appImage.installed.command).toBeUndefined();
+
+    const noDeb = presentUpdates({ ...base, platform: "linux", arch: "arm64", info: { ...available, format: "linux-deb", asset: undefined } });
+    expect(noDeb.phase).toBe("availableNoAsset");
+    expect(noDeb.sub).toBe("It has no .deb package for Linux arm64 yet, so it can’t be downloaded here. Checked today at 12:04.");
   });
 
   it("starts unchecked and shows a busy check", () => {
@@ -275,6 +362,10 @@ describe("updates presentation", () => {
     });
     expect(view.badge).toEqual({ text: "Downloaded", tone: "ok", dot: true });
     expect(view.download).toMatchObject({ state: "downloaded", percent: 100, filePath: "C:\\data\\updates\\x.exe" });
+    expect(view.installed).toEqual({
+      title: "Downloaded · 2.3.0 is ready to run",
+      body: "Shadow SSH doesn’t install updates itself. Quit it from the tray, then run the downloaded file. Your servers, keys and settings stay as they are."
+    });
     expect(view.navDot).toBe(false);
   });
 

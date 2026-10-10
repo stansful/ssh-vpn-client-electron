@@ -336,10 +336,17 @@ export interface RuntimeStatus {
   tunActive?: boolean;
 }
 
+/**
+ * The release file kind that replaces the running build: the Windows portable
+ * EXE, the macOS DMG, the Linux AppImage, or the Linux .deb package.
+ */
+export type AppUpdateFormat = "windows-portable" | "macos-dmg" | "linux-appimage" | "linux-deb";
+
 export interface AppUpdateAsset {
   name: string;
   version: string;
   arch: Extract<RuntimeArch, "x64" | "arm64">;
+  format: AppUpdateFormat;
   size: number;
   digest?: string;
   downloadUrl: string;
@@ -348,6 +355,8 @@ export interface AppUpdateAsset {
 export interface AppUpdateInfo {
   available: boolean;
   currentVersion: string;
+  /** The file kind the check looked for; absent where in-app updates aren't offered. */
+  format?: AppUpdateFormat;
   latestVersion?: string;
   releaseUrl?: string;
   publishedAt?: string;

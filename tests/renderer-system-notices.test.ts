@@ -49,5 +49,14 @@ describe("system notices", () => {
     });
     expect(updateDownloadedCopy(undefined, "shadow-ssh-2.3.0.exe").message).toBe("shadow-ssh-2.3.0.exe is ready to run.");
     expect(updateDownloadedCopy(undefined, undefined).message).toBe("The new version is ready to run.");
+    expect(updateDownloadedCopy("/Users/alex/updates/shadow-ssh-2.3.0-macos-dmg-arm64.dmg", undefined, "macos-dmg").message).toBe(
+      "shadow-ssh-2.3.0-macos-dmg-arm64.dmg is ready to install."
+    );
+    expect(updateDownloadedCopy(undefined, "shadow-ssh-2.3.0-linux-package-amd64.deb", "linux-deb").message).toBe(
+      "shadow-ssh-2.3.0-linux-package-amd64.deb is ready to install."
+    );
+    expect(updateDownloadedCopy(undefined, "shadow-ssh-2.3.0-linux-portable-x86_64.AppImage", "linux-appimage").message).toBe(
+      "shadow-ssh-2.3.0-linux-portable-x86_64.AppImage is ready to run."
+    );
   });
 });
