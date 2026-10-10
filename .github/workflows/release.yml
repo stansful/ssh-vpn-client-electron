@@ -1,0 +1,305 @@
+# Builds all 8 distributables on every push to master whose package.json version
+# has no release yet and publishes them as release "<version>" (plain semver tag
+# on the built commit), which the in-app updater reads via /releases/latest.
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The next master run's gate starts only after this one has published. A newer
+# pending run replaces an older pending one; a running release is never killed,
+# since that can leave a draft behind. Other refs get their own group so a
+# dispatch from a branch cannot cancel a pending master release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  # Exact names src/core/update/github-app-update.ts looks for, after
+  # "shadow-ssh-<version>-".
+  ASSET_SUFFIXES: >-
+    windows-portable-x64.exe windows-portable-arm64.exe
+    macos-dmg-x64.dmg macos-dmg-arm64.dmg
+    linux-portable-x86_64.AppImage linux-portable-arm64.AppImage
+    linux-package-amd64.deb linux-package-arm64.deb
+  # The updater ignores assets above 160 MiB.
+  MAX_ASSET_BYTES: "167772160"
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.gate.outputs.version }}
+      should_release: ${{ steps.gate.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /package.json
+            /.github/scripts/
+          sparse-checkout-cone-mode: false
+
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(jq -r .version package.json)
+          export VERSION
+          state=$(bash .github/scripts/release-state.sh)
+          if [ "$state" = released ]; then
+            echo "::notice title=Release skipped::$VERSION is already released. Bump \"version\" in package.json to publish a new one."
+            should_release=false
+          else
+            should_release=true
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    # DMG and hdiutil exist only on macOS; electron-builder cross-builds the
+    # Windows and Linux packages here without wine.
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+
+      # Not go-version-file: go.mod's toolchain line resolves to 1.24.x, while
+      # the committed service binaries are built with 1.25.
+      # No cache: build-native-service.mjs sets its own GOCACHE.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25"
+          cache: false
+
+      # Only the Electron zips (~780 MB): @electron/get re-checks them against a
+      # freshly downloaded SHASUMS256.txt. Toolsets and GOCACHE hold executables
+      # that are never re-verified, so a poisoned build would persist in them.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/electron
+          key: electron-zips-${{ hashFiles('package-lock.json') }}
+
+      - run: npm ci --no-audit --no-fund
+
+      # Gitignored, and Windows packaging refuses to run without it.
+      - run: |
+          npm run wintun:download
+          npm run wintun:ensure
+
+      - name: Prepare packaging tools
+        run: |
+          # fpm compresses .deb payloads with xz from PATH; nothing bundles it.
+          command -v xz >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install xz
+          # The zstd-19 AppImage wrapper only engages when this toolset is
+          # already cached; otherwise the first (x64) AppImage is ~10 MB larger.
+          ELECTRON_BUILDER_CACHE="$PWD/.cache/electron-builder" node -e '
+            const v = require("./package.json").build.toolsets.appimage;
+            require("app-builder-lib/out/toolsets/linux.js").getAppImageTools(v, 1).then((t) => console.log(t.mksquashfs));
+          '
+          # Spotlight indexing contributes to hdiutil "Resource busy" failures.
+          sudo mdutil -a -i off >/dev/null || true
+
+      - name: Build
+        env:
+          # Without a token electron-builder has no publish provider, so its
+          # implicit "publish on CI" uploads nothing.
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          if npm run build:prod 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          # Hosted macOS runners intermittently fail hdiutil with "Resource busy"
+          # (actions/runner-images#7522) and nothing in electron-builder retries
+          # it. Windows output from the first attempt is still in release/
+          # (prune has not run), so only macOS and Linux are packed again.
+          grep -Eq 'hdiutil.*failed|Resource busy' "$log" || exit 1
+          echo "::warning::hdiutil failed; packing macOS and Linux once more."
+          sync
+          sleep 15
+          rm -rf release/mac release/mac-arm64 release/*.dmg
+          {
+            npm run pack:prod-mac
+            npm run pack:prod-linux
+            npm run verify:prod-artifacts
+            npm run release:prune
+          } 2>&1 | tee -a "$log"
+
+      - name: Check artifacts
+        run: |
+          if grep -q 'uses the default zstd level' "$RUNNER_TEMP/build.log"; then
+            echo "::warning::An AppImage was built without the zstd-19 wrapper and is ~10 MB larger than a local build."
+          fi
+          shopt -s nullglob
+          files=(release/*)
+          if [ "${#files[@]}" -ne 8 ]; then
+            echo "::error::Expected 8 files in release/, found ${#files[@]}."
+            ls -la release
+            exit 1
+          fi
+          for suffix in $ASSET_SUFFIXES; do
+            f="release/shadow-ssh-$VERSION-$suffix"
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing $f."
+              exit 1
+            fi
+            size=$(wc -c < "$f" | tr -d ' ')
+            if [ "$size" -eq 0 ] || [ "$size" -gt "$MAX_ASSET_BYTES" ]; then
+              echo "::error::$f is $size bytes; the updater accepts 1..$MAX_ASSET_BYTES."
+              exit 1
+            fi
+            echo "$size $f"
+          done
+          df -h .
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ needs.check.outputs.version }}
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  # A separate job, so the write token never shares a machine with npm install
+  # scripts or downloaded build tools, and a failed upload can be re-run
+  # without rebuilding.
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # Full history and tags for the notes, without the 400 MB tree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+          sparse-checkout: /.github/scripts/
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ needs.check.outputs.version }}
+          path: release
+
+      # Same body as the hand-made releases: commit subjects since the
+      # previous version tag, newest first.
+      - name: Write release notes
+        run: |
+          prev=$(git tag --merged "$GITHUB_SHA" | { grep -xE '[0-9]+\.[0-9]+\.[0-9]+' || true; } \
+            | { grep -vxF "$VERSION" || true; } | sort -V | tail -n1)
+          git log --no-merges --max-count=200 --pretty=format:%s "${prev:+$prev..}$GITHUB_SHA" > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || echo "Release $VERSION" > "$RUNNER_TEMP/notes.md"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Fresh state, not the gate's: this job may be a re-run days later.
+          state=$(bash .github/scripts/release-state.sh)
+          if [ "$state" = released ]; then
+            echo "::error::$VERSION has already been released by another run."
+            exit 1
+          fi
+
+          # GITHUB_TOKEN cannot create a release on a commit whose workflow
+          # files differ from master's; the newer master run releases instead.
+          git fetch --quiet --no-tags origin master
+          if [ "$(git rev-parse "$GITHUB_SHA:.github/workflows")" != "$(git rev-parse FETCH_HEAD:.github/workflows)" ]; then
+            echo "::error::.github/workflows changed on master after this commit; the newer master run will release $VERSION."
+            exit 1
+          fi
+
+          assets=()
+          for suffix in $ASSET_SUFFIXES; do
+            assets+=("release/shadow-ssh-$VERSION-$suffix")
+          done
+
+          # Drafts have no tag yet. Any draft for this version is a leftover of
+          # a killed run, or this run's own one if it fails before publishing.
+          delete_drafts() {
+            gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft and .tag_name == env.VERSION) | .id' \
+              | while read -r id; do gh api -X DELETE "repos/$GH_REPO/releases/$id" --silent; done
+          }
+          delete_drafts
+          trap '[ -n "${published:-}" ] || delete_drafts' EXIT
+
+          # Draft first: the updater only sees the release once every asset is
+          # uploaded and checked. GitHub creates the lightweight tag on publish.
+          gh release create "$VERSION" "${assets[@]}" --draft \
+            --target "$GITHUB_SHA" \
+            --title "ssh-vpn-client-electron-$VERSION-release" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+
+          id=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft and .tag_name == env.VERSION) | .id')
+          if [ -z "$id" ] || [ "$(wc -l <<<"$id")" -ne 1 ]; then
+            echo "::error::Expected exactly one draft for $VERSION, got: $id"
+            exit 1
+          fi
+
+          gh api "repos/$GH_REPO/releases/$id" \
+            --jq '.assets[] | "\(.name) \(.size) \(.state) \(.digest // "-")"' > "$RUNNER_TEMP/uploaded.txt"
+          if [ "$(wc -l < "$RUNNER_TEMP/uploaded.txt")" -ne 8 ]; then
+            echo "::error::The draft has $(wc -l < "$RUNNER_TEMP/uploaded.txt") assets instead of 8."
+            exit 1
+          fi
+          for f in "${assets[@]}"; do
+            name=$(basename "$f")
+            size="" asset_state="" digest=""
+            read -r _ size asset_state digest < <(awk -v n="$name" '$1 == n' "$RUNNER_TEMP/uploaded.txt") || true
+            if [ "$size" != "$(wc -c < "$f" | tr -d ' ')" ] || [ "$asset_state" != uploaded ]; then
+              echo "::error::$name on the draft does not match the built file (size ${size:-?}, state ${asset_state:-?})."
+              exit 1
+            fi
+            if [ "$digest" = "-" ]; then
+              echo "::warning::GitHub reported no digest for $name."
+            elif [ "$digest" != "sha256:$(sha256sum "$f" | cut -d' ' -f1)" ]; then
+              echo "::error::$name on the draft has digest $digest, which differs from the built file."
+              exit 1
+            fi
+          done
+
+          gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f make_latest=true --silent
+          published=1
+
+          latest=""
+          for _ in 1 2 3 4 5 6; do
+            latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name || true)
+            [ "$latest" = "$VERSION" ] && break
+            sleep 5
+          done
+          if [ "$latest" != "$VERSION" ]; then
+            echo "::error::/releases/latest returns \"$latest\" instead of $VERSION."
+            exit 1
+          fi
+          echo "Released $VERSION: https://github.com/$GH_REPO/releases/tag/$VERSION"
