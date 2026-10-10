@@ -14,7 +14,7 @@ export function keyTypeLabel(type: SshKeyType | undefined): string {
   return KEY_TYPE_LABELS[type ?? "unknown"] ?? KEY_TYPE_LABELS.unknown;
 }
 
-/** Shadow SSH's own key ID, shortened the way lists show it: "sha256:4f1c9e…a92e". */
+/** Shadow's own key ID, shortened the way lists show it: "sha256:4f1c9e…a92e". */
 export function shortKeyId(fingerprint: string): string {
   return fingerprint ? shortenMiddle(fingerprint, 13, 4) : "—";
 }

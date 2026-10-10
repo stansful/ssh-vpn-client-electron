@@ -22,7 +22,7 @@ describe("TUN environment", () => {
     let probed = false;
     const environment = await detectTunEnvironment({
       platform: "darwin",
-      appDirectory: "/Applications/Shadow SSH.app/Contents/MacOS",
+      appDirectory: "/Applications/Shadow.app/Contents/MacOS",
       dataDirectory: "/Users/me/Library/Application Support/Shadow SSH",
       isElevated: async () => {
         probed = true;

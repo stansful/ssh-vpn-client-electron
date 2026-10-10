@@ -112,8 +112,17 @@ const iconPath = app.isPackaged ? path.join(rendererDist, "icon.svg") : path.joi
 const notificationIconPath = path.join(app.isPackaged ? process.resourcesPath : path.join(projectRoot, "resources"), "icons", "icon.png");
 const runtimeFormatOptions = { packaged: app.isPackaged, resourcesPath: process.resourcesPath };
 const trayIconPaths = resolveTrayIconPaths({ packaged: app.isPackaged, projectRoot, resourcesPath: process.resourcesPath });
-const appDisplayName = process.env.SHADOW_SSH_BUILD_CHANNEL === "development" ? "Shadow SSH Dev" : "Shadow SSH";
-const explicitUserDataPath = resolveUserDataPath(appDisplayName);
+const developmentBuild = process.env.SHADOW_SSH_BUILD_CHANNEL === "development";
+/**
+ * The name the OS keys this app's data by, kept from before the rename to
+ * Shadow: it names the data folder and, through app.setName, the
+ * "<name> Safe Storage" Keychain/keyring entry that encrypts saved secrets.
+ * Changing it would orphan both. Mirrors bootstrap.cts.
+ */
+const appSystemName = developmentBuild ? "Shadow SSH Dev" : "Shadow SSH";
+/** The name people see: windows, tray, menus and notifications. */
+const appDisplayName = developmentBuild ? "Shadow Dev" : "Shadow";
+const explicitUserDataPath = resolveUserDataPath(appSystemName);
 const dataLayout = resolveAppDataLayout(explicitUserDataPath);
 const persistedStorePath = dataLayout.storePath;
 const mainLogPath = dataLayout.mainLogPath;
@@ -242,7 +251,11 @@ const terminalOutputBatcher = new TerminalOutputBatcher<GlobalTab>(({ source, li
   }
 });
 
-app.setName(appDisplayName);
+app.setName(appSystemName);
+if (process.platform === "darwin") {
+  // The standard About panel would otherwise fall back to app.name.
+  app.setAboutPanelOptions({ applicationName: appDisplayName });
+}
 if (process.platform === "win32") {
   // Windows attributes toasts to an AppUserModelID; without one (a portable
   // build has no Start-menu shortcut) desktop notifications may never show.
@@ -255,7 +268,7 @@ await ensureExplicitUserDataPath();
 await writeMainLog(`Main module loaded. pid=${process.pid}, platform=${process.platform}, arch=${process.arch}, userData=${explicitUserDataPath}`);
 
 await app.whenReady();
-const applicationMenu = applicationMenuTemplate(process.platform);
+const applicationMenu = applicationMenuTemplate(process.platform, appDisplayName);
 Menu.setApplicationMenu(applicationMenu ? Menu.buildFromTemplate(applicationMenu) : null);
 await writeMainLog(
   `Application ready. packaged=${app.isPackaged}, resourcesPath=${formatRuntimePath(process.resourcesPath)}, dirname=${formatRuntimePath(__dirname)}, electronUserData=${app.getPath("userData")}`
@@ -487,7 +500,7 @@ async function createWindow(): Promise<void> {
   const size = fitWindowSize(PREFERRED_WINDOW_SIZE, MINIMUM_WINDOW_SIZE, screen.getPrimaryDisplay().workAreaSize);
   const creation = createMainWindow({
     ...runtimeFormatOptions,
-    appName: app.getName(),
+    appName: appDisplayName,
     rendererDist,
     preloadPath,
     iconPath,

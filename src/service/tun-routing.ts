@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { DataplaneStartRequest } from "./local-ipc-protocol.js";
 
 /** The adapter's name in Windows network settings. */
+/** Matches the adapter the native service creates (defaultAdapterName in native/service-go). */
 export const TUN_ADAPTER_NAME = "Shadow SSH";
 
 /**

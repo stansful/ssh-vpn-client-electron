@@ -256,7 +256,7 @@ export function presentConnection(input: ConnectionInput): ConnectionPresentatio
       tone: "warn",
       stateWord: "Preview only",
       badge: { text: "Not routing", tone: "warn", spinner: false },
-      description: "Shadow SSH couldn't start its connection core, so Connect shows a preview only. No tunnel is open and your traffic goes direct.",
+      description: "Shadow couldn't start its connection core, so Connect shows a preview only. No tunnel is open and your traffic goes direct.",
       orbLabel: "Tap to stop",
       orbAriaLabel: "Stop this session",
       orbDisabled: false,
@@ -318,7 +318,7 @@ export function presentConnection(input: ConnectionInput): ConnectionPresentatio
     const detail = isGenericStateMessage(runtime.message) || isStartupFailure(runtime.message) ? undefined : runtime.message.trim();
     let description: string;
     if (isStartupFailure(runtime.message)) {
-      description = "Shadow SSH couldn't start its connection core. Try again runs a preview only; quit and reopen Shadow SSH to connect for real.";
+      description = "Shadow couldn't start its connection core. Try again runs a preview only; quit and reopen Shadow to connect for real.";
     } else if (ssh) {
       description = detail ?? `The connection to ${name} stopped and won't retry on its own. Try again, or edit the server.`;
     } else {

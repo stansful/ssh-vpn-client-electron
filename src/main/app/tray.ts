@@ -11,7 +11,7 @@ export interface TrayMenuModel {
   tone: TrayTone;
   /** Header line, e.g. "Protected · SSH · Frankfurt-01" or "Not connected". */
   statusTitle: string;
-  /** Tooltip, e.g. "Shadow SSH — Protected · SSH · Frankfurt-01". */
+  /** Tooltip, e.g. "Shadow — Protected · SSH · Frankfurt-01". */
   tooltip: string;
   primary: { label: string; action: "connect" | "disconnect" | "retry" | "none"; enabled: boolean; sublabel?: string };
   servers: Array<{ kind: TrayServerKind; id: string; label: string; checked: boolean; enabled: boolean; sublabel?: string }>;
@@ -20,7 +20,7 @@ export interface TrayMenuModel {
   switchNote?: string;
   /** e.g. "Run check"; `sublabel` carries the board's hint ("Passed · 184 ms", "Needs a tunnel"). */
   check: { label: string; enabled: boolean; sublabel?: string };
-  /** e.g. "Disconnects the tunnel first" or "Closes Shadow SSH". */
+  /** e.g. "Disconnects the tunnel first" or "Closes Shadow". */
   quitSublabel?: string;
 }
 

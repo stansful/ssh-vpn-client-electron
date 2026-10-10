@@ -99,27 +99,27 @@ export function platformCopy(platform: DesktopPlatform): PlatformCopy {
     osName,
     trayTitle: `Keep running in the ${trayWord} when you close the window`,
     trayDescription: mac
-      ? "Closing the window hides it and the tunnel keeps running. When off, the window closes but Shadow SSH stays open in the Dock."
-      : "Closing the window hides Shadow SSH in the tray and the tunnel keeps running. When off, closing the window quits the app and disconnects.",
+      ? "Closing the window hides it and the tunnel keeps running. When off, the window closes but Shadow stays open in the Dock."
+      : "Closing the window hides Shadow in the tray and the tunnel keeps running. When off, closing the window quits the app and disconnects.",
     freeMemoryDescription: `After 30 seconds hidden in the ${trayWord}, the window is unloaded to save memory. The tunnel keeps running; unsaved form edits are discarded.`,
     freeMemoryWhy: `Turn on “Keep running in the ${trayWord}” to use this.`,
     signInAvailable: windows,
     signInDescription: windows
-      ? "Starts with Windows straight to the tray, without opening the window. It runs without administrator rights, so TUN stays off: quit from the tray and run Shadow SSH as administrator when you need it."
+      ? "Starts with Windows straight to the tray, without opening the window. It runs without administrator rights, so TUN stays off: quit from the tray and run Shadow as administrator when you need it."
       : "Available on Windows only.",
     updatesInApp: platform !== "unknown",
     notificationsSub: windows
-      ? "Windows shows these when something happens while Shadow SSH is out of sight."
+      ? "Windows shows these when something happens while Shadow is out of sight."
       : mac
-        ? "macOS shows these when something happens while Shadow SSH is out of sight."
-        : "Your desktop shows these when something happens while Shadow SSH is out of sight.",
+        ? "macOS shows these when something happens while Shadow is out of sight."
+        : "Your desktop shows these when something happens while Shadow is out of sight.",
     notificationsHint: windows
       ? "Windows Focus assist and its own notification settings still apply on top of these."
       : mac
         ? "macOS Focus and its own notification settings still apply on top of these."
         : "Your desktop’s do-not-disturb mode and its own notification settings still apply on top of these.",
     stillRunningTitle: `Still running in the ${trayWord}`,
-    stillRunningLabel: `Tell me once that Shadow SSH keeps running in the ${trayWord}`,
+    stillRunningLabel: `Tell me once that Shadow keeps running in the ${trayWord}`,
     stillRunningWhy: `Turn on “Keep running in the ${trayWord}” in General to use this.`,
     updateNotificationDescription: windows
       ? "When a new version is ready to run."
@@ -154,13 +154,13 @@ export function secretsCopy(backend: string): SecretsCopy {
     case "Linux keyring":
       return {
         title: "Encrypted with the system keyring",
-        hint: "Without a keyring (common on minimal desktops), Shadow SSH can’t save passwords, keys or Xray links."
+        hint: "Without a keyring (common on minimal desktops), Shadow can’t save passwords, keys or Xray links."
       };
     case "unavailable":
     case "":
       return {
         title: "No secure storage found",
-        hint: "Without a system keyring, Shadow SSH can’t save passwords, keys or Xray links."
+        hint: "Without a system keyring, Shadow can’t save passwords, keys or Xray links."
       };
     default:
       return { title: `Encrypted with ${backend}`, hint: "Passwords, private keys and Xray links are stored encrypted on this computer." };
@@ -508,7 +508,7 @@ export function presentUpdates(input: UpdatesInput): UpdatesPresentation {
       break;
     case "notChecked":
       title = "Not checked yet";
-      sub = "Shadow SSH looks for updates only when you press Check now.";
+      sub = "Shadow looks for updates only when you press Check now.";
       break;
     case "available":
       title = `Version ${latestVersion} is available for ${UPDATE_FORMAT_OS[format]} ${asset!.arch}`;
@@ -615,7 +615,7 @@ function installCopy(
   file: string | undefined,
   movesToArm64: boolean
 ): UpdatesPresentation["installed"] {
-  const lead = `Shadow SSH doesn’t install updates itself. Quit it from the ${trayWord}, then`;
+  const lead = `Shadow doesn’t install updates itself. Quit it from the ${trayWord}, then`;
   const keep = "Your servers, keys and settings stay as they are.";
   switch (format) {
     case "macos-dmg":
@@ -623,7 +623,7 @@ function installCopy(
         title: `Downloaded · ${version} is ready to install`,
         // The Apple silicon app is a different executable, so the Keychain asks
         // once before it hands over the key that encrypts saved secrets.
-        body: `${lead} open the downloaded file and drag Shadow SSH into Applications, replacing the old copy. ${keep}${
+        body: `${lead} open the downloaded file and drag Shadow into Applications, replacing the old copy. ${keep}${
           movesToArm64
             ? " On its first start macOS asks once for your login password so the Apple silicon build can read saved passwords and keys: choose Always Allow."
             : ""
@@ -639,7 +639,7 @@ function installCopy(
         title: `Downloaded · ${version} is ready to install`,
         body: `${lead} open the downloaded package in your software installer, or install it from a terminal. ${keep}`,
         // apt reads an argument as a local file only when it is a path (`/…` or `./…`);
-        // quoting keeps the space in "Shadow SSH" inside it.
+        // quoting keeps the space in the "Shadow SSH" data folder inside it.
         command: file ? `sudo apt install ${shellQuote(file.startsWith("/") ? file : `./${file}`)}` : undefined
       };
     default:

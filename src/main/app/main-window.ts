@@ -324,7 +324,7 @@ export function createCrashPageHtml({ tunnel, detail }: { tunnel: CrashPageTunne
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Shadow SSH</title>
+<title>Shadow</title>
 <style>
 :root {
   color-scheme: dark;

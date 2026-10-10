@@ -1,6 +1,21 @@
-# Shadow SSH Desktop
+# Shadow Desktop
 
-Electron + TypeScript desktop client for `shadow-ssh`.
+Electron + TypeScript desktop client for Shadow (formerly Shadow SSH).
+
+The app is shown as **Shadow**, while its system identity keeps the old name so existing installs keep their data and
+saved secrets: the data folder is still `Shadow SSH` (`%APPDATA%\Shadow SSH`, `~/Library/Application Support/Shadow SSH`,
+`~/.config/Shadow SSH`), `app.setName("Shadow SSH")` keeps the `Shadow SSH Safe Storage` Keychain/keyring entry, and
+the appId, `.deb` package name, Windows TUN adapter, IPC channels, `SHADOW_SSH_*` variables and `shadow-ssh-service`
+are unchanged. Release files keep the `shadow-ssh-<version>-…` names that the in-app updater of older versions looks for.
+
+Upgrading from Shadow SSH 2.4.0 or earlier:
+
+- macOS: the DMG now holds `Shadow.app`, so Finder adds it next to `Shadow SSH.app` instead of replacing it. Quit
+  Shadow SSH, drag Shadow into Applications, move the old `Shadow SSH` app to the Trash and pin Shadow in the Dock
+  again. Servers, keys and saved secrets carry over: both use the same data folder and Keychain entry.
+- Windows: run the new portable `.exe` as before; the file names haven't changed.
+- Linux: the `.deb` package keeps its name, so `apt` upgrades it in place and moves it from `/opt/Shadow SSH` to
+  `/opt/Shadow`. An AppImage is replaced like any other update.
 
 The default app path uses the built-in live SSH service in the Electron main process. It performs real TCP SSH
 connection setup, KEX, host-key fingerprint verification, password/private-key auth, keepalive, direct-tcpip checks,
@@ -139,7 +154,7 @@ npm run build:prod-linux
 `build:prod` rather than running platform commands one after another when all platforms are required.
 
 Runnable-only portable artifacts remain available when installable packages are not needed. Windows gets unpacked
-folder builds with `Shadow SSH.exe` and single-file portable `.exe` files, macOS gets unpacked `.app` bundles, and
+folder builds with `Shadow.exe` and single-file portable `.exe` files, macOS gets unpacked `.app` bundles, and
 Linux gets AppImages.
 
 Windows portable:
@@ -167,7 +182,7 @@ npm run build:portable-win-exe
 ```
 
 The single-file Windows portable `.exe` is convenient to copy, but Electron Builder runs it by self-extracting runtime
-resources to `%TEMP%`. Use `release/win-unpacked/Shadow SSH.exe` or `release/win-arm64-unpacked/Shadow SSH.exe` when
+resources to `%TEMP%`. Use `release/win-unpacked/Shadow.exe` or `release/win-arm64-unpacked/Shadow.exe` when
 that behavior is not acceptable.
 
 macOS portable `.app`:
@@ -219,14 +234,14 @@ Portable and opt-in package commands keep all builder output. Artifact names inc
 example:
 
 ```text
-release/win-unpacked/Shadow SSH.exe
-release/win-arm64-unpacked/Shadow SSH.exe
+release/win-unpacked/Shadow.exe
+release/win-arm64-unpacked/Shadow.exe
 release/shadow-ssh-<version>-windows-portable-x64.exe
 release/shadow-ssh-<version>-windows-portable-arm64.exe
 release/shadow-ssh-<version>-windows-installer-x64.exe
 release/shadow-ssh-<version>-windows-installer-arm64.exe
-release/mac/Shadow SSH.app
-release/mac-arm64/Shadow SSH.app
+release/mac/Shadow.app
+release/mac-arm64/Shadow.app
 release/shadow-ssh-<version>-macos-dmg-x64.dmg
 release/shadow-ssh-<version>-macos-dmg-arm64.dmg
 release/shadow-ssh-<version>-linux-portable-x86_64.AppImage
@@ -293,7 +308,7 @@ Diagnostics are available from the main screen under the Diagnostics panel. The 
 persisted. Logs are reset on a new user Connect action and can be copied with Copy logs.
 
 If the initial state cannot be loaded, the startup screen shows the IPC/preload error and a Retry button instead of
-remaining on `Loading Shadow SSH...`. On Windows, the startup log is `%APPDATA%\Shadow SSH\logs\main.log`; successful
+remaining on `Loading Shadow...`. On Windows, the startup log is `%APPDATA%\Shadow SSH\logs\main.log`; successful
 startup contains `Renderer snapshot IPC handshake completed` and `startupState=ready`.
 
 Diagnostics must not include:
@@ -438,9 +453,9 @@ pinned link is saved as a new profile; Add profile selects it for Connect in pla
 with the same host and ports.
 
 Only `salamander` obfuscation (with `obfs-password`) is supported; other obfuscation types and a malformed
-`pinSHA256` are rejected at import. In `fm` (finalmask JSON), Shadow SSH reads only a `salamander` mask, port hopping
+`pinSHA256` are rejected at import. In `fm` (finalmask JSON), Shadow reads only a `salamander` mask, port hopping
 (`quicParams.udpHop` or a `udphop` mask) and the other `quicParams`; any other UDP mask, including salamander with a
-`packetSize`, is rejected at import. That is Shadow SSH's choice, not a limit of the bundled Xray, which can run masks
+`packetSize`, is rejected at import. That is Shadow's choice, not a limit of the bundled Xray, which can run masks
 such as noise or the header masks. An `ech` value must be a base64 ECHConfigList: the DNS-server forms Xray also
 accepts (`udp://…`, `https://…`) are rejected, because Xray would query that server directly, outside the tunnel. A
 host longer than 253 characters is rejected too.

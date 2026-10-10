@@ -94,20 +94,20 @@ export function Sidebar(): JSX.Element {
   const StatusIcon = STATUS_ICON[status.icon];
 
   return (
-    <aside className="sb" data-collapsed={collapsed ? "true" : "false"} aria-label="Shadow SSH">
+    <aside className="sb" data-collapsed={collapsed ? "true" : "false"} aria-label="Shadow">
       <div className="sb-head">
         <button
           type="button"
           className="sb-mark"
-          aria-label={`Shadow SSH — ${status.title}. Open Connect.`}
-          title={`Shadow SSH — ${status.title}`}
+          aria-label={`Shadow — ${status.title}. Open Connect.`}
+          title={`Shadow — ${status.title}`}
           onClick={() => navigate("connect")}
         >
           <img src="./icon.svg" alt="" />
           <span className={["dot", toneClass(status.tone)].filter(Boolean).join(" ")} aria-hidden="true" />
         </button>
         <div className="sb-brand">
-          <span className="sb-name">Shadow SSH</span>
+          <span className="sb-name">Shadow</span>
           <span className="sb-meta">{meta}</span>
         </div>
         <IconButton

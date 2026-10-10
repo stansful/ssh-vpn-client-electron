@@ -77,7 +77,7 @@ export function PreviewBanner(): JSX.Element | null {
           </DisclosureButton>
         }
       >
-        The connection service didn’t start, so Connect only simulates a session. No tunnel is created and your apps stay on the direct network. Quit and reopen Shadow SSH to try again.
+        The connection service didn’t start, so Connect only simulates a session. No tunnel is created and your apps stay on the direct network. Quit and reopen Shadow to try again.
       </Callout>
       <Collapse open={open} id={detailsId}>
         <div className="stack-sm preview-banner-details">

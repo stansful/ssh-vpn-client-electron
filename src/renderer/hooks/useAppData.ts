@@ -51,7 +51,7 @@ export const AppDataContext = createContext<AppData | null>(null);
 export function useAppData(): AppData {
   const value = useContext(AppDataContext);
   if (!value) {
-    throw new Error("useAppData() must be used inside the Shadow SSH app shell.");
+    throw new Error("useAppData() must be used inside the Shadow app shell.");
   }
   return value;
 }

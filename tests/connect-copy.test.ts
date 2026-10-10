@@ -18,13 +18,13 @@ describe("SSH failure copy", () => {
     ["SSH private key is unavailable.", "No key is attached to Frankfurt-01. Pick a key in the server settings, then try again."],
     [
       "SSH authentication failed: Encrypted OpenSSH private keys are not supported yet. Use an unencrypted OpenSSH key or convert the key to encrypted PKCS8/PEM.",
-      "The key for Frankfurt-01 is a passphrase-protected OpenSSH key, which Shadow SSH can't load yet. Use an unencrypted key or convert it to PKCS8 or PEM."
+      "The key for Frankfurt-01 is a passphrase-protected OpenSSH key, which Shadow can't load yet. Use an unencrypted key or convert it to PKCS8 or PEM."
     ],
     [
       "SSH server fingerprint mismatch: expected SHA256:aaa, got SHA256:bbb.",
       "Frankfurt-01 presented a host key that doesn't match the pinned one. If the server was reinstalled, update the pinned key; otherwise don't connect."
     ],
-    ["Unsupported SSH host key algorithm ssh-dss.", "Frankfurt-01 uses a host key type Shadow SSH can't verify, so it won't connect."]
+    ["Unsupported SSH host key algorithm ssh-dss.", "Frankfurt-01 uses a host key type Shadow can't verify, so it won't connect."]
   ])("explains %s", (message, description) => {
     const copy = describeSshFailure(message, context);
     expect(copy.description).toBe(description);

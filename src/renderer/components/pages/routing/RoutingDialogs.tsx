@@ -113,7 +113,7 @@ function LastTargetDialog({ ctl, open, pending }: { ctl: RoutingController; open
       icon={ShieldAlert}
       iconTone="warn"
       title={undoing ? "Undo the import?" : deleting ? "Delete your last target?" : "Turn off your last target?"}
-      description={`Split tunnel would have nothing left to send. Rather than quietly sending everything direct, Shadow SSH disconnects ${name}.`}
+      description={`Split tunnel would have nothing left to send. Rather than quietly sending everything direct, Shadow disconnects ${name}.`}
       initialFocusRef={keepRef}
       footer={
         <>
@@ -260,7 +260,7 @@ function ImportRulesDialog({ ctl, open, preview }: { ctl: RoutingController; ope
 
       {cut ? (
         <Callout tone="warn" title={`${name} disconnects`}>
-          None of the imported rules are on, so Split tunnel would have nothing to route. Shadow SSH disconnects rather than sending everything
+          None of the imported rules are on, so Split tunnel would have nothing to route. Shadow disconnects rather than sending everything
           direct.
         </Callout>
       ) : null}

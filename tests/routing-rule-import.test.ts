@@ -65,7 +65,7 @@ describe("parseRuleImport", () => {
     expect(() => parseRuleImport("{", file("{"), options())).toThrow(RuleImportError);
     expect(() => parseRuleImport("{", file("{"), options())).toThrow("routing-backup.json isn’t valid JSON, so nothing was imported.");
     expect(() => parse({ hello: "world" })).toThrow("doesn’t contain a list of rules");
-    expect(() => parse(Array.from({ length: 10_001 }, () => ({ type: "domain", value: "a.com" })))).toThrow("Shadow SSH keeps up to 10,000.");
+    expect(() => parse(Array.from({ length: 10_001 }, () => ({ type: "domain", value: "a.com" })))).toThrow("Shadow keeps up to 10,000.");
     expect(() => parseRuleImport("[]", { name: "huge.json", size: MAX_RULE_IMPORT_BYTES + 1 }, options())).toThrow("huge.json is larger than 2 MB.");
   });
 

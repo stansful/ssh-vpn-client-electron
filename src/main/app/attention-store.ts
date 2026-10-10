@@ -136,7 +136,7 @@ export function attentionFromDiagnostic(
       level: "error",
       source: "routing",
       title: "TUN adapter didn’t stop cleanly",
-      message: "Windows may still route traffic through a stale Shadow SSH adapter. If sites don’t load, connect and disconnect once, or restart Windows."
+      message: "Windows may still route traffic through a stale “Shadow SSH” network adapter. If sites don’t load, connect and disconnect once, or restart Windows."
     };
   }
   if (/^Windows proxy restore( after enabling TUN routing)? failed/u.test(message)) {
@@ -145,7 +145,7 @@ export function attentionFromDiagnostic(
       level: "warning",
       source: "routing",
       title: "Couldn’t restore network settings",
-      message: "Windows may still point at the Shadow SSH proxy, so some apps may be offline. Connect once, or turn the proxy off in Windows settings."
+      message: "Windows may still point at the Shadow proxy, so some apps may be offline. Connect once, or turn the proxy off in Windows settings."
     };
   }
   if (/^The tunnel has been down for \d+ s; returning the machine to direct routing/u.test(message)) {
@@ -264,7 +264,7 @@ export function systemProxyRecoveredAttention(): AttentionInput {
     level: "info",
     source: "app",
     title: "Network settings repaired",
-    message: "Shadow SSH didn’t close cleanly last time, so Windows still pointed at its proxy. Direct settings are back."
+    message: "Shadow didn’t close cleanly last time, so Windows still pointed at its proxy. Direct settings are back."
   };
 }
 
@@ -274,7 +274,7 @@ export function systemProxyRecoveryFailedAttention(): AttentionInput {
     level: "warning",
     source: "app",
     title: "Couldn’t repair network settings",
-    message: "Windows still points at an old Shadow SSH proxy, so some apps may be offline. Connect once, or turn the proxy off in Windows settings."
+    message: "Windows still points at an old Shadow proxy, so some apps may be offline. Connect once, or turn the proxy off in Windows settings."
   };
 }
 
@@ -284,7 +284,7 @@ export function storageWriteFailedAttention(reason: string): AttentionInput {
     level: "warning",
     source: "app",
     title: "Couldn’t update your saved data",
-    message: `Your servers, keys and rules loaded fine, but writing them back failed. ${withFinalStop(reason)} Shadow SSH tries again on your next change.`
+    message: `Your servers, keys and rules loaded fine, but writing them back failed. ${withFinalStop(reason)} Shadow tries again on your next change.`
   };
 }
 
@@ -294,7 +294,7 @@ export function storageUnreadableAttention(reason: string): AttentionInput {
     level: "error",
     source: "app",
     title: "Your saved data couldn’t be read",
-    message: `Shadow SSH stopped before changing anything. ${withFinalStop(reason)}`
+    message: `Shadow stopped before changing anything. ${withFinalStop(reason)}`
   };
 }
 

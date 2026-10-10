@@ -50,11 +50,11 @@ export function StartupScreen({ startup, onRetry }: { startup: StartupState; onR
             <span className="splash-ring r2" />
             <img src="./icon.svg" alt="" />
           </div>
-          <p className="splash-name">Shadow SSH</p>
+          <p className="splash-name">Shadow</p>
           <p className="splash-status" aria-live="polite">
             <span className="splash-shimmer">Starting secure services…</span>
           </p>
-          <Progress label="Starting Shadow SSH" className="splash-bar" />
+          <Progress label="Starting Shadow" className="splash-bar" />
           {foot}
         </div>
       </main>
@@ -70,7 +70,7 @@ export function StartupScreen({ startup, onRetry }: { startup: StartupState; onR
           <StatusDot tone="danger" />
         </div>
         <div className="stack-sm" role="alert" style={{ alignItems: "center", textAlign: "center" }}>
-          <h1 className="splash-title">Shadow SSH couldn’t load its state</h1>
+          <h1 className="splash-title">Shadow couldn’t load its state</h1>
           <p className="splash-text">
             {isTimeout(startup.error)
               ? "The background service didn’t send your settings within 10 seconds. It may still be starting."
@@ -91,11 +91,11 @@ export function StartupScreen({ startup, onRetry }: { startup: StartupState; onR
                 .openLogFolder()
                 .then((opened) => {
                   if (!opened) {
-                    toast({ id: "open-logs", tone: "error", title: "Couldn't open the log folder", message: "Look for main.log in the Shadow SSH data folder." });
+                    toast({ id: "open-logs", tone: "error", title: "Couldn't open the log folder", message: "Look for logs/main.log in the “Shadow SSH” data folder." });
                   }
                 })
                 .catch(() => {
-                  toast({ id: "open-logs", tone: "error", title: "Couldn't open the log folder", message: "Look for main.log in the Shadow SSH data folder." });
+                  toast({ id: "open-logs", tone: "error", title: "Couldn't open the log folder", message: "Look for logs/main.log in the “Shadow SSH” data folder." });
                 });
             }}
           >

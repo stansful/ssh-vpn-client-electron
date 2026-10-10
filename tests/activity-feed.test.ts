@@ -185,7 +185,7 @@ describe("copy and labels", () => {
     });
     expect(report).toBe(
       [
-        "Shadow SSH activity, copied 2026-10-06T10:00:00.000Z",
+        "Shadow activity, copied 2026-10-06T10:00:00.000Z",
         "",
         "Needs your attention (1)",
         "[2026-10-06T08:00:00.000Z] WARNING TUN adapter not used. Apps may go direct.",

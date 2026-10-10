@@ -68,11 +68,11 @@ export function TunCard({ ctl }: { ctl: RoutingController }): JSX.Element {
       <Collapse id="rt-how" open={open}>
         <ol className="rt-steps">
           <Step ok={view.dllOk} title={<><Mono>wintun.dll</Mono> is in place</>} badge={view.dllOk ? "Found" : "Missing"}>
-            Put it next to <Mono>Shadow SSH.exe</Mono> or in the app data folder, beside the logs.
-            {snapshot.tunStatus.searchedPaths.length > 0 ? <> Shadow SSH looks in {pathList(snapshot.tunStatus.searchedPaths)}.</> : null}
+            Put it next to <Mono>Shadow.exe</Mono> or in the app data folder, beside the logs.
+            {snapshot.tunStatus.searchedPaths.length > 0 ? <> Shadow looks in {pathList(snapshot.tunStatus.searchedPaths)}.</> : null}
           </Step>
           <Step ok={view.adminOk} title="Running as administrator" badge={view.adminOk ? "Yes" : "No"}>
-            Right-click Shadow SSH and choose <strong>Run as administrator</strong>. Being signed in to Windows as an administrator isn’t the same
+            Right-click Shadow and choose <strong>Run as administrator</strong>. Being signed in to Windows as an administrator isn’t the same
             thing.
           </Step>
           <li className="rt-step">
@@ -217,7 +217,7 @@ export function RunningApps({
       {load.state === "loaded" && chips.length === 0 ? (
         <span className="hint">
           {names.length === 0
-            ? "Shadow SSH couldn’t see any running apps. Type the name above instead."
+            ? "Shadow couldn’t see any running apps. Type the name above instead."
             : `No running app matches “${trimmed}”. Type the name above instead.`}
         </span>
       ) : null}

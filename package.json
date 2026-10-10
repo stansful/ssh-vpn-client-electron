@@ -1,13 +1,13 @@
 {
   "name": "shadow-ssh-desktop",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "private": true,
-  "description": "Desktop client for shadow-ssh with Electron, TypeScript, and a platform-ready service boundary.",
+  "description": "Shadow: desktop SSH and Xray tunnel client built with Electron and TypeScript.",
   "type": "module",
   "main": "dist/main/bootstrap.cjs",
   "desktopName": "shadow-ssh",
   "author": {
-    "name": "shadow-ssh",
+    "name": "Shadow",
     "email": "stansful@gmail.com"
   },
   "homepage": "https://github.com/stansful/ssh-vpn-client-electron",
@@ -133,7 +133,7 @@
   },
   "build": {
     "appId": "app.shadowssh.desktop",
-    "productName": "Shadow SSH",
+    "productName": "Shadow",
     "compression": "maximum",
     "afterPack": "./scripts/after-pack-prune.mjs",
     "afterAllArtifactBuild": "./scripts/convert-dmg-ulmo.mjs",

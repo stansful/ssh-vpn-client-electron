@@ -605,7 +605,7 @@ export function useRoutingController(): RoutingController {
       eyebrow: "Routing",
       tone: "warn",
       title: "Undo the import?",
-      description: `Your previous rules have no enabled target, so Split tunnel would have nothing left to send. Rather than quietly sending everything direct, Shadow SSH disconnects ${name ?? "the tunnel"}.`,
+      description: `Your previous rules have no enabled target, so Split tunnel would have nothing left to send. Rather than quietly sending everything direct, Shadow disconnects ${name ?? "the tunnel"}.`,
       confirmLabel: "Undo and disconnect",
       cancelLabel: "Keep imported rules",
       errorTitle: "Couldn’t disconnect",
@@ -635,7 +635,7 @@ export function useRoutingController(): RoutingController {
       toast({
         tone: "error",
         title: "Nothing to import",
-        message: `${file.name} has no rules Shadow SSH can use.${skipped ? ` ${richTextToString(skipped)}` : ""} Your rules stay as they are.`
+        message: `${file.name} has no rules Shadow can use.${skipped ? ` ${richTextToString(skipped)}` : ""} Your rules stay as they are.`
       });
       return;
     }

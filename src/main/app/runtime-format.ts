@@ -18,7 +18,7 @@ export function createErrorDataUrl(message: string): string {
 <html>
   <head>
     <meta charset="utf-8">
-    <title>Shadow SSH startup error</title>
+    <title>Shadow startup error</title>
     <style>
       :root { color-scheme: dark; }
       body { margin: 0; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: #f5f6f8; background: #0b0d10; }
@@ -30,7 +30,7 @@ export function createErrorDataUrl(message: string): string {
   </head>
   <body>
     <main>
-      <h1>Shadow SSH could not load the UI</h1>
+      <h1>Shadow could not load the UI</h1>
       <p>Check the main process log under the application data directory.</p>
       <pre>${escapeHtml(message)}</pre>
     </main>

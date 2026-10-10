@@ -21,7 +21,7 @@ export function autoConnectCopy(notice: AutoConnectNotice | undefined, now = Dat
   }
   return {
     title: "Connecting automatically",
-    message: `Auto-connect is on, so Shadow SSH is starting ${notice.targetName}.`
+    message: `Auto-connect is on, so Shadow is starting ${notice.targetName}.`
   };
 }
 

@@ -10,7 +10,7 @@ export interface RecordingCardProps {
   onOpenDiagnostics: () => void;
 }
 
-/** What Shadow SSH keeps while it runs: live events and the log file. */
+/** What Shadow keeps while it runs: live events and the log file. */
 export function RecordingCard({ liveOn, fileOn, onLiveChange, onFileChange, onOpenDiagnostics }: RecordingCardProps): JSX.Element {
   const both = liveOn && fileOn;
   const none = !liveOn && !fileOn;
@@ -20,7 +20,7 @@ export function RecordingCard({ liveOn, fileOn, onLiveChange, onFileChange, onOp
         icon={CircleDot}
         title="Recording"
         titleId="ac-rec-title"
-        sub="Choose what Shadow SSH keeps while it runs."
+        sub="Choose what Shadow keeps while it runs."
         tools={
           <Badge tone={both ? "ok" : none ? "neutral" : "warn"} dot>
             {both ? "Recording" : none ? "Off" : "Partly off"}

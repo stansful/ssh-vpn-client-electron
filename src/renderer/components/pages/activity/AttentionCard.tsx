@@ -166,9 +166,9 @@ function AttentionItem({ event, when, animateIn, leaving, onDismiss, navigate }:
             {action?.type === "tun-steps" ? (
               <Collapse open={stepsOpen} id={stepsId}>
                 <ol className="ac-steps">
-                  <li>Quit Shadow SSH from the tray icon. Closing the window only hides it.</li>
+                  <li>Quit Shadow from the tray icon. Closing the window only hides it.</li>
                   <li>
-                    Right-click Shadow SSH and choose <strong>Run as administrator</strong>. Being signed in as an administrator is not the same thing.
+                    Right-click Shadow and choose <strong>Run as administrator</strong>. Being signed in as an administrator is not the same thing.
                   </li>
                   <li>
                     Keep <span className="mono">wintun.dll</span> beside the app’s .exe, or in the app data folder next to the logs.

@@ -25,7 +25,7 @@ const STUCK_PATTERNS: Array<{ pattern: RegExp; detail: string }> = [
   { pattern: /\bECONNREFUSED\b|connection refused/iu, detail: "The server refuses connections on this port." },
   {
     pattern: /no (?:compatible|matching|common) (?:algorithm|cipher|key exchange|host key|mac)|handshake failed: no/iu,
-    detail: "The server and Shadow SSH have no encryption method in common."
+    detail: "The server and Shadow have no encryption method in common."
   },
   { pattern: /host key (?:does not|doesn't) match|host key mismatch|fingerprint mismatch/iu, detail: "The server's host key doesn't match the pinned one." },
   { pattern: /authentication (?:failed|rejected)|permission denied/iu, detail: "The server rejected the sign-in." }
@@ -99,7 +99,7 @@ export function classifyReconnectReason(message: string | undefined, targetName?
   if (/clock[- ]jump|did not run for about|clock changed/iu.test(reason)) {
     return {
       kind: "clock-jump",
-      title: "Shadow SSH was paused for a while",
+      title: "Shadow was paused for a while",
       detail: "The system clock jumped, so the session is checked again from scratch.",
       tone: "info",
       likelyStuck: false,
@@ -119,7 +119,7 @@ export function classifyReconnectReason(message: string | undefined, targetName?
   return {
     kind: "session-lost",
     title: "The session dropped",
-    detail: "Shadow SSH is reconnecting on its own.",
+    detail: "Shadow is reconnecting on its own.",
     tone: "info",
     likelyStuck: false,
     technical: reason || undefined

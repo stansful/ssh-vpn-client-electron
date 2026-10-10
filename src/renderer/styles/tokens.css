@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Shadow SSH — "Night Signal" design tokens (ported from shadow.css)
+   Shadow — "Night Signal" design tokens (ported from shadow.css)
    Dark-first graphite ground, amber signal accent (from the app mark),
    mint for "protected", coral for "needs attention".
    `data-theme` lives on <html>; nested [data-theme] blocks (theme previews)

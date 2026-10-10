@@ -27,7 +27,7 @@ export function AboutSection(): JSX.Element {
         </span>
         <div className="st-about-id">
           <h2 className="st-about-name" id="st-about-h">
-            Shadow SSH
+            Shadow
           </h2>
           <span className="mono muted">
             {environment.version} · {platformArchLabel(environment.platform, environment.arch)}

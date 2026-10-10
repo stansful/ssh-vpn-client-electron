@@ -85,11 +85,11 @@ export function DataRecoveryScreen({ health, onRecovered }: { health: Unreadable
               <div className="stack-sm" role="alert">
                 <span className="eyebrow">Data recovery</span>
                 <h1 className="splash-title">Your saved data couldn’t be read</h1>
-                <p className="splash-text">Shadow SSH found its data file but couldn’t open it, so it stopped before changing anything.</p>
+                <p className="splash-text">Shadow found its data file but couldn’t open it, so it stopped before changing anything.</p>
               </div>
             </div>
             <Callout tone="ok" title="Nothing was overwritten">
-              Your servers, keys, profiles and rules are still in the file. Shadow SSH won’t save anything or auto-connect until you choose.
+              Your servers, keys, profiles and rules are still in the file. Shadow won’t save anything or auto-connect until you choose.
             </Callout>
             <div className="stack-sm">
               <DisclosureButton open={detailsOpen} controls={detailsId} className="recovery-toggle" onClick={() => setDetailsOpen((current) => !current)}>
@@ -114,7 +114,7 @@ export function DataRecoveryScreen({ health, onRecovered }: { health: Unreadable
               <RecoveryOption
                 icon={FolderOpen}
                 title="Open data folder"
-                description="Check the file or put back a copy you trust, then open Shadow SSH again."
+                description="Check the file or put back a copy you trust, then open Shadow again."
                 busy={working === "folder"}
                 disabled={working !== undefined}
                 onClick={openFolder}
@@ -136,7 +136,7 @@ export function DataRecoveryScreen({ health, onRecovered }: { health: Unreadable
                     </>
                   ) : (
                     <>
-                      Renames the file to <span className="mono">{backupNameFor(health.storePath)}</span> and opens Shadow SSH empty. You add servers and rules again.
+                      Renames the file to <span className="mono">{backupNameFor(health.storePath)}</span> and opens Shadow empty. You add servers and rules again.
                     </>
                   )
                 }
@@ -147,7 +147,7 @@ export function DataRecoveryScreen({ health, onRecovered }: { health: Unreadable
               <RecoveryOption
                 icon={LogOut}
                 title="Quit"
-                description="Close Shadow SSH and leave everything as it is."
+                description="Close Shadow and leave everything as it is."
                 busy={working === "quit"}
                 disabled={working !== undefined}
                 onClick={quit}

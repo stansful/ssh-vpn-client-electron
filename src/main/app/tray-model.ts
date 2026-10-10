@@ -44,7 +44,7 @@ export function buildTrayMenuModel(input: TrayModelInput): TrayMenuModel {
       servers: [],
       switchEnabled: false,
       check: { label: "Run check", enabled: false, sublabel: "Needs a tunnel" },
-      quitSublabel: "Closes Shadow SSH"
+      quitSublabel: "Closes Shadow"
     };
   }
 
@@ -123,7 +123,7 @@ export function buildTrayMenuModel(input: TrayModelInput): TrayMenuModel {
     switchEnabled,
     ...(switchNote ? { switchNote } : {}),
     check: checkItem(input),
-    quitSublabel: live ? "Disconnects the tunnel first" : "Closes Shadow SSH"
+    quitSublabel: live ? "Disconnects the tunnel first" : "Closes Shadow"
   };
 }
 

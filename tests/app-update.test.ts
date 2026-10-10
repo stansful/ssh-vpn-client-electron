@@ -93,7 +93,7 @@ describe("app update metadata", () => {
   });
 
   it("matches the update format to the running build", () => {
-    const resolve = (platform: PlatformTarget["platform"], env: Record<string, string> = {}, execPath = "/opt/Shadow SSH/shadow-ssh-desktop") =>
+    const resolve = (platform: PlatformTarget["platform"], env: Record<string, string> = {}, execPath = "/opt/Shadow/shadow-ssh-desktop") =>
       resolveUpdateFormat({ platform, execPath, env });
 
     expect(resolve("windows")).toBe("windows-portable");
@@ -137,7 +137,7 @@ describe("app update metadata", () => {
     const fileExists = (value: string) => value === "/home/alex/squashfs-root/AppRun";
 
     expect(resolveUpdateFormat({ platform: "linux", execPath: "/home/alex/squashfs-root/shadow-ssh-desktop", env: {}, fileExists })).toBe("linux-appimage");
-    expect(resolveUpdateFormat({ platform: "linux", execPath: "/opt/Shadow SSH/shadow-ssh-desktop", env: {}, fileExists })).toBe("linux-deb");
+    expect(resolveUpdateFormat({ platform: "linux", execPath: "/opt/Shadow/shadow-ssh-desktop", env: {}, fileExists })).toBe("linux-deb");
   });
 
   it("names the missing file for each format", () => {

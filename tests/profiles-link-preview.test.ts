@@ -205,10 +205,10 @@ describe("renderer share-link preview", () => {
       return preview.status === "error" ? describeLinkProblem(link, preview.message) : "";
     };
     expect(problem("ss://YWVz@198.51.100.7:8388#home-ss")).toBe(
-      "This is an ss:// (Shadowsocks) link, which Shadow SSH can’t run. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead."
+      "This is an ss:// (Shadowsocks) link, which Shadow can’t run. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead."
     );
     expect(problem("tuic://uuid:pw@198.51.100.7:443#tuic")).toBe(
-      "This is a tuic:// (TUIC) link, which Shadow SSH can’t run. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead."
+      "This is a tuic:// (TUIC) link, which Shadow can’t run. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead."
     );
     expect(problem("vles://id@203.0.113.91:443#jp")).toBe("Looks like a typo: vles:// instead of vless://.");
     expect(problem("hysteira2://pw@203.0.113.91:443#jp")).toBe("Looks like a typo: hysteira2:// instead of hysteria2://.");
@@ -216,7 +216,7 @@ describe("renderer share-link preview", () => {
       "That’s a web address, not a share link. Subscription URLs aren’t supported, so paste the vless://, vmess://, trojan:// or hysteria2:// links themselves."
     );
     expect(problem("hello there")).toBe("This isn’t a share link. Paste one that starts with vless://, vmess://, trojan:// or hysteria2://.");
-    expect(problem("naive://x@y:1")).toBe("naive:// links can’t run in Shadow SSH. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead.");
+    expect(problem("naive://x@y:1")).toBe("naive:// links can’t run in Shadow. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead.");
     expect(problem("vless://u@example.com?type=ws")).toBe("This vless:// link has no server address or a wrong port. Copy it again from your provider.");
     expect(problem("vmess://%%%%")).toBe("This vmess:// link is damaged: its encoded part can’t be read. Copy it again from your provider.");
   });
@@ -227,10 +227,10 @@ describe("renderer share-link preview", () => {
       return preview.status === "error" ? describeLinkProblem(link, preview.message) : "";
     };
     expect(problem("hysteria://hy1.example.com:443?auth=letmein#v1")).toBe(
-      "This is a hysteria:// (Hysteria v1) link, which Shadow SSH can’t run. Hysteria 2 links work, so paste a hysteria2:// or hy2:// link instead."
+      "This is a hysteria:// (Hysteria v1) link, which Shadow can’t run. Hysteria 2 links work, so paste a hysteria2:// or hy2:// link instead."
     );
     expect(problem("hysteria2+realm://token@realm.example.com/room")).toBe(
-      "This is a hysteria2+realm:// (Hysteria 2 Realm) link, which Shadow SSH can’t run. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead."
+      "This is a hysteria2+realm:// (Hysteria 2 Realm) link, which Shadow can’t run. Paste a vless://, vmess://, trojan:// or hysteria2:// link instead."
     );
     expect(problem("hysteria2://letmein@:443#no-host")).toBe("This hysteria2:// link has no server address. Copy it again from your provider.");
     const ports = "link’s ports can’t be read. Ports look like 443 or 443,20000-30000, with at most 64 ranges. Copy it again from your provider.";
@@ -258,12 +258,12 @@ describe("renderer share-link preview", () => {
     expect(problem("hysteria2://letmein@hy.example.com:443?fm=%7Bbroken")).toBe(
       "The fm settings in this link (Xray finalmask JSON) can’t be read. Remove the fm part or copy the link again from your provider."
     );
-    // Shadow SSH's choice: the bundled Xray could run these masks.
+    // Shadow's choice: the bundled Xray could run these masks.
     expect(problem("hysteria2://letmein@hy.example.com:443?fm=%7B%22udp%22%3A%5B%7B%22type%22%3A%22noise%22%7D%5D%7D")).toBe(
-      "The fm settings in this link use noise, which Shadow SSH doesn’t support with Hysteria 2 (only salamander and port hopping). Remove the fm part or ask your provider for another link."
+      "The fm settings in this link use noise, which Shadow doesn’t support with Hysteria 2 (only salamander and port hopping). Remove the fm part or ask your provider for another link."
     );
     expect(problem(`hysteria2://letmein@hy.example.com:443?fm=${FM_PACKET_SIZE}`)).toBe(
-      "The fm settings in this link use a salamander packetSize, which Shadow SSH doesn’t support with Hysteria 2 (only salamander and port hopping). Remove the fm part or ask your provider for another link."
+      "The fm settings in this link use a salamander packetSize, which Shadow doesn’t support with Hysteria 2 (only salamander and port hopping). Remove the fm part or ask your provider for another link."
     );
   });
 
@@ -306,9 +306,9 @@ describe("renderer share-link preview", () => {
       hint: "Looks like a typo: vles:// instead of vless://",
       fix: { from: "vles", to: "vless" }
     });
-    expect(importFailureHint("ss://abc")).toEqual({ hint: "Shadowsocks links can’t run in Shadow SSH." });
+    expect(importFailureHint("ss://abc")).toEqual({ hint: "Shadowsocks links can’t run in Shadow." });
     expect(importFailureHint("hysteria://hy1.example.com:443?auth=x")).toEqual({
-      hint: "Hysteria v1 links can’t run in Shadow SSH. Hysteria 2 links (hysteria2:// or hy2://) work."
+      hint: "Hysteria v1 links can’t run in Shadow. Hysteria 2 links (hysteria2:// or hy2://) work."
     });
     expect(importFailureHint("hysteira2://pw@hy.example.com:443")).toEqual({
       hint: "Looks like a typo: hysteira2:// instead of hysteria2://",

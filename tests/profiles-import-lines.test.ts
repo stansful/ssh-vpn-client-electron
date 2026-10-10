@@ -120,7 +120,7 @@ describe("import report", () => {
         line: 2,
         message: "Only vless://, vmess://, trojan:// and hysteria2:// links are supported.",
         text: HY1,
-        hint: "Hysteria v1 links can’t run in Shadow SSH. Hysteria 2 links (hysteria2:// or hy2://) work.",
+        hint: "Hysteria v1 links can’t run in Shadow. Hysteria 2 links (hysteria2:// or hy2://) work.",
         fix: undefined
       },
       {

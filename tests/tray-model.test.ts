@@ -77,7 +77,7 @@ function runtime(extra: Partial<RuntimeStatus> = {}): RuntimeStatus {
 
 function input(extra: Partial<TrayModelInput> = {}): TrayModelInput {
   return {
-    appName: "Shadow SSH",
+    appName: "Shadow",
     platform: "win32",
     activeTransport: "ssh",
     runtime: runtime(),
@@ -94,11 +94,11 @@ describe("tray menu model", () => {
     expect(model).toMatchObject({
       tone: "off",
       statusTitle: "Not connected · SSH · Frankfurt-01 selected",
-      tooltip: "Shadow SSH — not connected",
+      tooltip: "Shadow — not connected",
       primary: { label: "Connect", action: "connect", enabled: true },
       switchEnabled: true,
       check: { label: "Run check", enabled: false, sublabel: "Needs a tunnel" },
-      quitSublabel: "Closes Shadow SSH"
+      quitSublabel: "Closes Shadow"
     });
     expect(model.switchNote).toBeUndefined();
   });
@@ -162,7 +162,7 @@ describe("tray menu model", () => {
     expect(model).toMatchObject({
       tone: "ok",
       statusTitle: "Protected · SSH · Frankfurt-01",
-      tooltip: "Shadow SSH — protected · SSH · Frankfurt-01",
+      tooltip: "Shadow — protected · SSH · Frankfurt-01",
       primary: { label: "Disconnect", action: "disconnect", enabled: true },
       switchNote: "Picking another one closes the current tunnel first, then connects.",
       check: { label: "Run check", enabled: true, sublabel: "Passed · 184 ms" },
@@ -183,7 +183,7 @@ describe("tray menu model", () => {
     expect(model).toMatchObject({
       tone: "busy",
       statusTitle: "Connecting… · SSH · Frankfurt-01",
-      tooltip: "Shadow SSH — connecting to Frankfurt-01",
+      tooltip: "Shadow — connecting to Frankfurt-01",
       primary: { label: "Connecting…", action: "none", enabled: false, sublabel: "Can’t be cancelled" },
       switchEnabled: false,
       quitSublabel: "Disconnects the tunnel first"
@@ -200,9 +200,9 @@ describe("tray menu model", () => {
     expect(model).toMatchObject({
       tone: "attention",
       statusTitle: "Needs attention · Xray · not-pinned",
-      tooltip: "Shadow SSH — needs attention",
+      tooltip: "Shadow — needs attention",
       primary: { label: "Try again", action: "retry", enabled: true },
-      quitSublabel: "Closes Shadow SSH"
+      quitSublabel: "Closes Shadow"
     });
     // The profile in use stays in the menu even though it is not pinned.
     expect(model.servers.find((server) => server.checked)).toMatchObject({ kind: "xray", id: "np" });

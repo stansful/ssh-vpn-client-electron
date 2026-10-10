@@ -5,7 +5,7 @@ import { formatCount, plural } from "../../../lib/format.js";
 /** Same limits the main process enforces on the rule set. */
 export const MAX_RULE_IMPORT_BYTES = 2 * 1024 * 1024;
 export const MAX_ROUTING_RULES = 10_000;
-export const EXPORT_FILE_NAME = "shadow-ssh-routing-rules.json";
+export const EXPORT_FILE_NAME = "shadow-routing-rules.json";
 
 const RULE_TYPES: readonly RoutingRuleType[] = ["domain", "ip", "process.name"];
 
@@ -18,7 +18,7 @@ export class RuleImportError extends Error {
 }
 
 export interface SkippedEntries {
-  /** Entries whose `type` Shadow SSH doesn't know, e.g. "url". */
+  /** Entries whose `type` Shadow doesn't know, e.g. "url". */
   unsupported: number;
   /** The distinct unknown types, in file order. */
   unsupportedTypes: string[];
@@ -78,7 +78,7 @@ export function parseRuleImport(text: string, file: { name: string; size: number
     throw new RuleImportError(`${file.name} doesn’t contain a list of rules. Use a file made with Export.`);
   }
   if (list.length > MAX_ROUTING_RULES) {
-    throw new RuleImportError(`${file.name} has ${formatCount(list.length)} rules. Shadow SSH keeps up to ${formatCount(MAX_ROUTING_RULES)}.`);
+    throw new RuleImportError(`${file.name} has ${formatCount(list.length)} rules. Shadow keeps up to ${formatCount(MAX_ROUTING_RULES)}.`);
   }
 
   const skipped: SkippedEntries = { unsupported: 0, unsupportedTypes: [], invalid: 0, duplicates: 0, malformed: 0, total: 0 };

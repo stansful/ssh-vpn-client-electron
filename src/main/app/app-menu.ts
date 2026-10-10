@@ -6,14 +6,24 @@ import type { MenuItemConstructorOptions } from "electron";
  * through the menu's Edit and Quit roles. Quit goes through app.quit(), so it
  * runs the same shutdown as the tray's Quit.
  */
-export function applicationMenuTemplate(platform: NodeJS.Platform): MenuItemConstructorOptions[] | null {
+export function applicationMenuTemplate(platform: NodeJS.Platform, appName: string): MenuItemConstructorOptions[] | null {
   if (platform !== "darwin") {
     return null;
   }
+  // The roles would label these with app.name, which stays the pre-rename
+  // system name; the menu bar itself shows the bundle name.
   return [
     {
       role: "appMenu",
-      submenu: [{ role: "about" }, { type: "separator" }, { role: "hide" }, { role: "hideOthers" }, { role: "unhide" }, { type: "separator" }, { role: "quit" }]
+      submenu: [
+        { role: "about", label: `About ${appName}` },
+        { type: "separator" },
+        { role: "hide", label: `Hide ${appName}` },
+        { role: "hideOthers" },
+        { role: "unhide" },
+        { type: "separator" },
+        { role: "quit", label: `Quit ${appName}` }
+      ]
     },
     {
       role: "editMenu",

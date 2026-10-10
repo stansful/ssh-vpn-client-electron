@@ -112,7 +112,7 @@ export function FingerprintField({ id, value, onChange, onReveal, analysis, erro
         </div>
       ) : null}
       <p className="hint" id={hintId}>
-        A pinned server must present this exact key, or Shadow SSH stops instead of retrying. Pinning also helps when DNS fails, say right after {device}{" "}
+        A pinned server must present this exact key, or Shadow stops instead of retrying. Pinning also helps when DNS fails, say right after {device}{" "}
         wakes up: a pinned server can reconnect through its last known IP. Get it on the server with{" "}
         <span className="fm-cmd">ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</span>
       </p>

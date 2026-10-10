@@ -485,7 +485,7 @@ function ServerForm({ request, open, onClose }: { request: ServerFormRequest; op
                   labelAside={keepaliveDefault ? <Badge square>default</Badge> : undefined}
                   error={errors.keepalive}
                   keepHint
-                  hint="How often Shadow SSH checks the server is still there, so quiet sessions don't drop. 60–3600 seconds."
+                  hint="How often Shadow checks the server is still there, so quiet sessions don't drop. 60–3600 seconds."
                 >
                   <div className="fm-row-between">
                     <NumberStepper

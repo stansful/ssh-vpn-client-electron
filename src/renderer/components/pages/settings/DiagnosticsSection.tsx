@@ -17,7 +17,7 @@ export function DiagnosticsSection({ settings, save }: { settings: AppSettings; 
         titleId="st-diagnostics-h"
         icon={Activity}
         title="Diagnostics"
-        sub="What Shadow SSH records for Activity and for bug reports."
+        sub="What Shadow records for Activity and for bug reports."
         tools={
           <Badge tone={state.badge.tone} dot>
             {state.badge.text}
@@ -30,7 +30,7 @@ export function DiagnosticsSection({ settings, save }: { settings: AppSettings; 
           <SettingToggle
             title="Keep activity history"
             label="Keep activity history"
-            description="Lets Shadow SSH record what the tunnel does, so you can look back in Activity when something goes wrong."
+            description="Lets Shadow record what the tunnel does, so you can look back in Activity when something goes wrong."
             checked={state.historyOn}
             onCheckedChange={(checked) => save(historyPatch(checked))}
           />

@@ -1,7 +1,7 @@
 import type { ShadowSshApi } from "../shared/ipc.js";
 import { createBrowserPreviewApi } from "./browser-preview-api.js";
 
-const missingPreloadMessage = "Shadow SSH preload API is unavailable. Restart the packaged application and check main.log.";
+const missingPreloadMessage = "Shadow preload API is unavailable. Restart the packaged application and check main.log.";
 
 export const api: ShadowSshApi = window.shadowSsh ?? (import.meta.env.DEV ? createBrowserPreviewApi() : createMissingPreloadApi());
 

@@ -132,7 +132,7 @@ describe("TUN status", () => {
 
 describe("app data layout", () => {
   it("keeps storage, logs, routing, xray and updates inside the data folder", () => {
-    const root = path.join("/data", "Shadow SSH");
+    const root = path.join("/data", "Shadow");
     expect(resolveAppDataLayout(root)).toEqual({
       dataDirectory: root,
       storageDirectory: path.join(root, "storage"),

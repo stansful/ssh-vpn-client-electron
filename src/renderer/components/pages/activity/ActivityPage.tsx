@@ -227,7 +227,7 @@ export function ActivityPage(): JSX.Element {
       <PageHeader
         eyebrow="App"
         title="Activity"
-        sub="What the tunnel did and why: live events from this connection, plus the log file Shadow SSH keeps on disk."
+        sub="What the tunnel did and why: live events from this connection, plus the log file Shadow keeps on disk."
         className="ac-topbar"
         actions={
           <>

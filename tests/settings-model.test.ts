@@ -273,7 +273,7 @@ describe("updates presentation", () => {
     expect(done.installed.title).toBe("Downloaded · 2.3.0 is ready to install");
     expect(done.installed.body).not.toContain("login password");
     expect(done.installed.body).toBe(
-      "Shadow SSH doesn’t install updates itself. Quit it from the menu bar, then open the downloaded file and drag Shadow SSH into Applications, replacing the old copy. Your servers, keys and settings stay as they are."
+      "Shadow doesn’t install updates itself. Quit it from the menu bar, then open the downloaded file and drag Shadow into Applications, replacing the old copy. Your servers, keys and settings stay as they are."
     );
   });
 
@@ -364,7 +364,7 @@ describe("updates presentation", () => {
     expect(view.download).toMatchObject({ state: "downloaded", percent: 100, filePath: "C:\\data\\updates\\x.exe" });
     expect(view.installed).toEqual({
       title: "Downloaded · 2.3.0 is ready to run",
-      body: "Shadow SSH doesn’t install updates itself. Quit it from the tray, then run the downloaded file. Your servers, keys and settings stay as they are."
+      body: "Shadow doesn’t install updates itself. Quit it from the tray, then run the downloaded file. Your servers, keys and settings stay as they are."
     });
     expect(view.navDot).toBe(false);
   });

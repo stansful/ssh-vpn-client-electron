@@ -4,8 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import { acquireSingleInstanceLock } from "./app/single-instance.cjs";
 
-const appDisplayName = process.env.SHADOW_SSH_BUILD_CHANNEL === "development" ? "Shadow SSH Dev" : "Shadow SSH";
-const explicitUserDataPath = resolveUserDataPath(appDisplayName);
+const developmentBuild = process.env.SHADOW_SSH_BUILD_CHANNEL === "development";
+/**
+ * Kept from before the rename to Shadow. Electron names the Keychain/keyring
+ * entry that encrypts saved secrets "<app name> Safe Storage" from the name
+ * set here, before the app is ready, and the data folder carries it too.
+ * Mirrors main.ts.
+ */
+const appSystemName = developmentBuild ? "Shadow SSH Dev" : "Shadow SSH";
+const appDisplayName = developmentBuild ? "Shadow Dev" : "Shadow";
+const explicitUserDataPath = resolveUserDataPath(appSystemName);
 const persistedStorePath = path.join(explicitUserDataPath, "storage", "app-store.v1.json");
 const primaryLogPath = path.join(explicitUserDataPath, "logs", "main.log");
 const bootstrapLoggingEnabled = readPersistedLoggingEnabled();
@@ -14,7 +22,7 @@ registerCrashLogging();
 
 let primaryInstance = false;
 try {
-  app.setName(appDisplayName);
+  app.setName(appSystemName);
   ensureUserDataPath();
   primaryInstance = acquireSingleInstanceLock(app, { userDataPath: explicitUserDataPath });
   if (primaryInstance) {

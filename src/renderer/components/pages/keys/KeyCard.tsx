@@ -56,7 +56,7 @@ export function KeyCard({ sshKey, users, index, leaving, nudge, onEdit, onDelete
               <Tooltip
                 align="end"
                 className="ky-tip"
-                content="Shadow SSH’s own ID for the saved key text — not the OpenSSH fingerprint. It changes only when you replace the key."
+                content="Shadow’s own ID for the saved key text — not the OpenSSH fingerprint. It changes only when you replace the key."
               >
                 <button type="button" className="help-tip-btn" aria-label="What is the Key ID?">
                   <Icon icon={Info} />

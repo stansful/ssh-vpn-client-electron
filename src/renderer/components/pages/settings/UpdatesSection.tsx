@@ -115,7 +115,7 @@ export function UpdatesSection(): JSX.Element {
         titleId="st-updates-h"
         icon={Package}
         title="Updates"
-        sub="Shadow SSH checks GitHub only when you ask and never installs anything on its own."
+        sub="Shadow checks GitHub only when you ask and never installs anything on its own."
         tools={
           <span className={cx("badge", view.badge.tone === "outline" ? "t-outline" : `t-${view.badge.tone}`)}>
             {busyBadge ? <Spinner size="md" /> : view.badge.dot ? <span className={cx("dot", BADGE_DOT[view.badge.tone])} aria-hidden="true" /> : null}

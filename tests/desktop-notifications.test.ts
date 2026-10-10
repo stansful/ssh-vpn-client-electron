@@ -62,7 +62,7 @@ function createNotifier({
   const onStopReconnecting = vi.fn();
   const onRevealUpdate = vi.fn();
   const notifier = new DesktopNotifier({
-    appName: "Shadow SSH",
+    appName: "Shadow",
     iconPath: "/resources/icons/icon.png",
     platform: "win32",
     getSettings: () => ({ ...DEFAULT_SETTINGS, ...settings }),
@@ -84,10 +84,10 @@ describe("desktop notifications", () => {
     const notification = lastNotification();
     expect(notification.options).toMatchObject({
       title: "Reconnecting to Frankfurt-01…",
-      body: "The session dropped, so Shadow SSH is trying again.",
+      body: "The session dropped, so Shadow is trying again.",
       icon: "/resources/icons/icon.png",
       actions: [
-        { type: "button", text: "Open Shadow SSH" },
+        { type: "button", text: "Open Shadow" },
         { type: "button", text: "Stop reconnecting" }
       ]
     });
@@ -208,7 +208,7 @@ describe("desktop notifications", () => {
     expect(lastNotification().options).toMatchObject({
       title: "Stopped reconnecting to Frankfurt-01",
       body: "Frankfurt-01 rejected the password.",
-      actions: [{ type: "button", text: "Open Shadow SSH" }]
+      actions: [{ type: "button", text: "Open Shadow" }]
     });
   });
 
@@ -223,7 +223,7 @@ describe("desktop notifications", () => {
     const notification = lastNotification();
     expect(notification.options).toMatchObject({
       title: "Update 2.3.0 downloaded",
-      body: "shadow-ssh-2.3.0-windows-portable-x64.exe · 92 MB. Quit Shadow SSH, then run the new file.",
+      body: "shadow-ssh-2.3.0-windows-portable-x64.exe · 92 MB. Quit Shadow, then run the new file.",
       actions: [
         { type: "button", text: "Show in folder" },
         { type: "button", text: "Later" }
@@ -239,13 +239,13 @@ describe("desktop notifications", () => {
     const { notifier } = createNotifier();
 
     notifier.notifyUpdateDownloaded("2.3.0", { format: "macos-dmg" });
-    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then open the new file and drag Shadow SSH into Applications.");
+    expect(lastNotification().options.body).toBe("Quit Shadow, then open the new file and drag Shadow into Applications.");
     notifier.notifyUpdateDownloaded("2.3.0", { format: "linux-appimage" });
-    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then run the new AppImage.");
+    expect(lastNotification().options.body).toBe("Quit Shadow, then run the new AppImage.");
     notifier.notifyUpdateDownloaded("2.3.0", { format: "linux-deb" });
-    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then install the new package.");
+    expect(lastNotification().options.body).toBe("Quit Shadow, then install the new package.");
     notifier.notifyUpdateDownloaded("2.3.0", { format: "windows-portable" });
-    expect(lastNotification().options.body).toBe("Quit Shadow SSH, then run the new file.");
+    expect(lastNotification().options.body).toBe("Quit Shadow, then run the new file.");
   });
 
   it("uses the macOS close button for Later", () => {
@@ -254,7 +254,7 @@ describe("desktop notifications", () => {
     notifier.notifyUpdateDownloaded("2.3.0");
 
     expect(lastNotification().options).toMatchObject({
-      body: "Quit Shadow SSH, then run the new file.",
+      body: "Quit Shadow, then run the new file.",
       actions: [{ type: "button", text: "Show in folder" }],
       closeButtonText: "Later"
     });
@@ -288,7 +288,7 @@ describe("desktop notifications", () => {
 
     expect(notifier.notifyStillRunningInTray()).toBe(true);
     expect(lastNotification().options).toMatchObject({
-      title: "Shadow SSH is still running",
+      title: "Shadow is still running",
       body: "Closing the window keeps the tunnel on. To exit, right-click the tray icon and choose Quit."
     });
     lastNotification().emit("click");
@@ -305,7 +305,7 @@ describe("desktop notifications", () => {
     notifier.notifyStillRunningInTray();
 
     expect(lastNotification().options.body).toBe(
-      "Closing the window keeps the tunnel on. To exit, click the Shadow SSH icon in the menu bar and choose Quit."
+      "Closing the window keeps the tunnel on. To exit, click the Shadow icon in the menu bar and choose Quit."
     );
   });
 

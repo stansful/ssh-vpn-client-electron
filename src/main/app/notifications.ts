@@ -253,7 +253,7 @@ function formatMegabytes(bytes: number): string {
   return `${Math.max(1, Math.round(bytes / (1024 * 1024)))} MB`;
 }
 
-/** What follows "Quit Shadow SSH, then …" for a downloaded update. */
+/** What follows "Quit Shadow, then …" for a downloaded update. */
 function installStep(format: AppUpdateFormat | undefined, appName: string): string {
   switch (format) {
     case "macos-dmg":

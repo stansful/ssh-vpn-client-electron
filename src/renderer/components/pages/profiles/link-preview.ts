@@ -145,7 +145,7 @@ const SCHEME_NAMES: Record<string, string> = {
 };
 
 /** Hysteria v1 is the one close miss with a working sibling; say so instead of only "can't run". */
-const HYSTERIA_V1_HINT = "Hysteria v1 links can’t run in Shadow SSH. Hysteria 2 links (hysteria2:// or hy2://) work.";
+const HYSTERIA_V1_HINT = "Hysteria v1 links can’t run in Shadow. Hysteria 2 links (hysteria2:// or hy2://) work.";
 
 /** A likely typo of a supported scheme ("vles" → "vless"), when there is exactly one close match. */
 export function suggestScheme(raw: string): { from: string; to: (typeof SUPPORTED_SCHEMES)[number] } | undefined {
@@ -192,12 +192,12 @@ export function describeLinkProblem(raw: string, message: string): string {
       return `That’s a web address, not a share link. Subscription URLs aren’t supported, so paste the ${LINK_SCHEMES_TEXT} links themselves.`;
     }
     if (scheme === "hysteria") {
-      return "This is a hysteria:// (Hysteria v1) link, which Shadow SSH can’t run. Hysteria 2 links work, so paste a hysteria2:// or hy2:// link instead.";
+      return "This is a hysteria:// (Hysteria v1) link, which Shadow can’t run. Hysteria 2 links work, so paste a hysteria2:// or hy2:// link instead.";
     }
     const name = SCHEME_NAMES[scheme];
     return name
-      ? `This is ${/^(ss|[aeiou])/u.test(scheme) ? "an" : "a"} ${scheme}:// (${name}) link, which Shadow SSH can’t run. Paste a ${LINK_SCHEMES_TEXT} link instead.`
-      : `${scheme}:// links can’t run in Shadow SSH. Paste a ${LINK_SCHEMES_TEXT} link instead.`;
+      ? `This is ${/^(ss|[aeiou])/u.test(scheme) ? "an" : "a"} ${scheme}:// (${name}) link, which Shadow can’t run. Paste a ${LINK_SCHEMES_TEXT} link instead.`
+      : `${scheme}:// links can’t run in Shadow. Paste a ${LINK_SCHEMES_TEXT} link instead.`;
   }
   if (/^Invalid VMess base64 JSON payload\.$/u.test(message)) {
     return "This vmess:// link is damaged: its encoded part can’t be read. Copy it again from your provider.";
@@ -233,9 +233,9 @@ export function describeLinkProblem(raw: string, message: string): string {
   }
   const mask = /^Unsupported Hysteria 2 finalmask type: (.+)\.$/u.exec(message);
   if (mask) {
-    // A choice of Shadow SSH, not a limit of the bundled Xray: it reads only these two from fm.
+    // A choice of Shadow, not a limit of the bundled Xray: it reads only these two from fm.
     const what = mask[1] === "salamander with packetSize" ? "a salamander packetSize" : mask[1];
-    return `The fm settings in this link use ${what}, which Shadow SSH doesn’t support with Hysteria 2 (only salamander and port hopping). Remove the fm part or ask your provider for another link.`;
+    return `The fm settings in this link use ${what}, which Shadow doesn’t support with Hysteria 2 (only salamander and port hopping). Remove the fm part or ask your provider for another link.`;
   }
   if (message === HYSTERIA2_FINALMASK_MESSAGE) {
     return "The fm settings in this link (Xray finalmask JSON) can’t be read. Remove the fm part or copy the link again from your provider.";
@@ -272,7 +272,7 @@ export function importFailureHint(line: string): { hint: string; fix?: { from: s
     return { hint: HYSTERIA_V1_HINT };
   }
   const name = scheme ? SCHEME_NAMES[scheme] : undefined;
-  return name ? { hint: `${name} links can’t run in Shadow SSH.` } : undefined;
+  return name ? { hint: `${name} links can’t run in Shadow.` } : undefined;
 }
 
 // ---------- mirrored parser ----------

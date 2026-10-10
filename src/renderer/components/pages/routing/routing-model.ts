@@ -465,7 +465,7 @@ export function describeListError(error: string, kind: ListKind, list: DomainLis
   if (/timed out|\btimeout\b|ETIMEDOUT|ERR_TIMED_OUT/iu.test(raw)) {
     reason = `GitHub didn’t answer within 15 s.${NETWORK_NOTE}`;
   } else if (/fetch failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ENETUNREACH|net::ERR_|socket hang up/iu.test(raw)) {
-    reason = `Shadow SSH couldn’t reach GitHub.${NETWORK_NOTE}`;
+    reason = `Shadow couldn’t reach GitHub.${NETWORK_NOTE}`;
   } else if (status) {
     const text = status[2]?.trim();
     reason = `GitHub answered ${status[1]}${text ? ` ${text}` : ""}. Try again in a few minutes.`;
@@ -474,7 +474,7 @@ export function describeListError(error: string, kind: ListKind, list: DomainLis
   } else if (/returned no domains/iu.test(raw)) {
     reason = "The download didn’t contain any domains.";
   } else if (/larger than \d+ entries/iu.test(raw)) {
-    reason = "The list has more than 20,000 domains, the most Shadow SSH can use.";
+    reason = "The list has more than 20,000 domains, the most Shadow can use.";
   } else {
     reason = sentence(raw || "The download failed.");
   }
@@ -532,7 +532,7 @@ export interface TunView {
   howLabel: string;
 }
 
-const NOT_ADMIN = "Shadow SSH isn’t running as administrator";
+const NOT_ADMIN = "Shadow isn’t running as administrator";
 const NO_WINTUN = "wintun.dll wasn’t found";
 const FALLBACK = "App rules fall back to the Windows proxy, so apps that ignore it go direct.";
 
@@ -560,7 +560,7 @@ export function presentTun(tun: TunStatus, live: boolean): TunView {
     ...base,
     tone: "ok",
     title: live && tun.appliesOnNextConnect ? "Ready · starts when you reconnect" : "Ready · starts when you connect",
-    sub: "wintun.dll is in place and Shadow SSH runs as administrator."
+    sub: "wintun.dll is in place and Shadow runs as administrator."
   };
 }
 

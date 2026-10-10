@@ -28,7 +28,7 @@ const isShadowDevBuild = args.includes(shadowDevBuildFlag);
 const builderArgs = args.filter((arg) => arg !== shadowDevBuildFlag);
 
 if (isShadowDevBuild) {
-  builderArgs.push("--config.productName=Shadow SSH Dev");
+  builderArgs.push("--config.productName=Shadow Dev");
   builderArgs.push("--config.portable.artifactName=shadow-ssh-dev-${version}-windows-portable-${arch}.${ext}");
 }
 

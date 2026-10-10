@@ -124,7 +124,7 @@ function PageCallouts({ ctl }: { ctl: RoutingController }): JSX.Element {
             </>
           }
         >
-          It stays on screen for now, but Shadow SSH drops it the next time the window reloads.
+          It stays on screen for now, but Shadow drops it the next time the window reloads.
           {inActivity ? " The reason is in Activity." : reason ? ` ${reason}` : ""}
         </Callout>
       ) : null}

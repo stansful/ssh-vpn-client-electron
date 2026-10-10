@@ -57,7 +57,7 @@ export interface TunEnvironmentFacts {
   searchedPaths: string[];
 }
 
-export const TUN_FAILURE_NOT_ELEVATED = "Shadow SSH isn’t running as administrator";
+export const TUN_FAILURE_NOT_ELEVATED = "Shadow isn’t running as administrator";
 export const TUN_FAILURE_NO_WINTUN = "wintun.dll wasn’t found";
 export const TUN_FAILURE_GENERIC = "The TUN adapter couldn’t start this session. Activity has the reason.";
 

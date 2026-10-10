@@ -302,7 +302,7 @@ export interface ActivityReportInput {
 
 /** Everything Clear deletes, as one text for a bug report. */
 export function formatActivityReport({ events, attention, logText, now = new Date() }: ActivityReportInput): string {
-  const sections = [`Shadow SSH activity, copied ${now.toISOString()}`];
+  const sections = [`Shadow activity, copied ${now.toISOString()}`];
   if (attention.length > 0) {
     sections.push(
       [`Needs your attention (${attention.length})`, ...attention.map((event) => `[${event.at}] ${event.level.toUpperCase()} ${event.title}. ${event.message}`)].join("\n")

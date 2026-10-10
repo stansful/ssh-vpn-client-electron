@@ -135,7 +135,7 @@ class BrowserPreview {
         downloadUrl: `https://github.com/stansful/ssh-vpn-client-electron/releases/download/2.3.0/${update.name}`
       },
       checkedAt: new Date(today.getTime() + 12 * HOUR + 4 * 60_000).toISOString(),
-      message: "Shadow SSH 2.3.0 is available."
+      message: "Shadow 2.3.0 is available."
     };
     const platformTarget = {
       platform,
@@ -246,7 +246,7 @@ class BrowserPreview {
             level: "error",
             source: "app",
             title: "Saved data couldn't be read",
-            message: "Shadow SSH stopped before changing anything. Recover it on the startup screen."
+            message: "Shadow stopped before changing anything. Recover it on the startup screen."
           }
         ];
         break;
@@ -355,10 +355,10 @@ class BrowserPreview {
       enabled,
       elevated: false,
       wintunFound: supported,
-      searchedPaths: supported ? ["C:\\Program Files\\Shadow SSH\\resources\\native\\windows\\x64", this.environment.dataDirectory] : [],
+      searchedPaths: supported ? ["C:\\Program Files\\Shadow\\resources\\native\\windows\\x64", this.environment.dataDirectory] : [],
       active: false,
       appliesOnNextConnect: false,
-      lastFailure: supported && enabled ? "Shadow SSH isn't running as administrator" : undefined
+      lastFailure: supported && enabled ? "Shadow isn't running as administrator" : undefined
     };
   }
 
@@ -700,7 +700,7 @@ class BrowserPreview {
           level: "info",
           source: "app",
           title: "Network settings repaired",
-          message: "Shadow SSH didn't close cleanly last time, so Windows still pointed at its proxy. Direct settings are back."
+          message: "Shadow didn't close cleanly last time, so Windows still pointed at its proxy. Direct settings are back."
         }),
       invalidate: () => this.emit({ type: "snapshot-invalidated", reason: "preview" })
     };
@@ -1510,7 +1510,7 @@ function seedAttention(today: Date): AttentionEvent[] {
 
 function seedLogFile(today: Date): string {
   const rows: Array<[number, number, number, string, string]> = [
-    [8, 40, 12.418, "INFO", "Shadow SSH 2.2.0 started on Windows x64."],
+    [8, 40, 12.418, "INFO", "Shadow 2.2.0 started on Windows x64."],
     [8, 41, 3.902, "INFO", "Connecting to helsinki.example.net:22 over SSH."],
     [8, 41, 4.311, "WARNING", "DNS lookup for helsinki.example.net failed (getaddrinfo EAI_AGAIN helsinki.example.net); retrying with the last known address 198.51.100.61."],
     [8, 41, 5.027, "INFO", "Connected to Helsinki-backup. Local proxy 127.0.0.1:50817."],

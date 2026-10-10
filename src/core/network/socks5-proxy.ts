@@ -345,7 +345,7 @@ export class Socks5Proxy {
         socket.write(Buffer.from([0x00, 0x5a, 0, 0, 0, 0, 0, 0]));
         proxyReplySent = true;
       } else if (request.protocol === "http-connect") {
-        socket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow SSH\r\n\r\n", "utf8");
+        socket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow\r\n\r\n", "utf8");
         proxyReplySent = true;
       }
 
@@ -768,7 +768,7 @@ function readHttpHeader(reader: ProxySocketReader, initial: Buffer): Promise<{ h
 function writeProxyFailure(socket: net.Socket, protocol: ProxyFailureProtocol): void {
   if (!socket.destroyed) {
     if (protocol === "http") {
-      socket.write("HTTP/1.1 502 Bad Gateway\r\nProxy-Agent: Shadow SSH\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", "utf8");
+      socket.write("HTTP/1.1 502 Bad Gateway\r\nProxy-Agent: Shadow\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", "utf8");
       return;
     }
     if (protocol === "socks4") {

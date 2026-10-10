@@ -42,13 +42,13 @@ describe("system wake detector", () => {
     let addresses: Record<string, string[]> = { en0: ["192.168.1.10", "fe80::1"], lo0: ["127.0.0.1"] };
     const detector = new SystemWakeDetector((event) => events.push(event), {
       tickIntervalMs: 5_000,
-      ignoredInterfaceNames: ["Shadow SSH"],
+      ignoredInterfaceNames: ["Shadow"],
       interfaces: () => interfaces(addresses)
     });
     detector.start();
 
     // The app's own adapter and a VPN's utun come and go without a wake.
-    addresses = { ...addresses, "Shadow SSH": ["10.66.0.2"], utun3: ["10.8.0.2"] };
+    addresses = { ...addresses, "Shadow": ["10.66.0.2"], utun3: ["10.8.0.2"] };
     vi.advanceTimersByTime(5_000);
     expect(events).toEqual([]);
 

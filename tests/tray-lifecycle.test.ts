@@ -254,7 +254,7 @@ describe("tray window lifecycle", () => {
     const window = new FakeWindow();
     electron.getAllWindows.mockReturnValue([window]);
     const controller = new TrayController({
-      appName: "Shadow SSH",
+      appName: "Shadow",
       iconPaths: [],
       isCloseToTrayEnabled: () => closeToTrayEnabled,
       isRendererReleaseEnabled: () => true,
@@ -297,9 +297,9 @@ describe("tray state updates", () => {
     const controller = createController({ onQuit });
     controller.sync();
 
-    expect(lastTray().setToolTip).toHaveBeenCalledWith("Shadow SSH");
+    expect(lastTray().setToolTip).toHaveBeenCalledWith("Shadow");
     const menu = lastMenu();
-    expect(menu.map((item) => item.type === "separator" ? "---" : item.label)).toEqual(["Open Shadow SSH", "---", "Quit"]);
+    expect(menu.map((item) => item.type === "separator" ? "---" : item.label)).toEqual(["Open Shadow", "---", "Quit"]);
     click(menuItem(menu, "Quit"));
     expect(onQuit).toHaveBeenCalledOnce();
   });
@@ -311,7 +311,7 @@ describe("tray state updates", () => {
 
     controller.sync();
 
-    expect(lastTray().setToolTip).toHaveBeenCalledWith("Shadow SSH — Protected · SSH · Frankfurt-01");
+    expect(lastTray().setToolTip).toHaveBeenCalledWith("Shadow — Protected · SSH · Frankfurt-01");
     expect(lastMenu()[0]).toMatchObject({ label: "Protected · SSH · Frankfurt-01", enabled: false });
     // The tray was created with the tone image already, so there is nothing to swap.
     expect(lastTray().setImage).not.toHaveBeenCalled();
@@ -371,7 +371,7 @@ describe("tray state updates", () => {
   it("reapplies the last model after the tray is destroyed and recreated", () => {
     let required = true;
     const controller = new TrayController({
-      appName: "Shadow SSH",
+      appName: "Shadow",
       iconPaths: [],
       platform: "win32",
       isCloseToTrayEnabled: () => required,
@@ -388,7 +388,7 @@ describe("tray state updates", () => {
     controller.sync();
 
     expect(electron.FakeTray.instances).toHaveLength(2);
-    expect(lastTray().setToolTip).toHaveBeenCalledWith("Shadow SSH — Protected · SSH · Frankfurt-01");
+    expect(lastTray().setToolTip).toHaveBeenCalledWith("Shadow — Protected · SSH · Frankfurt-01");
   });
 
   it("wires menu actions to the controller callbacks", () => {
@@ -405,7 +405,7 @@ describe("tray state updates", () => {
 
     click(menuItem(menu, "Disconnect"));
     click(menuItem(menu, "Run check"));
-    click(menuItem(menu, "Open Shadow SSH"));
+    click(menuItem(menu, "Open Shadow"));
     click(menuItem(menu, "Quit"));
 
     expect(onDisconnect).toHaveBeenCalledOnce();
@@ -454,8 +454,8 @@ describe("tray state updates", () => {
 });
 
 describe("tray menu template", () => {
-  const windows = { appName: "Shadow SSH", platform: "win32" as const, nativeSublabels: false };
-  const mac = { appName: "Shadow SSH", platform: "darwin" as const, nativeSublabels: true };
+  const windows = { appName: "Shadow", platform: "win32" as const, nativeSublabels: false };
+  const mac = { appName: "Shadow", platform: "darwin" as const, nativeSublabels: true };
 
   it("follows the board order: header, primary, switch, check, Open, Quit", () => {
     const menu = buildTrayMenuTemplate(protectedModel(), testActions(), windows);
@@ -467,7 +467,7 @@ describe("tray menu template", () => {
       "Switch server or profile",
       "Run check — Passed · 184 ms",
       "---",
-      "Open Shadow SSH",
+      "Open Shadow",
       "Quit — Disconnects the tunnel first"
     ]);
     expect(menu[0]?.enabled).toBe(false);
@@ -613,7 +613,7 @@ function createController({
   rendererReleaseDelayMs?: number;
 } & Partial<Omit<TrayControllerOptions, "isCloseToTrayEnabled" | "isRendererReleaseEnabled" | "isTrayRequired">> = {}): InstanceType<typeof TrayController> {
   return new TrayController({
-    appName: "Shadow SSH",
+    appName: "Shadow",
     iconPaths: [],
     isCloseToTrayEnabled: () => closeToTrayEnabled,
     isRendererReleaseEnabled: () => rendererReleaseEnabled,
@@ -630,7 +630,7 @@ function protectedModel(overrides: Partial<TrayMenuModel> = {}): TrayMenuModel {
   return {
     tone: "ok",
     statusTitle: "Protected · SSH · Frankfurt-01",
-    tooltip: "Shadow SSH — Protected · SSH · Frankfurt-01",
+    tooltip: "Shadow — Protected · SSH · Frankfurt-01",
     primary: { label: "Disconnect", action: "disconnect", enabled: true },
     servers: [
       { kind: "ssh", id: "fra", label: "Frankfurt-01", checked: true, enabled: true },

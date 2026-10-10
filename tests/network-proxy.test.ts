@@ -114,7 +114,7 @@ describe("SOCKS5 proxy", () => {
     );
     const response = Buffer.concat(fake.writes);
     expect(response.toString("latin1")).toBe(
-      "HTTP/1.1 502 Bad Gateway\r\nProxy-Agent: Shadow SSH\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+      "HTTP/1.1 502 Bad Gateway\r\nProxy-Agent: Shadow\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     );
     expect(response.subarray(0, 2)).not.toEqual(Buffer.from([0x05, 0x01]));
   });
@@ -134,7 +134,7 @@ describe("SOCKS5 proxy", () => {
     await handling;
 
     expect(Buffer.concat(fake.writes).toString("latin1")).toBe(
-      "HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow SSH\r\n\r\n"
+      "HTTP/1.1 200 Connection Established\r\nProxy-Agent: Shadow\r\n\r\n"
     );
   });
 
@@ -738,7 +738,7 @@ describe("Windows PAC generation", () => {
       1080
     );
 
-    expect(pac).toContain("Shadow SSH routing PAC");
+    expect(pac).toContain("Shadow routing PAC");
     expect(pac).toContain("PROXY 127.0.0.1:1080");
     expect(pac).not.toContain("SOCKS5 127.0.0.1:1080");
     expect(pac).toContain('var proxyWildcardDomains = {"example.com":1};');

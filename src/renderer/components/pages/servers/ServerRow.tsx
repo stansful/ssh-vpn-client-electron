@@ -16,7 +16,7 @@ export function LiveBadge({ state, className }: { state: SshSessionView["state"]
   }
   if (state === "preview") {
     return (
-      <Badge tone="warn" dot className={className} title="Shadow SSH couldn’t start its connection core, so this session routes nothing">
+      <Badge tone="warn" dot className={className} title="Shadow couldn’t start its connection core, so this session routes nothing">
         Preview only
       </Badge>
     );

@@ -198,12 +198,12 @@ describe("domain lists", () => {
     expect(timeout.text).toMatch(/^GitHub didn’t answer within 15 s\. Lists download directly.*The list stays off\.$/u);
     const offline = describeListError("TypeError: fetch failed", "direct", inUse);
     expect(offline.title).toBe("Couldn’t refresh Russian services");
-    expect(offline.text).toMatch(/^Shadow SSH couldn’t reach GitHub\..*Your current copy stays in use\.$/u);
+    expect(offline.text).toMatch(/^Shadow couldn’t reach GitHub\..*Your current copy stays in use\.$/u);
     expect(describeListError("Routing list download failed: 404 Not Found", "proxy", empty).text).toMatch(/^GitHub answered 404 Not Found\./u);
     expect(describeListError("Routing list is larger than the allowed limit.", "proxy", empty).text).toMatch(/2 MB/u);
     expect(describeListError("Routing proxy list refresh returned no domains.", "proxy", empty).text).toMatch(/didn’t contain any domains/u);
     expect(describeListError("Domain proxy list is larger than 20000 entries.", "direct", { enabled: false, domains: ["a.com"] }).text).toBe(
-      "The list has more than 20,000 domains, the most Shadow SSH can use. Your current copy is kept."
+      "The list has more than 20,000 domains, the most Shadow can use. Your current copy is kept."
     );
   });
 
@@ -230,7 +230,7 @@ describe("TUN status", () => {
     expect(presentTun({ ...base, active: true }, true)).toMatchObject({ tone: "ok", title: "Active this session", howLabel: "Requirements" });
     expect(presentTun({ ...base, elevated: false }, false)).toMatchObject({
       tone: "warn",
-      title: "Not active: Shadow SSH isn’t running as administrator",
+      title: "Not active: Shadow isn’t running as administrator",
       howLabel: "How to enable"
     });
     expect(presentTun({ ...base, wintunFound: false }, false).title).toBe("Not active: wintun.dll wasn’t found");

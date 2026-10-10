@@ -68,7 +68,7 @@ function createTargets(version) {
     targets.push({
       platform: "win",
       label: `Windows ${arch} unpacked`,
-      output: `${unpackedDirectory}/Shadow SSH.exe`,
+      output: `${unpackedDirectory}/Shadow.exe`,
       verify: (releaseRoot) => verifyWindowsBundle(releaseRoot, unpackedDirectory, arch)
     });
     targets.push(createPackageTarget({
@@ -84,7 +84,7 @@ function createTargets(version) {
     targets.push({
       platform: "mac",
       label: `macOS ${arch} application`,
-      output: `${unpackedDirectory}/Shadow SSH.app`,
+      output: `${unpackedDirectory}/Shadow.app`,
       verify: (releaseRoot) => verifyMacBundle(releaseRoot, unpackedDirectory, arch)
     });
     targets.push(createPackageTarget({
@@ -131,7 +131,7 @@ function createPackageTarget({ platform, label, output, format }) {
 
 function verifyWindowsBundle(releaseRoot, unpackedDirectory, arch) {
   const bundleRoot = path.join(releaseRoot, unpackedDirectory);
-  verifyArchitecture(path.join(bundleRoot, "Shadow SSH.exe"), arch);
+  verifyArchitecture(path.join(bundleRoot, "Shadow.exe"), arch);
   requireFile(path.join(bundleRoot, "resources", "app.asar"));
   verifyArchitecture(
     path.join(bundleRoot, "resources", "native", "windows", arch, "shadow-ssh-service.exe"),
@@ -145,8 +145,8 @@ function verifyWindowsBundle(releaseRoot, unpackedDirectory, arch) {
 }
 
 function verifyMacBundle(releaseRoot, unpackedDirectory, arch) {
-  const bundleRoot = path.join(releaseRoot, unpackedDirectory, "Shadow SSH.app", "Contents");
-  verifyArchitecture(path.join(bundleRoot, "MacOS", "Shadow SSH"), arch);
+  const bundleRoot = path.join(releaseRoot, unpackedDirectory, "Shadow.app", "Contents");
+  verifyArchitecture(path.join(bundleRoot, "MacOS", "Shadow"), arch);
   requireFile(path.join(bundleRoot, "Resources", "app.asar"));
   verifyArchitecture(
     path.join(bundleRoot, "Resources", "native", "macos", arch, "shadow-ssh-service"),

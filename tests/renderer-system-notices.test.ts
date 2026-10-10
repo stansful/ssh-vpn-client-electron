@@ -13,7 +13,7 @@ describe("system notices", () => {
     const notice = { at, transport: "ssh" as const, targetName: "Frankfurt-01" };
     expect(autoConnectCopy(notice, Date.parse(at) + 1000)).toEqual({
       title: "Connecting automatically",
-      message: "Auto-connect is on, so Shadow SSH is starting Frankfurt-01."
+      message: "Auto-connect is on, so Shadow is starting Frankfurt-01."
     });
     expect(autoConnectCopy(notice, Date.parse(at) + AUTO_CONNECT_NOTICE_MS + 1)).toBeUndefined();
     expect(autoConnectCopy(undefined)).toBeUndefined();

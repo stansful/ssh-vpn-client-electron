@@ -184,7 +184,7 @@ export function EventsPanel({
 
       {counts.total === 0 ? (
         <EmptyState icon={Activity} title="No events yet" className="fade">
-          New events show up here as Shadow SSH connects, checks the tunnel and changes routing.
+          New events show up here as Shadow connects, checks the tunnel and changes routing.
         </EmptyState>
       ) : feed.length === 0 ? (
         <EmptyState

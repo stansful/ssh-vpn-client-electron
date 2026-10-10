@@ -19,7 +19,7 @@ export function GeneralSection({ settings, save }: { settings: AppSettings; save
         titleId="st-general-h"
         icon={Monitor}
         title="General"
-        sub="Startup & window: how Shadow SSH starts, closes and keeps running in the background."
+        sub="Startup & window: how Shadow starts, closes and keeps running in the background."
       />
 
       <div className="st-toggles">
