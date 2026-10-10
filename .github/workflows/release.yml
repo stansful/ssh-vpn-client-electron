@@ -72,7 +72,7 @@ jobs:
     if: needs.check.outputs.should_release == 'true'
     # DMG and hdiutil exist only on macOS; electron-builder cross-builds the
     # Windows and Linux packages here without wine.
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       VERSION: ${{ needs.check.outputs.version }}
@@ -81,9 +81,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # The owner's local Node (bundles npm 11.6.2). Newer npm rejects lockfiles
+      # 11.6.2 writes ("Missing: @emnapi/core from lock file"), so keep the two
+      # in step when upgrading Node locally.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 24.11.1
           cache: npm
 
       # Not go-version-file: go.mod's toolchain line resolves to 1.24.x, while

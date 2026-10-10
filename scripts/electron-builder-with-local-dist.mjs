@@ -32,6 +32,13 @@ if (isShadowDevBuild) {
   builderArgs.push("--config.portable.artifactName=shadow-ssh-dev-${version}-windows-portable-${arch}.${ext}");
 }
 
+// On CI electron-builder publishes implicitly and, without a GitHub token, fails
+// on the latest*.yml it writes for DMG and AppImage. Releases are published by
+// .github/workflows/release.yml instead.
+if (!args.some((arg) => arg === "--publish" || arg === "-p" || arg.startsWith("--publish="))) {
+  builderArgs.push("--publish", "never");
+}
+
 if (!hasElectronDist && platformFlag && archFlag) {
   const platform = platformMap.get(platformFlag);
   const arch = archFlag.slice(2);
