@@ -113,6 +113,66 @@ On the SSH transport the local listener is left in place but stops enforcing pol
 helper has already decided, and a second pass would apply the rules twice with different
 information. Everything the listener receives is tunnelled.
 
+## When the server has no IPv6
+
+IPv6 is captured whenever this machine has an IPv6 route, but the server at the other end of
+the transport may have none. That combination broke every selected site with an IPv6 address:
+a browser on a dual-stack PC prefers IPv6, the SSH server answered each `direct-tcpip` open to
+an IPv6 address with `open failed`, and the browser never moved on to IPv4. The log showed the
+same address refused several times a second:
+
+```
+SOCKS5 CONNECT tunnel failed for 2001:4860:4828:400:0:0:0:0:443: open failed
+TUN tcp chrome.exe -> [2001:4860:4828:400::]:443 (proxy/proxy-list) failed: proxy refused request (reply 0x1)
+```
+
+The stack completes the handshake with the application before it dials, so the application saw
+its IPv6 connection succeed and then close. Happy Eyeballs moves to the next address only on a
+*refused* connect; after an accepted one Chromium restarts the TLS job once on the same address
+and gives up, and nothing remembers that IPv6 failed. A flow held for its name - which is every
+flow the curated list can select - cannot be refused any later than the handshake, since its
+name arrives only after it.
+
+So the dataplane asks the far end (`reach.go`). It opens TLS handshakes through the transport
+with two IPv6 anycast resolvers, `2606:4700:4700::1111` and `2001:4860:4860::8888`, and with
+their IPv4 twins, and counts an address as reached only when a byte comes back: a successful
+`CONNECT` proves nothing on Xray, whose SOCKS inbound reports success before its outbound has
+connected. The answer is
+
+- **reachable** when *both* IPv6 targets answer. A wrong yes brings the original failure back
+  and a wrong no only costs a fallback to IPv4, so a server that reaches one operator's IPv6
+  some other way (a WARP route for Google, say) does not count;
+- **unreachable** when IPv6 does not answer but IPv4 does;
+- **unknown** when nothing answers - the tunnel is down or still settling - which keeps the
+  previous answer and is asked again in 30 s.
+
+The hellos carry no server name: an Xray server that sniffs TLS and routes by name would
+otherwise connect to the name and answer for an address it cannot reach. The first "reachable"
+is asked once more 30 s later before IPv6 is tunnelled; a settled answer is checked again
+hourly, since a different server rebuilds the dataplane anyway. A change is logged once. On
+SSH, each check that finds no IPv6 leaves two failed `CONNECT`s to those addresses in the
+proxy log - the warning names them, so they are not mistaken for the original failure. The
+SSH listener stops enforcing its own policy before the helper starts, not after: it would
+otherwise send the first check out directly and the PC's own IPv6 would answer for the
+server's.
+
+Until the answer is "reachable", a TCP flow to an IPv6 address is refused with a reset before
+the handshake when it is already selected, or when it is held for its name on 443 or 80 and no
+name is known for the address yet - a browser on DNS-over-HTTPS, or one that resolved before
+the tunnel came up. A selected IPv6 datagram is dropped. The application then uses the site's
+IPv4 address, which is routed as usual. Everything else is untouched: an IPv6 flow on another
+port, or one whose address DNS has already named without selecting it, is sniffed and goes out
+directly as before, so ssh to an IPv6-only host, DNS over TCP and unselected dual-stack sites
+keep working. What is left is narrow: a selected site sharing an IPv6 address with unselected
+names, whose own DNS answer was never seen, is still accepted and then fails. And if Windows
+retries a refused SYN before failing the connect, a browser waits out its 300 ms Happy Eyeballs
+delay on a new connection rather than switching at once.
+
+Destinations are never rewritten. Connecting by the name in the hello instead would send
+applications that put a borrowed name in their SNI (REALITY, fake-TLS proxies, domain fronting)
+to the wrong host, make the server resolve names a page chose, and stall an OpenSSH session
+on its synchronous resolver.
+
 ## Keeping the transport out of its own tunnel
 
 A flow from the transport to its own server that ends up in the adapter is a loop: it is
@@ -285,6 +345,9 @@ unobserved. Each of the following is a considered guess rather than a fact:
 - **IPv6.** Capture is disabled automatically when the transport's server is reachable only
   over IPv6, or when no IPv6 route exists to pin direct traffic to. Both cases are logged. On a
   dual-stack network with capture off, a selected application's IPv6 traffic is not captured.
+  With capture on and a server without IPv6, tunnelled IPv6 is refused onto IPv4 (see "When the
+  server has no IPv6"). Whether Windows retries a refused SYN before failing the connect, and so
+  how long a browser takes to switch, has not been measured.
 
 A first run should be checked in this order: the adapter appears in network settings, `route
 print` shows the two `/1` routes and the transport's host route, a selected application's TCP

@@ -178,14 +178,21 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 		return nil, fmt.Errorf("apply tunnel routing: %w", err)
 	}
 
+	tunnel := &Socks5Client{Endpoint: options.TunnelEndpoint}
+	var probeIPv6 func(ctx context.Context) IPv6Reach
+	if enforceIPv6 {
+		// Only a captured family needs to know whether the tunnel carries it.
+		probeIPv6 = func(ctx context.Context) IPv6Reach { return ProbeTunnelIPv6(ctx, tunnel) }
+	}
 	plane, err := Start(Options{
-		Adapter:     adapter,
-		Attribution: NewOwnerTable(windowsOwnerSnapshot),
-		Tunnel:      &Socks5Client{Endpoint: options.TunnelEndpoint},
-		Direct:      directDialer{winnet.NewInterfaceDialer(internetEgress.InterfaceIndex, internetIndex6)},
-		Policy:      options.Policy,
-		Domains:     NewDomainCache(0),
-		Log:         log,
+		Adapter:         adapter,
+		Attribution:     NewOwnerTable(windowsOwnerSnapshot),
+		Tunnel:          tunnel,
+		Direct:          directDialer{winnet.NewInterfaceDialer(internetEgress.InterfaceIndex, internetIndex6)},
+		Policy:          options.Policy,
+		Domains:         NewDomainCache(0),
+		TunnelIPv6Probe: probeIPv6,
+		Log:             log,
 	})
 	if err != nil {
 		if restoreErr := routes.Restore(ctx); restoreErr != nil {

@@ -396,6 +396,52 @@ describe("TUN routing across a reconnect", () => {
     });
   });
 
+  it("stops enforcing locally before the helper starts, so its IPv6 check goes through the tunnel", async () => {
+    // The helper asks through the listener whether the server reaches IPv6
+    // the moment it is up. A listener still enforcing the policy of an earlier
+    // fallback would send that check out directly, and this machine's IPv6
+    // would be taken for the server's.
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const enforcingDuringStart: boolean[] = [];
+      let failStarts = 2;
+      const dataplane = {
+        isActive: false,
+        probe: async () => ({ available: true }),
+        start: async () => {
+          enforcingDuringStart.push((service as unknown as { localProcessEnforcement: boolean }).localProcessEnforcement);
+          if (failStarts > 0) {
+            failStarts -= 1;
+            throw new Error("adapter is still being removed");
+          }
+        },
+        stop: async () => undefined,
+        dispose: async () => undefined
+      } as unknown as DataplaneController;
+      const service = new LiveSshServiceBridge(initialStatus(), {
+        systemProxy: systemProxy(applies),
+        processConnectionsProvider: async () => [],
+        processDnsEntriesProvider: async () => [],
+        processAttribution: workingAttribution(),
+        dataplane,
+        protectedAddressResolver: async () => ["203.0.113.9"]
+      });
+      const internals = service as unknown as SshInternals & { localProcessEnforcement: boolean };
+
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      // Both attempts fail: the session falls back to enforcing locally.
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+      expect(internals.localProcessEnforcement).toBe(true);
+
+      // A later apply - a routing change, a held reconnect - brings TUN up.
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+      expect(enforcingDuringStart).toEqual([false, false, false]);
+      expect(internals.localProcessEnforcement).toBe(false);
+    });
+  });
+
   it("says what a permanent failure costs instead of falling back silently", async () => {
     await withWin32(async () => {
       const applies: SystemProxyApplyRequest[] = [];

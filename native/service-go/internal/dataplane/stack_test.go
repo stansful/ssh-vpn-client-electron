@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
 	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
+	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
@@ -68,8 +70,8 @@ func (a *pipeAdapter) Close() error {
 	return nil
 }
 
-// clientStack is the "application side": a stack with one address whose
-// packets all go to the adapter.
+// clientStack is the "application side": a dual-stack host with one address
+// per family whose packets all go to the adapter.
 type clientStack struct {
 	stack    *stack.Stack
 	endpoint *channel.Endpoint
@@ -79,21 +81,31 @@ type clientStack struct {
 func newClientStack(t *testing.T, adapter *pipeAdapter) *clientStack {
 	t.Helper()
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 	endpoint := channel.New(512, DefaultMTU, "")
 	if err := s.CreateNIC(1, endpoint); err != nil {
 		t.Fatalf("client nic: %v", err)
 	}
-	address := tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
-	if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{
-		Protocol:          ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{Address: address, PrefixLen: 24},
-	}, stack.AddressProperties{}); err != nil {
-		t.Fatalf("client address: %v", err)
+	for _, address := range []tcpip.ProtocolAddress{
+		{
+			Protocol:          ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{Address: tcpip.AddrFrom4([4]byte{10, 0, 0, 2}), PrefixLen: 24},
+		},
+		{
+			Protocol:          ipv6.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{Address: tcpip.AddrFrom16(netip.MustParseAddr("fd00::2").As16()), PrefixLen: 64},
+		},
+	} {
+		if err := s.AddProtocolAddress(1, address, stack.AddressProperties{}); err != nil {
+			t.Fatalf("client address: %v", err)
+		}
 	}
-	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: 1},
+		{Destination: header.IPv6EmptySubnet, NIC: 1},
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		for {
@@ -116,8 +128,12 @@ func newClientStack(t *testing.T, adapter *pipeAdapter) *clientStack {
 		for {
 			select {
 			case packet := <-adapter.toClient:
+				protocol, ok := ipVersion(packet)
+				if !ok {
+					continue
+				}
 				buffered := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
-				endpoint.InjectInbound(header.IPv4ProtocolNumber, buffered)
+				endpoint.InjectInbound(protocol, buffered)
 				buffered.DecRef()
 			case <-ctx.Done():
 				return
@@ -129,26 +145,32 @@ func newClientStack(t *testing.T, adapter *pipeAdapter) *clientStack {
 
 func (c *clientStack) dialTCP(t *testing.T, destination netip.AddrPort) net.Conn {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, err := gonet.DialContextTCP(ctx, c.stack, tcpip.FullAddress{
-		NIC:  1,
-		Addr: tcpip.AddrFrom4(destination.Addr().As4()),
-		Port: destination.Port(),
-	}, ipv4.ProtocolNumber)
+	conn, err := c.tryDialTCP(destination, 5*time.Second)
 	if err != nil {
 		t.Fatalf("client dial: %v", err)
 	}
 	return conn
 }
 
+// tryDialTCP is a connect() whose failure is the point of the test.
+func (c *clientStack) tryDialTCP(destination netip.AddrPort, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	address, protocol := clientAddress(destination)
+	return gonet.DialContextTCP(ctx, c.stack, address, protocol)
+}
+
+func clientAddress(destination netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {
+	if destination.Addr().Is4() {
+		return tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(destination.Addr().As4()), Port: destination.Port()}, ipv4.ProtocolNumber
+	}
+	return tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom16(destination.Addr().As16()), Port: destination.Port()}, ipv6.ProtocolNumber
+}
+
 func (c *clientStack) dialUDP(t *testing.T, destination netip.AddrPort) *gonet.UDPConn {
 	t.Helper()
-	conn, err := gonet.DialUDP(c.stack, nil, &tcpip.FullAddress{
-		NIC:  1,
-		Addr: tcpip.AddrFrom4(destination.Addr().As4()),
-		Port: destination.Port(),
-	}, ipv4.ProtocolNumber)
+	address, protocol := clientAddress(destination)
+	conn, err := gonet.DialUDP(c.stack, nil, &address, protocol)
 	if err != nil {
 		t.Fatalf("client udp dial: %v", err)
 	}
@@ -163,12 +185,13 @@ func (c *clientStack) close() {
 
 // recordingDialers stand in for the transport and the physical interface.
 type recordingDialers struct {
-	mu        sync.Mutex
-	tunnelled []netip.AddrPort
-	direct    []netip.AddrPort
-	tunnelEnd chan net.Conn
-	directEnd chan net.Conn
-	udpDirect chan *recordingPacketConn
+	mu           sync.Mutex
+	tunnelled    []netip.AddrPort
+	direct       []netip.AddrPort
+	associations int
+	tunnelEnd    chan net.Conn
+	directEnd    chan net.Conn
+	udpDirect    chan *recordingPacketConn
 }
 
 func newRecordingDialers() *recordingDialers {
@@ -189,6 +212,9 @@ func (r *recordingDialers) DialTCP(ctx context.Context, destination netip.AddrPo
 }
 
 func (r *recordingDialers) AssociateUDP(ctx context.Context) (*Socks5UDPSession, error) {
+	r.mu.Lock()
+	r.associations++
+	r.mu.Unlock()
 	return nil, errors.New("no udp in this test")
 }
 
@@ -238,16 +264,23 @@ func (c *recordingPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 func startTestDataplane(t *testing.T, cfg Config) (*clientStack, *recordingDialers, *DomainCache) {
 	t.Helper()
+	client, dialers, domains, _ := startTestDataplaneWithProbe(t, cfg, nil)
+	return client, dialers, domains
+}
+
+func startTestDataplaneWithProbe(t *testing.T, cfg Config, probe func(context.Context) IPv6Reach) (*clientStack, *recordingDialers, *DomainCache, *Dataplane) {
+	t.Helper()
 	adapter := newPipeAdapter()
 	dialers := newRecordingDialers()
 	domains := NewDomainCache(0)
 	dataplane, err := Start(Options{
-		Adapter: adapter,
-		Tunnel:  dialers,
-		Direct:  testDirectDialer{dialers},
-		Policy:  NewPolicy(cfg),
-		Domains: domains,
-		Log:     func(level, message string) { t.Logf("%s: %s", level, message) },
+		Adapter:         adapter,
+		Tunnel:          dialers,
+		Direct:          testDirectDialer{dialers},
+		Policy:          NewPolicy(cfg),
+		Domains:         domains,
+		TunnelIPv6Probe: probe,
+		Log:             func(level, message string) { t.Logf("%s: %s", level, message) },
 	})
 	if err != nil {
 		t.Fatalf("start dataplane: %v", err)
@@ -257,7 +290,7 @@ func startTestDataplane(t *testing.T, cfg Config) (*clientStack, *recordingDiale
 		client.close()
 		_ = dataplane.Close()
 	})
-	return client, dialers, domains
+	return client, dialers, domains, dataplane
 }
 
 func readWithin(t *testing.T, conn net.Conn, want int) []byte {
@@ -582,5 +615,171 @@ func TestSniffTCPBoundsTheWorkForATricklingPeer(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 2*sniffTimeout {
 		t.Fatalf("a trickling peer held the flow for %v", elapsed)
+	}
+}
+
+// The report these pin: a dual-stack PC, a transport whose server has no IPv6,
+// and every selected site with an IPv6 address failing outright. The server
+// refused each IPv6 address, but the application had already been told the
+// connection was up, so the browser never tried IPv4 and retried the dead
+// address several times a second.
+
+func TestDataplaneRefusesIPv6ThatWouldBeTunnelledWhileTheTunnelHasNone(t *testing.T) {
+	client, dialers, _ := startTestDataplane(t, Config{Mode: routing.ModeProxyAll})
+
+	// Refused before the handshake: that is what moves Happy Eyeballs on to
+	// the site's IPv4 address.
+	_, err := client.tryDialTCP(netip.MustParseAddrPort("[2001:db8::7]:443"), 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("expected the IPv6 connect to be refused, got %v", err)
+	}
+	// And IPv4 is tunnelled as before.
+	conn := client.dialTCP(t, netip.MustParseAddrPort("203.0.113.7:443"))
+	defer conn.Close()
+	select {
+	case remote := <-dialers.tunnelEnd:
+		remote.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("the IPv4 flow was never tunnelled")
+	}
+	dialers.mu.Lock()
+	defer dialers.mu.Unlock()
+	if len(dialers.tunnelled) != 1 || !dialers.tunnelled[0].Addr().Is4() {
+		t.Fatalf("expected only the IPv4 flow to reach the transport, got %v", dialers.tunnelled)
+	}
+}
+
+func TestDataplaneRefusesIPv6ANameCouldStillSelect(t *testing.T) {
+	// The failing flows in the report were selected by the curated list, so
+	// they were held for their hello - accepted before the name was known. A
+	// browser's flow with nothing known about its address is refused up
+	// front: by the time its name is known, refusing no longer helps.
+	client, dialers, _ := startTestDataplane(t, Config{
+		Mode:         routing.ModeSelectedRules,
+		ProxyDomains: []string{"example.org"},
+	})
+	_, err := client.tryDialTCP(netip.MustParseAddrPort("[2001:db8::7]:443"), 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("expected the IPv6 connect to be refused, got %v", err)
+	}
+	select {
+	case <-dialers.tunnelEnd:
+		t.Fatal("a refused flow was dialled")
+	case <-dialers.directEnd:
+		t.Fatal("a refused flow was dialled")
+	default:
+	}
+}
+
+func TestDataplaneRefusesIPv6WhoseLearnedNameIsSelected(t *testing.T) {
+	client, _, domains := startTestDataplane(t, Config{
+		Mode:         routing.ModeSelectedRules,
+		ProxyDomains: []string{"example.org"},
+	})
+	destination := netip.MustParseAddrPort("[2001:db8::7]:443")
+	domains.Record([]dnsRecord{{Address: destination.Addr(), Names: []string{"www.example.org"}, TTL: time.Minute}})
+	_, err := client.tryDialTCP(destination, 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("expected the IPv6 connect to be refused, got %v", err)
+	}
+}
+
+func TestDataplaneLetsUnselectedIPv6OutUnderNameRules(t *testing.T) {
+	// Name rules hold almost every flow for its hello, but refusing all of
+	// those broke what had worked: ssh to an IPv6-only host, DNS over TCP, an
+	// unselected site whose DNS answer was seen.
+	client, dialers, domains := startTestDataplane(t, Config{
+		Mode:         routing.ModeSelectedRules,
+		ProxyDomains: []string{"example.org"},
+	})
+	known := netip.MustParseAddrPort("[2001:db8::9]:443")
+	domains.Record([]dnsRecord{{Address: known.Addr(), Names: []string{"ipv6only.example.net"}, TTL: time.Minute}})
+	for _, destination := range []netip.AddrPort{
+		netip.MustParseAddrPort("[2001:db8::9]:22"),
+		netip.MustParseAddrPort("[2001:db8::53]:53"),
+		known,
+	} {
+		conn, err := client.tryDialTCP(destination, 3*time.Second)
+		if err != nil {
+			t.Fatalf("%s: an unselected IPv6 flow was refused: %v", destination, err)
+		}
+		select {
+		case remote := <-dialers.directEnd:
+			remote.Close()
+		case <-dialers.tunnelEnd:
+			t.Fatalf("%s: an unselected flow was tunnelled", destination)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: the flow was never dialled", destination)
+		}
+		conn.Close()
+	}
+}
+
+func TestDataplaneLeavesIPv6ThatCannotBeTunnelledAlone(t *testing.T) {
+	// Only a process rule: an unattributed flow is going out directly whatever
+	// it carries, so its IPv6 works as it did before the tunnel came up.
+	client, dialers, _ := startTestDataplane(t, Config{
+		Mode:  routing.ModeSelectedRules,
+		Rules: []routing.Rule{{ID: "p", Type: routing.RuleProcessName, Value: "app.exe", Enabled: true}},
+	})
+	conn := client.dialTCP(t, netip.MustParseAddrPort("[2001:db8::7]:443"))
+	defer conn.Close()
+	select {
+	case remote := <-dialers.directEnd:
+		remote.Close()
+	case <-dialers.tunnelEnd:
+		t.Fatal("an unselected flow was tunnelled")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the direct IPv6 flow was never dialled")
+	}
+}
+
+func TestDataplaneTunnelsIPv6OnceTheTunnelReachesIt(t *testing.T) {
+	previous := ipv6ProbeRetry
+	ipv6ProbeRetry = 10 * time.Millisecond
+	t.Cleanup(func() { ipv6ProbeRetry = previous })
+	client, dialers, _, dataplane := startTestDataplaneWithProbe(t, Config{Mode: routing.ModeProxyAll},
+		func(context.Context) IPv6Reach { return IPv6Reachable })
+	deadline := time.Now().Add(3 * time.Second)
+	for !dataplane.TunnelReachesIPv6() {
+		if time.Now().After(deadline) {
+			t.Fatal("the probe's answer was never taken")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	destination := netip.MustParseAddrPort("[2001:db8::7]:443")
+	conn := client.dialTCP(t, destination)
+	defer conn.Close()
+	select {
+	case remote := <-dialers.tunnelEnd:
+		remote.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("the IPv6 flow was never tunnelled")
+	}
+	dialers.mu.Lock()
+	defer dialers.mu.Unlock()
+	if len(dialers.tunnelled) != 1 || dialers.tunnelled[0] != destination {
+		t.Fatalf("expected the IPv6 flow to be tunnelled by its address, got %v", dialers.tunnelled)
+	}
+}
+
+func TestDataplaneDropsTunnelledIPv6DatagramsWhileTheTunnelHasNone(t *testing.T) {
+	// Xray carries UDP, but not to IPv6 from a server without it. QUIC that
+	// gets no answer falls back to TCP, which is then refused onto IPv4.
+	client, dialers, _ := startTestDataplane(t, Config{Mode: routing.ModeProxyAll, UDPSupported: true})
+	conn := client.dialUDP(t, netip.MustParseAddrPort("[2001:db8::7]:443"))
+	defer conn.Close()
+	if _, err := conn.Write([]byte("datagram")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-dialers.udpDirect:
+		t.Fatal("a selected IPv6 datagram went out directly")
+	case <-time.After(sniffTimeout * 3):
+	}
+	dialers.mu.Lock()
+	defer dialers.mu.Unlock()
+	if dialers.associations != 0 {
+		t.Fatalf("an IPv6 datagram was handed to a tunnel that cannot carry it")
 	}
 }

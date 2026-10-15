@@ -113,6 +113,10 @@ type Options struct {
 	Policy      *Policy
 	Domains     *DomainCache
 	MTU         uint32
+	// TunnelIPv6Probe asks whether the transport's far end reaches IPv6 (see
+	// reach.go). It runs at start and periodically after. Without one the
+	// tunnel is taken not to, which only costs IPv6 flows a fallback to IPv4.
+	TunnelIPv6Probe func(ctx context.Context) IPv6Reach
 	// Log receives one line per notable event. Levels are "info" and
 	// "warning", matching the service's diagnostics vocabulary.
 	Log func(level string, message string)
@@ -128,6 +132,9 @@ type Dataplane struct {
 	done     sync.WaitGroup
 	closeOne sync.Once
 	closeErr error
+
+	// tunnelIPv6 is the last answer of the IPv6 probe.
+	tunnelIPv6 atomic.Bool
 }
 
 // Start brings the stack up and begins forwarding. The returned Dataplane runs
@@ -198,6 +205,10 @@ func Start(options Options) (*Dataplane, error) {
 	dataplane.done.Add(2)
 	go dataplane.pumpInbound(ctx)
 	go dataplane.pumpOutbound(ctx)
+	if options.TunnelIPv6Probe != nil {
+		dataplane.done.Add(1)
+		go dataplane.watchTunnelIPv6(ctx)
+	}
 	return dataplane, nil
 }
 
@@ -315,9 +326,12 @@ func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 	flow := d.flowOf(ProtocolTCP, id)
 	policy := d.policy.Load()
 	decision := policy.Decide(flow)
-	if decision.Verdict == VerdictDrop {
+	heldForName := d.shouldSniff(policy, flow)
+	if decision.Verdict == VerdictDrop || d.refusesForIPv6(flow, decision, heldForName) {
 		// A reset tells the application immediately instead of leaving it to
-		// time out, which is what a user reads as "the app is broken".
+		// time out, which is what a user reads as "the app is broken". For an
+		// IPv6 flow the tunnel cannot carry it is also what makes the
+		// application try the site's IPv4 address next.
 		request.Complete(true)
 		return
 	}
@@ -338,7 +352,7 @@ func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 		// nothing, and DNS learning does not see it for a client that resolved
 		// before the tunnel came up or resolves over DoH. Its first bytes do.
 		var head []byte
-		if d.shouldSniff(policy, flow) {
+		if heldForName {
 			var name string
 			head, name = sniffTCP(local)
 			if name != "" {
@@ -556,15 +570,16 @@ func (d *Dataplane) handleUDP(request *udp.ForwarderRequest) bool {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		defer cancel()
-		switch decision.Verdict {
-		case VerdictDrop:
+		switch {
+		case decision.Verdict == VerdictDrop || d.refusesForIPv6(flow, decision, false):
 			// The endpoint is held open and drained rather than closed, so the
 			// application's retransmits are swallowed here instead of
 			// re-entering this handler - and, on the packet pump, re-running
 			// attribution - for every datagram. A QUIC client that gets no
-			// answer falls back to TCP, which is tunnelled.
+			// answer falls back to TCP, which is tunnelled - or, for an IPv6
+			// flow the tunnel cannot carry, refused, which sends it to IPv4.
 			d.discardUDP(local)
-		case VerdictProxy:
+		case decision.Verdict == VerdictProxy:
 			d.relayUDPThroughTunnel(ctx, local, flow, head)
 		default:
 			d.relayUDPDirect(ctx, local, flow, head)

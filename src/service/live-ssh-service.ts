@@ -1677,6 +1677,15 @@ export class LiveSshServiceBridge implements ServiceBridge {
       return false;
     }
 
+    // The local listener is about to receive only traffic the helper already
+    // decided to tunnel, so a second policy pass here would double-count the
+    // rules. It has to stop before the helper starts, not after: the helper
+    // checks through this listener whether the server reaches IPv6 as soon as
+    // it is up, and a listener still enforcing an earlier proxy-path policy
+    // would send that check out directly - taking this machine's IPv6 for the
+    // server's. A failed start recomputes both in applySystemRouting.
+    this.localProcessEnforcement = false;
+    this.localRoutingContext = undefined;
     try {
       await startDataplaneWithRetry(dataplane, {
         routingMode: request.routingMode,
@@ -1725,10 +1734,6 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
     this.tunRoutingActive = true;
     this.syncDerivedStatus();
-    // The local listener now only receives traffic the helper already decided
-    // to tunnel, so a second policy pass here would double-count the rules.
-    this.localProcessEnforcement = false;
-    this.localRoutingContext = undefined;
     this.clearProcessRoutingState();
     this.appendDiagnostic(
       "info",
