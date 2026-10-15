@@ -40,3 +40,10 @@ type InterfaceDialer interface {
 	DialTCP(ctx context.Context, destination netip.AddrPort) (net.Conn, error)
 	ListenUDP(ctx context.Context, destination netip.AddrPort) (net.PacketConn, error)
 }
+
+// Route is one entry of the routing table: a destination prefix and the
+// interface it leaves by.
+type Route struct {
+	Destination   netip.Prefix
+	InterfaceLUID uint64
+}

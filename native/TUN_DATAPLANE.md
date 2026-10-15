@@ -173,6 +173,66 @@ applications that put a borrowed name in their SNI (REALITY, fake-TLS proxies, d
 to the wrong host, make the server resolve names a page chose, and stall an OpenSSH session
 on its synchronous resolver.
 
+## Traffic that does not ask the routing table
+
+The capture routes beat the default route on prefix length, which decides for every socket
+that lets Windows pick the route. A socket *bound to the network card's own address* does not:
+Windows sends from a bound address over that interface's routes only (the strong host model),
+so it leaves through the card's default route and the dataplane never sees it. Calls bind
+exactly that way. With microphone or camera access Chrome's WebRTC opens one UDP socket per
+interface - so do Telegram, Signal and Zoom, for TCP fallbacks too - and ICE ranks candidate
+pairs by network cost before priority: an Ethernet or Wi-Fi card beats the adapter, whose type
+it does not recognise. So a Google Meet call's page went through the tunnel while its audio and
+video left directly - on a network that throttles calls, a call without sound or picture. On
+either transport and in every routing mode.
+
+`internal/winfirewall` closes it the way VPN clients do. While the dataplane runs, WFP filters
+refuse traffic that would leave by any interface but the adapter to a destination the routing
+table sends into the tunnel: UDP at `ALE_AUTH_CONNECT` and `ALE_AUTH_RECV_ACCEPT` (a peer's ICE
+check to the card would otherwise open the flow from outside), and new TCP connections at
+`ALE_AUTH_CONNECT` (ICE-TCP and TURN-TCP, once UDP is refused). A TCP connection that already
+existed when the filters went in is re-authorized by Windows and let through: an RDP session or a
+download opened before the tunnel is left to finish rather than cut. A refused send fails that candidate pair, ICE
+settles on the socket on the adapter, and the policy routes it like everything else - through
+the tunnel when selected, out directly through the helper when not. Nothing is rewritten and no
+rule changes meaning. Exempt:
+
+- whatever the routing table itself sends elsewhere ahead of the capture routes, read with
+  `GetIpForwardTable2` when the guard starts and every ten seconds after: the networks the
+  machine is on, a LAN numbered from public space, persistent routes, another VPN's split
+  routes, a VPN connected later. A change replaces these exemptions in one WFP transaction.
+  Covered prefixes are collapsed; a table with more than 8192 such networks per family is not
+  guarded at all, since a partial list would refuse what the table sends elsewhere;
+- private, shared, link-local, multicast and broadcast space, and the transport's own servers
+  (Hysteria 2 and mKCP reach them over UDP);
+- DNS and DHCP to any address, and multicast and broadcast a socket receives (an operator's
+  IPTV stream comes from a public source);
+- this helper (its interface-pinned direct dials and DNS forwarding), loopback, the adapter;
+- processes running as SYSTEM, LocalService or NetworkService, matched by an `ALE_USER_ID`
+  security descriptor: Windows' own services and other VPN clients' daemons (IKE, Teredo,
+  tailscaled, AnyConnect) pin to an interface deliberately. The applications that leaked run
+  as the user.
+
+The filters live in a *dynamic* WFP session in their own sublayer. Windows deletes them the
+moment the session's handle closes, including when the helper dies, so a crash cannot leave the
+machine cut off; and a block in another sublayer (Windows Firewall) still wins over the guard's
+permits, so the guard can only narrow what was allowed. It is installed after the routes and
+removed before them. If it cannot be installed the dataplane runs without it and says what that
+costs. The structures WFP and `GetIpForwardTable2` take carry unions; their Go spelling follows
+wireguard-windows' `tunnel/firewall` and `winipcfg` and is checked against the 64-bit layout at
+compile time.
+
+What it costs: an application running as the user that binds to the network card on purpose -
+a torrent client pinned to Ethernet, a user-mode VPN client - cannot reach the internet through
+it while the tunnel is up; a public UDP service on the card cannot be reached from outside; and a
+route added while the tunnel is up is refused for up to ten seconds before it is exempted.
+
+The dataplane also reports UDP it carries into the tunnel and never sees answered (twenty
+datagrams over five seconds, once per destination address per ten minutes): with Xray the
+association always succeeds, so a server that does not pass UDP was otherwise silent. And it
+drops a datagram larger than 8 KiB instead of handing it to Xray's SOCKS relay, which reads into
+an 8 KiB buffer and, on Windows, ends its receive loop for every association on a larger one.
+
 ## Keeping the transport out of its own tunnel
 
 A flow from the transport to its own server that ends up in the adapter is a loop: it is
@@ -342,6 +402,13 @@ unobserved. Each of the following is a considered guess rather than a fact:
 - **MTU.** 1420 is a guess that leaves room for the transport's framing; if large transfers
   stall, this is the first thing to change. Note the adapter is never told this value - only
   the userspace stack is - so a mismatch shows up as stalls rather than as an error.
+- **The traffic guard.** Whether `FWPM_CONDITION_IP_LOCAL_INTERFACE` names the adapter for a
+  wildcard socket the routes send there (WireGuard relies on it), that a refused first datagram
+  makes Chrome's ICE fall back to the adapter's socket within a call's setup, that the
+  `ALE_USER_ID` descriptor matches services and not the user, and that DNS, DHCP and LAN
+  discovery keep working. Check in `chrome://webrtc-internals` that the selected pair's local
+  address is the adapter's (`10.253.7.2`), and `netsh wfp show filters` while connected and
+  after a crash of the helper.
 - **IPv6.** Capture is disabled automatically when the transport's server is reachable only
   over IPv6, or when no IPv6 route exists to pin direct traffic to. Both cases are logged. On a
   dual-stack network with capture off, a selected application's IPv6 traffic is not captured.

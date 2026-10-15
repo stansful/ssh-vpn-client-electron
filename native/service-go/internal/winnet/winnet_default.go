@@ -36,3 +36,6 @@ func (unsupportedDialer) DialTCP(context.Context, netip.AddrPort) (net.Conn, err
 func (unsupportedDialer) ListenUDP(context.Context, netip.AddrPort) (net.PacketConn, error) {
 	return nil, ErrUnsupportedPlatform
 }
+
+// Routes is unavailable off Windows.
+func Routes() ([]Route, error) { return nil, ErrUnsupportedPlatform }

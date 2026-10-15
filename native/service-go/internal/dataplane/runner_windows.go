@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
+	"time"
 
 	"shadowssh/service/internal/platform"
 	"shadowssh/service/internal/tun"
+	"shadowssh/service/internal/winfirewall"
 	"shadowssh/service/internal/winnet"
 	"shadowssh/service/internal/winroute"
 )
@@ -66,11 +69,18 @@ type WindowsOptions struct {
 
 // Runner owns a live Windows dataplane.
 type Runner struct {
-	options   WindowsOptions
-	routes    *winroute.Manager
-	plane     *Dataplane
-	closeOnce sync.Once
-	closeErr  error
+	options WindowsOptions
+	routes  *winroute.Manager
+	plane   *Dataplane
+	// guard keeps interface-bound traffic in the adapter; nil when it could
+	// not be installed.
+	guard *winfirewall.Guard
+	// stopRoutesWatch ends the goroutine that keeps the guard's exemptions in
+	// step with the routing table, and routesWatchDone closes when it has.
+	stopRoutesWatch context.CancelFunc
+	routesWatchDone chan struct{}
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // StartWindows brings up the dataplane.
@@ -202,10 +212,93 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 		return nil, err
 	}
 
+	// The routes capture every socket that lets Windows choose; the guard
+	// covers the ones that do not (see internal/winfirewall). Without it the
+	// tunnel still works for nearly everything, so failing to install it is a
+	// warning, not a reason to give up the dataplane.
+	runner := &Runner{options: options, routes: routes, plane: plane}
+	guardPlan := buildGuardPlan(adapter.LUID(), interfaceIndex, enforceIPv6, options.ProtectedAddresses, log)
+	guard, guardErr := winfirewall.Start(guardPlan)
+	if guardErr != nil {
+		log("warning", "Traffic from sockets bound to the network card is not kept in the tunnel - calls (Google Meet, "+
+			"Zoom, Telegram) may send audio and video directly: "+guardErr.Error())
+	} else {
+		log("info", "UDP, and new outgoing TCP, from sockets bound to another interface is refused for destinations "+
+			"the routing table sends into the tunnel, so calls fall back to the adapter. Applications that bind to "+
+			"the network card on purpose cannot reach the internet through it while the tunnel is up; system "+
+			"services and other VPN services are not affected.")
+		runner.guard = guard
+		watchCtx, stop := context.WithCancel(context.Background())
+		runner.stopRoutesWatch = stop
+		runner.routesWatchDone = make(chan struct{})
+		go runner.watchRoutes(watchCtx, guardPlan, adapter.LUID(), interfaceIndex, enforceIPv6)
+	}
+
 	log("info", fmt.Sprintf(
-		"TUN dataplane is up on interface %d (IPv6 capture %s, transport proxy %s).",
-		interfaceIndex, enabledLabel(enforceIPv6), options.TunnelEndpoint))
-	return &Runner{options: options, routes: routes, plane: plane}, nil
+		"TUN dataplane is up on interface %d (IPv6 capture %s, traffic guard %s, transport proxy %s).",
+		interfaceIndex, enabledLabel(enforceIPv6), enabledLabel(runner.guard != nil), options.TunnelEndpoint))
+	return runner, nil
+}
+
+// routesWatchInterval is how often the routing table is re-read for the
+// guard's exemptions. A route another VPN or the network adds meanwhile is
+// refused for at most this long.
+const routesWatchInterval = 10 * time.Second
+
+// buildGuardPlan reads the routing table into a plan. A table that cannot be
+// read leaves the networks the interfaces are on as the only routed
+// exemptions.
+func buildGuardPlan(tunnelLUID uint64, tunnelIndex uint32, enforceIPv6 bool, servers []netip.Addr, log func(string, string)) winfirewall.Plan {
+	routed, err := routedPrefixes(tunnelLUID, tunnelIndex)
+	if err != nil {
+		log("warning", "Could not read the routing table for the traffic guard; exempting only the networks this "+
+			"machine is on: "+err.Error())
+	}
+	return winfirewall.NewPlan(tunnelLUID, enforceIPv6, servers, routed)
+}
+
+// watchRoutes keeps the guard's exemptions in step with the routing table: a
+// VPN connected, a network joined or a route added after the tunnel came up
+// must keep reaching what the table sends elsewhere. If the table outgrows
+// what the guard can exempt, the guard is removed rather than left to refuse
+// destinations the table routes elsewhere.
+func (r *Runner) watchRoutes(ctx context.Context, current winfirewall.Plan, tunnelLUID uint64, tunnelIndex uint32, enforceIPv6 bool) {
+	defer close(r.routesWatchDone)
+	ticker := time.NewTicker(routesWatchInterval)
+	defer ticker.Stop()
+	failing := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		routed, err := routedPrefixes(tunnelLUID, tunnelIndex)
+		if err != nil {
+			// A table that cannot be read says nothing about what changed;
+			// the exemptions in place stay.
+			continue
+		}
+		next := winfirewall.NewPlan(tunnelLUID, enforceIPv6, r.options.ProtectedAddresses, routed)
+		if slices.Equal(next.Reachable, current.Reachable) {
+			continue
+		}
+		if next.TooManyRoutes {
+			r.options.Log("warning", "The routing table now sends more networks elsewhere than the traffic guard can "+
+				"exempt, so the guard is removed: calls may again send audio and video directly.")
+			_ = r.guard.Close()
+			return
+		}
+		if err := r.guard.UpdateReachable(next); err != nil {
+			if !failing {
+				r.options.Log("warning", "Could not update the traffic guard for a routing change: "+err.Error())
+			}
+			failing = true
+			continue
+		}
+		failing = false
+		current = next
+	}
 }
 
 // UpdatePolicy swaps the routing revision without restarting the dataplane.
@@ -213,13 +306,28 @@ func (r *Runner) UpdatePolicy(policy *Policy) {
 	r.plane.UpdatePolicy(policy)
 }
 
-// Close tears the dataplane down. Routing is restored before the adapter goes
-// away, so there is no moment in which the machine has capture routes pointing
-// at an interface that no longer exists.
+// Close tears the dataplane down. The traffic guard goes first, while the routes
+// still send everything to the adapter: the other way round, there would be a
+// moment in which interface-bound UDP is refused and nothing else carries it.
+// Routing is restored before the adapter goes away, so there is no moment in
+// which the machine has capture routes pointing at an interface that no longer
+// exists.
 func (r *Runner) Close(ctx context.Context) error {
 	r.closeOnce.Do(func() {
+		if r.stopRoutesWatch != nil {
+			r.stopRoutesWatch()
+			<-r.routesWatchDone
+		}
+		if r.guard != nil {
+			if err := r.guard.Close(); err != nil {
+				r.closeErr = err
+				r.options.Log("warning", "Removing the traffic guard reported: "+err.Error())
+			}
+		}
 		if err := r.routes.Restore(ctx); err != nil {
-			r.closeErr = err
+			if r.closeErr == nil {
+				r.closeErr = err
+			}
 			r.options.Log("warning", "Routing restore reported: "+err.Error())
 		}
 		if err := r.plane.Close(); err != nil && r.closeErr == nil {
@@ -227,6 +335,64 @@ func (r *Runner) Close(ctx context.Context) error {
 		}
 	})
 	return r.closeErr
+}
+
+// routedPrefixes are the destinations the routing table sends by another
+// interface ahead of the capture routes: the networks this machine is on, a
+// LAN numbered from public space, persistent routes, another VPN's split
+// routes. The guard leaves them alone - it is there for sockets that ignore the
+// routing table, not to overrule it. It is read after the capture routes are
+// in, and again by watchRoutes.
+func routedPrefixes(tunnelLUID uint64, tunnelIndex uint32) ([]netip.Prefix, error) {
+	routes, err := winnet.Routes()
+	if err != nil {
+		return onLinkPrefixes(tunnelIndex), err
+	}
+	var prefixes []netip.Prefix
+	for _, route := range routes {
+		if route.InterfaceLUID != tunnelLUID {
+			prefixes = append(prefixes, route.Destination)
+		}
+	}
+	// The interfaces' own prefixes as well: an address can be on-link without
+	// a route of its own length having been listed.
+	return append(prefixes, onLinkPrefixes(tunnelIndex)...), nil
+}
+
+// onLinkPrefixes are the networks this machine's other interfaces are on.
+func onLinkPrefixes(tunnelIndex uint32) []netip.Prefix {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var prefixes []netip.Prefix
+	for _, candidate := range interfaces {
+		if candidate.Index == int(tunnelIndex) || candidate.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addresses, err := candidate.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addresses {
+			network, ok := address.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(network.IP)
+			if !ok {
+				continue
+			}
+			ones, size := network.Mask.Size()
+			ip = ip.Unmap()
+			if ip.Is4() && size == 128 {
+				// An IPv4 address with its mask in the 16-byte form.
+				ones -= 96
+			}
+			prefixes = append(prefixes, netip.PrefixFrom(ip, ones))
+		}
+	}
+	return prefixes
 }
 
 // protectedRoutePlan works out how each of the transport's servers stays

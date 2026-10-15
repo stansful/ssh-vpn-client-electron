@@ -33,9 +33,22 @@ const (
 	// sockets have no close handshake, so the TCP side is what tells the proxy
 	// the association is over.
 	socksHandshakeTimeout = 10 * time.Second
+
+	// socksUDPMaxDatagram bounds one wrapped datagram sent to the relay. Xray
+	// reads its SOCKS inbound's UDP into an 8 KiB buffer, and on Windows a
+	// larger datagram fails that read - which ends Xray's receive loop for
+	// every association at once, silently, until Xray restarts. One oversized
+	// datagram from any application took all tunnelled UDP down with it. A
+	// datagram that size would not have got through anyway: VLESS's XUDP drops
+	// anything over about 7.5 KiB.
+	socksUDPMaxDatagram = 8192
 )
 
 var errSocksUDPUnsupported = errors.New("proxy refused UDP ASSOCIATE")
+
+// errSocksUDPTooLarge is a datagram the relay cannot take. It is dropped; the
+// association goes on.
+var errSocksUDPTooLarge = errors.New("datagram too large for the proxy's UDP relay")
 
 // Socks5Client dials one loopback SOCKS5 inbound.
 type Socks5Client struct {
@@ -206,9 +219,14 @@ type Socks5UDPSession struct {
 	relay   *net.UDPAddr
 }
 
-// WriteTo sends one datagram to destination through the association.
+// WriteTo sends one datagram to destination through the association. A
+// datagram the relay cannot take is refused with errSocksUDPTooLarge and not
+// sent.
 func (s *Socks5UDPSession) WriteTo(payload []byte, destination netip.AddrPort) error {
 	header := append([]byte{0x00, 0x00, 0x00}, encodeSocksAddress(destination)...)
+	if len(header)+len(payload) > socksUDPMaxDatagram {
+		return errSocksUDPTooLarge
+	}
 	_, err := s.packet.WriteToUDP(append(header, payload...), s.relay)
 	return err
 }
