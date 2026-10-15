@@ -135,6 +135,8 @@ type Dataplane struct {
 
 	// tunnelIPv6 is the last answer of the IPv6 probe.
 	tunnelIPv6 atomic.Bool
+	// udpWarnings keeps the UDP diagnostics to one line per destination.
+	udpWarnings logLimiter
 }
 
 // Start brings the stack up and begins forwarding. The returned Dataplane runs
@@ -609,8 +611,42 @@ func (d *Dataplane) relayUDPThroughTunnel(ctx context.Context, local net.Conn, f
 		return
 	}
 	defer session.Close()
+
+	// Whether anything ever came back, and how much has gone out meanwhile:
+	// with Xray the association always succeeds, so a server that does not
+	// pass UDP shows up only as a flow that is never answered.
+	var answered atomic.Bool
+	sent := 0
+	var firstSent time.Time
+	considered := false
+	send := func(datagram []byte) error {
+		err := session.WriteTo(datagram, flow.Destination)
+		if errors.Is(err, errSocksUDPTooLarge) {
+			if d.udpWarnings.allow("oversized "+flow.Destination.Addr().String(), time.Now()) {
+				d.options.Log("warning", fmt.Sprintf("TUN udp %s -> %s: dropped a %d-byte datagram, larger than the transport's UDP relay takes.",
+					describeProcess(flow.ProcessName), flow.Destination, len(datagram)))
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		if sent == 0 {
+			firstSent = now
+		}
+		sent++
+		if !considered && sent >= udpUnansweredWarnAfter && now.Sub(firstSent) >= udpUnansweredWarnAge {
+			considered = true
+			if !answered.Load() && d.udpWarnings.allow("unanswered "+flow.Destination.Addr().String(), now) {
+				d.options.Log("warning", fmt.Sprintf("TUN udp %s -> %s: %d datagrams over %s through the tunnel and no reply; the tunnel's server may not pass UDP there, or the destination does not answer.",
+					describeProcess(flow.ProcessName), flow.Destination, sent, now.Sub(firstSent).Round(100*time.Millisecond)))
+			}
+		}
+		return nil
+	}
 	for _, datagram := range head {
-		if err := session.WriteTo(datagram, flow.Destination); err != nil {
+		if err := send(datagram); err != nil {
 			return
 		}
 	}
@@ -630,6 +666,7 @@ func (d *Dataplane) relayUDPThroughTunnel(ctx context.Context, local net.Conn, f
 			if err != nil {
 				return
 			}
+			answered.Store(true)
 			if _, err := local.Write(payload); err != nil {
 				return
 			}
@@ -645,10 +682,56 @@ func (d *Dataplane) relayUDPThroughTunnel(ctx context.Context, local net.Conn, f
 		if err != nil {
 			return
 		}
-		if err := session.WriteTo(buffer[:read], flow.Destination); err != nil {
+		if err := send(buffer[:read]); err != nil {
 			return
 		}
 	}
+}
+
+// udpUnansweredWarnAfter and udpUnansweredWarnAge are how much a tunnelled
+// flow sends, and for how long, without an answer before it is reported. Both
+// are needed: a sender ticking fast can send twenty datagrams before the first
+// reply of a new association is even possible - Xray has to open its outbound
+// connection first - while a QUIC attempt the transport refuses gives up
+// before twenty.
+const udpUnansweredWarnAfter = 20
+
+// udpUnansweredWarnAge is a variable only so tests need not wait for it.
+var udpUnansweredWarnAge = 5 * time.Second
+
+// udpWarningInterval is how often one kind of UDP warning is repeated for the
+// same destination address. A call opens a flow per candidate pair, and a
+// line per flow would bury everything else in the log.
+const udpWarningInterval = 10 * time.Minute
+
+// logLimiter lets one line per key through per udpWarningInterval.
+type logLimiter struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+// logLimiterMaxKeys bounds the memory a limiter keeps. Keys older than the
+// interval are dropped first; past that, the whole map is.
+const logLimiterMaxKeys = 1024
+
+func (l *logLimiter) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if last, ok := l.last[key]; ok && now.Sub(last) < udpWarningInterval {
+		return false
+	}
+	if l.last == nil || len(l.last) >= logLimiterMaxKeys {
+		for stale, last := range l.last {
+			if now.Sub(last) >= udpWarningInterval {
+				delete(l.last, stale)
+			}
+		}
+		if l.last == nil || len(l.last) >= logLimiterMaxKeys {
+			l.last = make(map[string]time.Time)
+		}
+	}
+	l.last[key] = now
+	return true
 }
 
 type deadlineSetter interface {

@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -201,5 +202,47 @@ func TestDecodeSocksUDPDatagramRejectsFragments(t *testing.T) {
 	fragment := append([]byte{0x00, 0x00, 0x01, socksAddrIPv4, 1, 2, 3, 4, 0x00, 0x35}, []byte("x")...)
 	if _, _, ok := decodeSocksUDPDatagram(fragment); ok {
 		t.Fatalf("expected a fragmented datagram to be rejected")
+	}
+}
+
+func TestUDPSessionDropsADatagramTheRelayCannotTake(t *testing.T) {
+	// Xray's relay reads into 8 KiB; on Windows a larger datagram ends its
+	// receive loop for every association. It is refused here instead, and
+	// the association carries on.
+	relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer relay.Close()
+	relayPort := uint16(relay.LocalAddr().(*net.UDPAddr).Port)
+	endpoint, requests := startFakeSocks5(t, func(byte, netip.AddrPort) (byte, netip.AddrPort) {
+		return socksReplySucceeded, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), relayPort)
+	})
+	session, err := (&Socks5Client{Endpoint: endpoint}).AssociateUDP(context.Background())
+	if err != nil {
+		t.Fatalf("associate: %v", err)
+	}
+	defer session.Close()
+	<-requests
+
+	destination := netip.MustParseAddrPort("[2001:db8::7]:19305")
+	if err := session.WriteTo(make([]byte, 9000), destination); !errors.Is(err, errSocksUDPTooLarge) {
+		t.Fatalf("expected an oversized datagram to be refused, got %v", err)
+	}
+	// The largest datagram that fits still goes.
+	fits := make([]byte, socksUDPMaxDatagram-len(encodeSocksAddress(destination))-3)
+	if err := session.WriteTo(fits, destination); err != nil {
+		t.Fatalf("a datagram that fits was refused: %v", err)
+	}
+	if err := relay.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	incoming := make([]byte, 64*1024)
+	read, _, err := relay.ReadFromUDP(incoming)
+	if err != nil {
+		t.Fatalf("relay read: %v", err)
+	}
+	if read != socksUDPMaxDatagram {
+		t.Fatalf("the relay received %d bytes, expected the %d-byte datagram that fits", read, socksUDPMaxDatagram)
 	}
 }
