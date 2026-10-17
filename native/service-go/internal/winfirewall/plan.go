@@ -70,9 +70,12 @@ const (
 	// card on purpose.
 	ConditionHelper ConditionKind = iota
 	// ConditionServices matches processes running as SYSTEM, LocalService or
-	// NetworkService: Windows' own services and the VPN daemons of other
+	// NetworkService - Windows' own services and the VPN daemons of other
 	// clients (Teredo, IKE, tailscaled, AnyConnect), which pin to an interface
-	// deliberately. The applications whose calls leaked run as the user.
+	// deliberately - and elevated processes: this helper, whatever path it was
+	// started by, and the app and its transport when started as
+	// administrator. The applications whose calls leaked run as the user,
+	// unelevated.
 	ConditionServices
 	// ConditionLoopback matches loopback traffic.
 	ConditionLoopback

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/windows"
+
 	"shadowssh/service/internal/platform"
 	"shadowssh/service/internal/tun"
 	"shadowssh/service/internal/winfirewall"
@@ -189,6 +191,7 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 	}
 
 	tunnel := &Socks5Client{Endpoint: options.TunnelEndpoint}
+	direct := directDialer{winnet.NewInterfaceDialer(internetEgress.InterfaceIndex, internetIndex6)}
 	var probeIPv6 func(ctx context.Context) IPv6Reach
 	if enforceIPv6 {
 		// Only a captured family needs to know whether the tunnel carries it.
@@ -198,7 +201,7 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 		Adapter:         adapter,
 		Attribution:     NewOwnerTable(windowsOwnerSnapshot),
 		Tunnel:          tunnel,
-		Direct:          directDialer{winnet.NewInterfaceDialer(internetEgress.InterfaceIndex, internetIndex6)},
+		Direct:          direct,
 		Policy:          options.Policy,
 		Domains:         NewDomainCache(0),
 		TunnelIPv6Probe: probeIPv6,
@@ -219,6 +222,12 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 	runner := &Runner{options: options, routes: routes, plane: plane}
 	guardPlan := buildGuardPlan(adapter.LUID(), interfaceIndex, enforceIPv6, options.ProtectedAddresses, log)
 	guard, guardErr := winfirewall.Start(guardPlan)
+	if guardErr == nil {
+		if err := guardRefusesDirectDials(ctx, direct); err != nil {
+			_ = guard.Close()
+			guardErr = err
+		}
+	}
 	if guardErr != nil {
 		log("warning", "Traffic from sockets bound to the network card is not kept in the tunnel - calls (Google Meet, "+
 			"Zoom, Telegram) may send audio and video directly: "+guardErr.Error())
@@ -238,6 +247,32 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 		"TUN dataplane is up on interface %d (IPv6 capture %s, traffic guard %s, transport proxy %s).",
 		interfaceIndex, enabledLabel(enforceIPv6), enabledLabel(runner.guard != nil), options.TunnelEndpoint))
 	return runner, nil
+}
+
+// guardProbeAddress is where the guard's self-check dials: TEST-NET-1, which
+// no network routes anywhere, so nothing is ever contacted.
+var guardProbeAddress = netip.MustParseAddrPort("192.0.2.1:9")
+
+// guardRefusesDirectDials checks that the guard lets this helper's own direct
+// traffic through. A guard that does not would cut every flow the rules send
+// direct - which is what happened once, when the helper's identity in the
+// filters did not match the one Windows saw. WFP refuses at connect time, with
+// WSAEACCES and before a packet leaves; anything else - a timeout, an
+// unreachable network - means the guard did not interfere.
+func guardRefusesDirectDials(ctx context.Context, direct directDialer) error {
+	// WFP answers at once; the bound only caps what a dial that was let
+	// through costs the start.
+	ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	conn, err := direct.DialTCP(ctx, guardProbeAddress)
+	if err == nil {
+		_ = conn.Close()
+		return nil
+	}
+	if errors.Is(err, windows.WSAEACCES) {
+		return fmt.Errorf("with it in place this helper's own direct connections were refused, so it was removed: %w", err)
+	}
+	return nil
 }
 
 // routesWatchInterval is how often the routing table is re-read for the

@@ -208,10 +208,12 @@ rule changes meaning. Exempt:
 - DNS and DHCP to any address, and multicast and broadcast a socket receives (an operator's
   IPTV stream comes from a public source);
 - this helper (its interface-pinned direct dials and DNS forwarding), loopback, the adapter;
-- processes running as SYSTEM, LocalService or NetworkService, matched by an `ALE_USER_ID`
-  security descriptor: Windows' own services and other VPN clients' daemons (IKE, Teredo,
-  tailscaled, AnyConnect) pin to an interface deliberately. The applications that leaked run
-  as the user.
+- processes running as SYSTEM, LocalService or NetworkService, or elevated, matched by an
+  `ALE_USER_ID` security descriptor (`SY`, `LS`, `NS`, `BA`): Windows' own services and other
+  VPN clients' daemons (IKE, Teredo, tailscaled, AnyConnect) pin to an interface deliberately,
+  and this helper is always elevated, as are the app and its transport when started as
+  administrator. The applications that leaked run as the user, where Administrators is a
+  deny-only group that an allow entry never matches.
 
 The filters live in a *dynamic* WFP session in their own sublayer. Windows deletes them the
 moment the session's handle closes, including when the helper dies, so a crash cannot leave the
@@ -221,6 +223,17 @@ removed before them. If it cannot be installed the dataplane runs without it and
 costs. The structures WFP and `GetIpForwardTable2` take carry unions; their Go spelling follows
 wireguard-windows' `tunnel/firewall` and `winipcfg` and is checked against the 64-bit layout at
 compile time.
+
+The guard's first release cut every flow the rules send direct. The helper was exempted only by
+its WFP application identity, built from `os.Executable()`, and that identity did not match the
+one Windows saw: every direct dial failed with `WSAEACCES` while tunnelled sites kept working.
+The likely reason is the path - the portable build runs from `%TEMP%`, which under a non-ASCII
+user name is an 8.3 path (`C:\Users\FILIPP~1\...`), while Windows derives the identity from
+the image's full path. The identity is
+now built from the file's final, normalised path as well; the helper is also exempt as an
+elevated process; and right after installing the guard the helper dials TEST-NET-1 directly -
+WFP refuses at connect time, before anything is sent - and removes the guard if its own direct
+traffic is refused.
 
 What it costs: an application running as the user that binds to the network card on purpose -
 a torrent client pinned to Ethernet, a user-mode VPN client - cannot reach the internet through
