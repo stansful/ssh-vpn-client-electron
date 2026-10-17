@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -118,12 +120,16 @@ func (g *Guard) install(plan Plan) error {
 		}
 		g.subLayerKey = subLayerKey
 
-		appID, err := helperAppID()
+		appIDs, err := helperAppIDs()
 		if err != nil {
 			return err
 		}
-		defer fwpmFreeMemory0(&appID)
-		if _, err := g.addFilters(plan.StaticFilters(), appID); err != nil {
+		defer func() {
+			for index := range appIDs {
+				fwpmFreeMemory0(&appIDs[index])
+			}
+		}()
+		if _, err := g.addFilters(plan.StaticFilters(), appIDs); err != nil {
 			return err
 		}
 		reachable, err := g.addFilters(plan.ReachableFilters(), nil)
@@ -155,10 +161,10 @@ func (g *Guard) transaction(operation func() error) (err error) {
 	return nil
 }
 
-func (g *Guard) addFilters(filters []Filter, appID *fwpByteBlob) ([]uint64, error) {
+func (g *Guard) addFilters(filters []Filter, appIDs []*fwpByteBlob) ([]uint64, error) {
 	ids := make([]uint64, 0, len(filters))
 	for _, filter := range filters {
-		id, err := g.addFilter(filter, appID)
+		id, err := g.addFilter(filter, appIDs)
 		if err != nil {
 			return nil, fmt.Errorf("add filter %q: %w", filter.Name, err)
 		}
@@ -167,26 +173,94 @@ func (g *Guard) addFilters(filters []Filter, appID *fwpByteBlob) ([]uint64, erro
 	return ids, nil
 }
 
-// helperAppID is the WFP application identity of this executable, which the
-// filters exempt: the dataplane's own direct traffic leaves by the network
-// card on purpose.
-func helperAppID() (*fwpByteBlob, error) {
+// helperAppIDs are the WFP application identities this executable may be
+// known by, which the filters exempt: the dataplane's own direct traffic
+// leaves by the network card on purpose.
+//
+// The identity WFP compares is built from the image's full path, and the path
+// this process was started by need not be it: the portable build runs from
+// %TEMP%, which under a non-ASCII user name is an 8.3 path such as
+// C:\Users\FILIPP~1\AppData\Local\Temp. An identity built from the path as
+// started did not match on a user's machine, every direct flow of the helper
+// was refused, and the sites the rules leave direct stopped opening. So the
+// identity is also taken from the file's final, normalised path - and the
+// helper is exempt as an elevated process besides, which does not depend on
+// any path.
+func helperAppIDs() ([]*fwpByteBlob, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("locate this executable: %w", err)
 	}
-	path, err := windows.UTF16PtrFromString(executable)
-	if err != nil {
-		return nil, err
+	var paths []string
+	for _, candidate := range []string{finalPath(executable), longPath(executable), executable} {
+		if candidate != "" && !slices.ContainsFunc(paths, func(path string) bool { return strings.EqualFold(path, candidate) }) {
+			paths = append(paths, candidate)
+		}
 	}
-	var appID *fwpByteBlob
-	if err := fwpmGetAppIdFromFileName0(path, &appID); err != nil {
-		return nil, fmt.Errorf("resolve the application identity of %s: %w", executable, err)
+	var appIDs []*fwpByteBlob
+	var firstErr error
+	for _, path := range paths {
+		pointer, err := windows.UTF16PtrFromString(path)
+		if err != nil {
+			continue
+		}
+		var appID *fwpByteBlob
+		if err := fwpmGetAppIdFromFileName0(pointer, &appID); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("resolve the application identity of %s: %w", path, err)
+			}
+			continue
+		}
+		appIDs = append(appIDs, appID)
 	}
-	return appID, nil
+	if len(appIDs) == 0 {
+		return nil, firstErr
+	}
+	return appIDs, nil
 }
 
-func (g *Guard) addFilter(filter Filter, appID *fwpByteBlob) (uint64, error) {
+// finalPath is the file's normalised full path - long names, links and
+// junctions resolved - or empty when it cannot be read.
+func finalPath(path string) string {
+	pointer, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return ""
+	}
+	handle, err := windows.CreateFile(pointer, 0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(handle)
+	buffer := make([]uint16, windows.MAX_LONG_PATH)
+	// Flags zero: FILE_NAME_NORMALIZED and VOLUME_NAME_DOS.
+	length, err := windows.GetFinalPathNameByHandle(handle, &buffer[0], uint32(len(buffer)), 0)
+	if err != nil || length == 0 || int(length) >= len(buffer) {
+		return ""
+	}
+	final := windows.UTF16ToString(buffer[:length])
+	if strings.HasPrefix(final, `\\?\UNC\`) {
+		return `\\` + final[len(`\\?\UNC\`):]
+	}
+	return strings.TrimPrefix(final, `\\?\`)
+}
+
+// longPath expands 8.3 components of a path, or is empty when it cannot.
+func longPath(path string) string {
+	pointer, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return ""
+	}
+	buffer := make([]uint16, windows.MAX_LONG_PATH)
+	length, err := windows.GetLongPathName(pointer, &buffer[0], uint32(len(buffer)))
+	if err != nil || length == 0 || int(length) >= len(buffer) {
+		return ""
+	}
+	return windows.UTF16ToString(buffer[:length])
+}
+
+func (g *Guard) addFilter(filter Filter, appIDs []*fwpByteBlob) (uint64, error) {
 	name, err := windows.UTF16PtrFromString("Shadow SSH tunnel: " + filter.Name)
 	if err != nil {
 		return 0, err
@@ -195,7 +269,7 @@ func (g *Guard) addFilter(filter Filter, appID *fwpByteBlob) (uint64, error) {
 	// garbage collector does not follow. Everything they point at is kept in
 	// referents until Windows has copied the filter.
 	var referents []any
-	conditions, err := conditionsOf(filter, g.tunnelLUID, appID, &referents)
+	conditions, err := conditionsOf(filter, g.tunnelLUID, appIDs, &referents)
 	if err != nil {
 		return 0, err
 	}
@@ -235,27 +309,36 @@ func layerOf(filter Filter) windows.GUID {
 }
 
 // servicesDescriptor grants FWP_ACTRL_MATCH_FILTER - access right 0x1, which
-// SDDL spells "CC" - to SYSTEM, LocalService and NetworkService: an
-// ALE_USER_ID condition with it matches any process whose token holds one of
-// them.
-const servicesDescriptor = "D:(A;;CC;;;SY)(A;;CC;;;LS)(A;;CC;;;NS)"
+// SDDL spells "CC" - to SYSTEM, LocalService, NetworkService and enabled
+// BUILTIN\Administrators: an ALE_USER_ID condition with it matches any
+// process whose token holds one of them. The last is an elevated process -
+// this helper, which TUN requires to be elevated, and the app and its
+// transport when they were started as administrator. An ordinary
+// application holds Administrators only as a deny-only group, which an allow
+// entry never matches, so the browsers and messengers the guard is for are
+// not exempted by it.
+const servicesDescriptor = "D:(A;;CC;;;SY)(A;;CC;;;LS)(A;;CC;;;NS)(A;;CC;;;BA)"
 
 // conditionsOf spells one filter's condition the way WFP takes it. Several
 // conditions on the same field are alternatives; this is how one filter
 // covers a list of prefixes or ports. Conditions on different fields must all
 // hold.
-func conditionsOf(filter Filter, tunnelLUID uint64, appID *fwpByteBlob, referents *[]any) ([]fwpmFilterCondition0, error) {
+func conditionsOf(filter Filter, tunnelLUID uint64, appIDs []*fwpByteBlob, referents *[]any) ([]fwpmFilterCondition0, error) {
 	condition := filter.Condition
 	switch condition.Kind {
 	case ConditionHelper:
-		if appID == nil {
+		if len(appIDs) == 0 {
 			return nil, errors.New("the helper's application identity is not known")
 		}
-		return []fwpmFilterCondition0{{
-			fieldKey:       conditionALEAppID,
-			matchType:      fwpMatchEqual,
-			conditionValue: fwpValue0{kind: fwpByteBlobType, value: uintptr(unsafe.Pointer(appID))},
-		}}, nil
+		conditions := make([]fwpmFilterCondition0, 0, len(appIDs))
+		for _, appID := range appIDs {
+			conditions = append(conditions, fwpmFilterCondition0{
+				fieldKey:       conditionALEAppID,
+				matchType:      fwpMatchEqual,
+				conditionValue: fwpValue0{kind: fwpByteBlobType, value: uintptr(unsafe.Pointer(appID))},
+			})
+		}
+		return conditions, nil
 	case ConditionServices:
 		descriptor, err := windows.SecurityDescriptorFromString(servicesDescriptor)
 		if err != nil {
