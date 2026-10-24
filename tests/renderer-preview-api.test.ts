@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBrowserPreviewApi } from "../src/renderer/browser-preview-api.js";
 import { isAppSnapshot, snapshotOf } from "../src/renderer/hooks/useAsyncAction.js";
 
@@ -163,5 +163,31 @@ describe("browser preview API", () => {
     expect((await api.clearDiagnostics()).attention).toEqual([]);
     await api.clearLogFile();
     expect((await api.getLogFileInfo()).map((file) => file.exists)).toEqual([true, false, false]);
+  });
+
+  describe("with URL switches", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("fails to clear main.log with ?clearLogError=1 and keeps the files, like a locked log on Windows", async () => {
+      vi.stubGlobal("window", { location: { search: "?clearLogError=1" } });
+      const api = createBrowserPreviewApi();
+      await expect(api.clearLogFile()).rejects.toThrow("main.log couldn’t be cleared");
+      expect((await api.getLogFileInfo()).map((file) => file.exists)).toEqual([true, true, true]);
+    });
+  });
+
+  it("runs shell requests in order, so collapsing and re-expanding during an open leaves the shell open", async () => {
+    const api = createBrowserPreviewApi();
+    const requests = [api.openTerminal(), api.closeTerminal(), api.openTerminal()];
+    const [, , last] = await Promise.all(requests);
+    const markers = last.terminal.filter((line) => line.stream === "system").map((line) => line.text.trim());
+    expect(markers).toEqual(["SSH shell channel opened.", "Shell channel closed.", "SSH shell channel opened."]);
+    // The shell is up: input reaches it.
+    await expect(api.terminalInput("uptime\n")).resolves.toBeUndefined();
+    // A second open while it is up changes nothing, as in the main process.
+    const again = await api.openTerminal();
+    expect(again.terminal.filter((line) => line.stream === "system")).toHaveLength(3);
   });
 });

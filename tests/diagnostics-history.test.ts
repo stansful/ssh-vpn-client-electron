@@ -53,6 +53,12 @@ describe("diagnostics source", () => {
     expect(classifyDiagnosticSource("Routing mode changed while connected: mode=selected-rules", "xray")).toBe("routing");
     expect(classifyDiagnosticSource("Selected routing prepared: enabled=3", "ssh")).toBe("routing");
     expect(classifyDiagnosticSource("Windows proxy restore failed: denied", "xray")).toBe("routing");
+    expect(
+      classifyDiagnosticSource("The tunnel has been down for 30 s; returning the machine to direct routing until the session is back.", "xray")
+    ).toBe("routing");
+    expect(
+      classifyDiagnosticSource("Another program took Xray's local port while Xray was down (x); returning the machine to direct routing until Xray is back.", "xray")
+    ).toBe("routing");
     expect(classifyDiagnosticSource("Reconnect attempt 1 scheduled in 8 s: SSH keepalive timed out.", "ssh")).toBe("ssh");
     expect(classifyDiagnosticSource("Xray runtime exited with code 1.", "xray")).toBe("xray");
     expect(classifyDiagnosticSource("TUN routing is unavailable", "app")).toBe("app");

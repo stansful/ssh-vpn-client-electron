@@ -1,6 +1,6 @@
 import type { RoutingMode, RoutingRule } from "../../shared/types.js";
 import { normalizeRuleValue, validateRoutingRuleValue } from "../../shared/validation.js";
-import { ipMatchesCidr, parseCidrRange, parseIpAddress, type ParsedCidrRange } from "./ip-address.js";
+import { ipMatchesCidr, parseCidrRange, parseIpAddressUnmapped, type ParsedCidrRange } from "./ip-address.js";
 
 export interface TrafficDescriptor {
   destinationDomain?: string;
@@ -94,15 +94,22 @@ export class RoutingMatcher {
     }
   }
 
+  /**
+   * Matches the user's own rules in the shared routing order: a domain or IP
+   * rule, then a process rule, and only then proxy-all. Every rule proxies,
+   * so the order changes only the reported reason here; it matters to callers
+   * that place the local network between the two kinds of rule and the
+   * direct list between the rules and proxy-all (see TrafficPolicy).
+   */
   match(descriptor: TrafficDescriptor): RoutingMatch {
-    if (this.mode === "proxy-all") {
-      return { shouldProxy: true, reason: "proxy-all" };
+    if (this.mode !== "proxy-all" && this.enabledRulesCount() === 0) {
+      return this.unmatched();
     }
+    return this.matchDestination(descriptor) ?? this.matchProcess(descriptor.processName) ?? this.unmatched();
+  }
 
-    if (this.enabledRulesCount() === 0) {
-      return { shouldProxy: false, reason: "no-enabled-rules" };
-    }
-
+  /** A domain or IP rule naming the destination - the step ahead of the local network - or undefined. */
+  matchDestination(descriptor: Pick<TrafficDescriptor, "destinationDomain" | "destinationIp">): RoutingMatch | undefined {
     const domain = descriptor.destinationDomain?.trim().toLowerCase();
     if (domain) {
       const matched = this.matchDomain(domain);
@@ -111,23 +118,31 @@ export class RoutingMatcher {
       }
     }
 
-    const ip = descriptor.destinationIp ? parseIpAddress(descriptor.destinationIp) : undefined;
+    const ip = descriptor.destinationIp ? parseIpAddressUnmapped(descriptor.destinationIp) : undefined;
     if (ip) {
       const matched = this.ips.find((rule) => ipMatchesCidr(ip, rule.range));
       if (matched) {
         return { shouldProxy: true, reason: "ip", ruleId: matched.id };
       }
     }
+    return undefined;
+  }
 
-    const processName = descriptor.processName?.trim().toLowerCase();
-    if (processName) {
-      const matched = this.processes.get(processName);
-      if (matched) {
-        return { shouldProxy: true, reason: "process.name", ruleId: matched.id };
-      }
+  /** A process rule for the owning process, compared case-insensitively as written, or undefined. */
+  matchProcess(processName: string | undefined): RoutingMatch | undefined {
+    const name = processName?.trim().toLowerCase();
+    const matched = name ? this.processes.get(name) : undefined;
+    return matched ? { shouldProxy: true, reason: "process.name", ruleId: matched.id } : undefined;
+  }
+
+  /** The answer when no rule matches: proxy-all, or direct as "no-match" or "no-enabled-rules". */
+  unmatched(): RoutingMatch {
+    if (this.mode === "proxy-all") {
+      return { shouldProxy: true, reason: "proxy-all" };
     }
-
-    return { shouldProxy: false, reason: "no-match" };
+    return this.enabledRulesCount() === 0
+      ? { shouldProxy: false, reason: "no-enabled-rules" }
+      : { shouldProxy: false, reason: "no-match" };
   }
 
   summary(): RoutingMatcherSummary {

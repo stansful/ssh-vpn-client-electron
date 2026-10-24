@@ -1,7 +1,7 @@
 import { normalizeProxyDomain } from "../../../../core/routing/domain-proxy-list.js";
 import { proxyProtocolMark } from "../../../../shared/proxy-protocols.js";
 import { validateRoutingRuleValue } from "../../../../shared/validation.js";
-import type { AppSnapshot, AppStore, GlobalTab, ProxyProfile, RoutingRuleType, SshConfig } from "../../../../shared/types.js";
+import type { AppSnapshot, AppStore, DesktopPlatform, GlobalTab, ProxyProfile, RoutingRule, RoutingRuleType, SshConfig } from "../../../../shared/types.js";
 import { formatHostPort, formatProfileAddress, formatProfileSummary, formatSshTarget, initials, plural } from "../../../lib/format.js";
 
 /** What the Connect hero shows in its picker and copy for one transport. */
@@ -166,7 +166,9 @@ export function sessionTargetName(snapshot: Pick<AppSnapshot, "store" | "runtime
   return resolveTarget(snapshot, snapshot.activeTransport).target?.name ?? snapshot.runtime.activeConfigName;
 }
 
-type RoutingState = Pick<AppStore, "routingMode" | "routingRules" | "routingProxyList" | "routingDirectList">;
+type RoutingState = Pick<AppStore, "routingMode" | "routingRules" | "routingProxyList" | "routingDirectList"> & {
+  settings?: Pick<AppStore["settings"], "tunDataplaneEnabled">;
+};
 
 /** Display names of the curated domain lists (see the rename table in the brief). */
 export const PROXY_LIST_NAME = "Blocked in Russia";
@@ -208,14 +210,70 @@ export interface RoutingSummary {
   hint: string;
 }
 
-export function summarizeRouting(store: RoutingState): RoutingSummary {
+/**
+ * What Full tunnel keeps out of the tunnel, in words. Windows routing (system
+ * proxy, PAC, local enforcement, TUN) keeps the local network direct unless a
+ * rule names it, and the Russian services list when it is on and has sites.
+ * Elsewhere apps send the local proxy everything, and all of it is tunnelled.
+ *
+ * `appRules`: enabled app rules exist. The TUN adapter ranks an app rule ahead
+ * of the Russian services list in Full tunnel too, so that app's sites on the
+ * list use the tunnel; the Windows proxy path cannot tell apps apart and keeps
+ * them direct. Only the list is affected - an app rule never takes the local
+ * network along.
+ */
+export function fullTunnelDescription(steers: boolean, directListOn: boolean, appRules = false): string {
+  if (!steers) {
+    return "All traffic sent to the local proxy goes through the tunnel.";
+  }
+  if (!directListOn) {
+    return "All traffic goes through the tunnel. Your local network stays direct.";
+  }
+  return appRules
+    ? `All traffic goes through the tunnel. Your local network and sites on the ${DIRECT_LIST_NAME} list stay direct, except that with the TUN adapter an app you added a rule for reaches those sites through the tunnel too.`
+    : `All traffic goes through the tunnel. Your local network and sites on the ${DIRECT_LIST_NAME} list stay direct.`;
+}
+
+/**
+ * What the rules list says under Full tunnel: which rules change anything.
+ * Everything Full tunnel keeps direct (see fullTunnelDescription) is what a
+ * rule can still send through the tunnel - a user rule wins over the local
+ * network and the Russian services list on every Windows path, and an app
+ * rule over the list with the TUN adapter - so the notice names the same
+ * things the mode card does.
+ */
+export function fullTunnelRulesNotice(steers: boolean, directListOn: boolean, appRules = false): string {
+  if (!steers) {
+    return "Everything already goes through the tunnel, so these rules don’t change anything right now. They’re kept for Split tunnel.";
+  }
+  if (!directListOn) {
+    return "Everything but your local network already goes through the tunnel, so only rules that name your local network, such as 10.0.0.0/8, change anything right now. The rest are kept for Split tunnel.";
+  }
+  return appRules
+    ? `Everything but your local network and sites on the ${DIRECT_LIST_NAME} list already goes through the tunnel, so only rules that name those, such as 10.0.0.0/8 or a site on the list, change anything right now - and, with the TUN adapter, app rules, which send that app’s sites on the list through the tunnel too. The rest are kept for Split tunnel.`
+    : `Everything but your local network and sites on the ${DIRECT_LIST_NAME} list already goes through the tunnel, so only rules that name those, such as 10.0.0.0/8 or a site on the list, change anything right now. The rest are kept for Split tunnel.`;
+}
+
+/** Whether any enabled app (process) rule exists, for the Full tunnel copy above. */
+export function hasEnabledAppRules(rules: ReadonlyArray<Pick<RoutingRule, "type" | "enabled">>): boolean {
+  return rules.some((rule) => rule.enabled && rule.type === "process.name");
+}
+
+/**
+ * The routing at a glance. Only Windows routing (system proxy, PAC, local
+ * enforcement, TUN) reads the Russian services list; elsewhere apps send the
+ * local proxy everything, and the summary does not claim the list for them.
+ * An unknown platform (the browser preview) is described as Windows.
+ */
+export function summarizeRouting(store: RoutingState, platform: DesktopPlatform = "unknown"): RoutingSummary {
   const split = store.routingMode === "selected-rules";
   if (!split) {
-    const directList = store.routingDirectList.enabled && store.routingDirectList.domains.length > 0;
+    const steers = platform === "windows" || platform === "unknown";
+    const directList = steers && store.routingDirectList.enabled && store.routingDirectList.domains.length > 0;
     return {
       split,
       title: "Full tunnel",
-      sub: "All traffic goes through the tunnel. Sites on the Russian services list stay direct when the system proxy is used.",
+      sub: fullTunnelDescription(steers, directList, store.settings?.tunDataplaneEnabled === true && hasEnabledAppRules(store.routingRules)),
       badges: directList ? ["All traffic", `${DIRECT_LIST_NAME} stay direct`] : ["All traffic"],
       blocked: false,
       hint: directList

@@ -19,6 +19,7 @@ Shadow is a desktop client that sends your traffic through your own server, over
 - **Split tunnel.** Only the sites, IP addresses and apps you pick go through the server; everything else stays
   direct. Or send all traffic through the tunnel.
 - **Ready-made site lists.** Turn on the "blocked in Russia" list with one switch instead of adding hundreds of rules.
+  The "Russian services" list keeps Russian sites direct, even in full tunnel.
 - **Reconnects on its own.** When the link drops after sleep, a Wi-Fi change or a server hiccup, Shadow brings the
   tunnel back without you.
 - **Keeps secrets safe.** Passwords, keys and links are encrypted by the system store (Windows DPAPI, macOS Keychain,
@@ -40,9 +41,14 @@ SSH servers come with a built-in terminal, so you can run a command on the serve
 
 ### Routing
 
-Full tunnel or split tunnel. In split mode only the domains, IP addresses, apps and domain lists you chose go through
-the server. Changes apply instantly, even while connected. Rules steer traffic on Windows (see the
-[table below](#platform-support)).
+Full tunnel or split tunnel. In full tunnel everything goes through the server except sites on the Russian services
+list, when it's on, and, on Windows, your local network: private and CGNAT addresses (`192.168.x.x`, `10.x.x.x` and
+the like), names without a dot and `.local` names stay direct unless an IP or domain rule names them - a rule such as
+`10.0.0.0/8` reaches the network behind the server. `localhost` and other loopback addresses always stay on this
+computer, whatever the rules say. With the TUN adapter, ordinary DNS lookups (over UDP) also stay off the server in
+every mode: they go to the resolver your network gave you, as before connecting. In split mode only the
+domains, IP addresses, apps and domain lists you chose go through the server. Changes apply instantly, even while
+connected. Rules steer traffic on Windows (see the [table below](#platform-support)).
 
 ![Routing mode and domain lists](docs/images/routing.png)
 
@@ -53,8 +59,9 @@ tunnel. The TUN adapter also catches apps that ignore the system proxy. Rules ca
 
 ### SSH servers and keys
 
-Sign in with a password or a key (RSA, Ed25519; OpenSSH and PEM formats). Pin the server's fingerprint so a
-swapped host can't go unnoticed.
+Sign in with a password or a key: RSA, Ed25519 or ECDSA, in OpenSSH format (passphrase-protected too) or PEM.
+The server's key is remembered on the first connect; if it changes later, Shadow refuses to connect and tells you,
+so a swapped host can't go unnoticed. You can also pin the fingerprint up front in the Fingerprint field.
 
 ![SSH servers](docs/images/servers.png)
 
@@ -94,7 +101,8 @@ Light, dark or a custom theme, with your own accent colours.
 | Launch at sign-in                            |   ✅    |   —   |   —   |
 
 On macOS and Linux Shadow opens a local proxy on `127.0.0.1`. The Connect screen shows its address: set it in your
-browser or in the app you want to tunnel.
+browser or in the app you want to tunnel. Everything sent to it goes through the server, the local network included,
+as with `ssh -D`: `localhost` and private addresses are the server's.
 
 ## Install
 
@@ -124,7 +132,7 @@ and you install it yourself. Upgrading from Shadow SSH 2.4.0 or earlier? See the
 
 ## For developers
 
-You need Node.js 22.12+ (or 24+) and npm 10+. Building the installers also needs Go 1.23+.
+You need Node.js 22.12+ (or 24+) and npm 10+. Building the installers also needs Go 1.24.7+ (CI builds with Go 1.25).
 
 ```bash
 npm install

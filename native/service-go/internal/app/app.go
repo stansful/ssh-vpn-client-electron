@@ -45,7 +45,16 @@ type App struct {
 	dataplane          *dataplane.Runner
 	dataplanePolicy    *dataplane.Policy
 	dataplaneSignature string
-	logDiagnostic      func(level string, message string)
+	// shutdownTeardownErr is the incomplete dataplane teardown a Shutdown ran
+	// into. The teardown runs once, so a repeated Shutdown has nothing left
+	// to close and reports this again instead of a clean stop.
+	shutdownTeardownErr error
+	logDiagnostic       func(level string, message string)
+
+	// closeRunner and recoverRoutes reach the routing table. They are fields
+	// so the teardown and recovery sequencing can be tested off Windows.
+	closeRunner   func(ctx context.Context, runner *dataplane.Runner) error
+	recoverRoutes func(ctx context.Context, journalPath string, log func(level string, message string)) (int, error)
 }
 
 func New(options Options) *App {
@@ -70,9 +79,9 @@ func New(options Options) *App {
 
 	logDiagnostic := options.LogDiagnostic
 	if logDiagnostic == nil {
-		// Every line the helper writes to stderr is turned into a warning
-		// diagnostic by the Electron side, so an unconfigured sink still
-		// reaches the user rather than disappearing.
+		// The Electron side turns every stderr line into a diagnostic, at the
+		// level this prefix names, so an unconfigured sink still reaches the
+		// user rather than disappearing.
 		logDiagnostic = func(level string, message string) {
 			fmt.Fprintf(os.Stderr, "dataplane %s: %s\n", level, message)
 		}
@@ -84,6 +93,10 @@ func New(options Options) *App {
 		status:        status,
 		routingMode:   routing.ModeSelectedRules,
 		logDiagnostic: logDiagnostic,
+		closeRunner: func(ctx context.Context, runner *dataplane.Runner) error {
+			return runner.Close(ctx)
+		},
+		recoverRoutes: recoverRoutes,
 	}
 }
 
@@ -136,6 +149,8 @@ func (a *App) HandleCommand(ctx context.Context, command protocol.Command) proto
 		return a.handleStartDataplane(ctx, command)
 	case "stop-dataplane":
 		return a.handleStopDataplane(ctx, command)
+	case "recover-routes":
+		return a.handleRecoverRoutes(ctx, command)
 	case "list-process-connections":
 		return a.handleListProcessConnections(ctx, command)
 	case "shutdown":
@@ -152,8 +167,15 @@ func (a *App) Shutdown(ctx context.Context) error {
 	// anything else: leaving capture routes behind would take the machine
 	// offline.
 	if err := a.stopDataplane(ctx); err != nil {
-		a.setRoutingCleanupError(err)
-		return err
+		a.shutdownTeardownErr = err
+	}
+	// A dataplane that came down leaving routing changes to the journal is
+	// gone, so a retry - the SCM stop's second attempt, main's deferred
+	// cleanup - finds nothing to close. It must not report a clean stop while
+	// those changes wait for the next start.
+	if a.shutdownTeardownErr != nil {
+		a.setRoutingCleanupError(a.shutdownTeardownErr)
+		return a.shutdownTeardownErr
 	}
 	if err := a.clearRoutingAndSetDisconnected(ctx, "Native service stopped."); err != nil {
 		a.setRoutingCleanupError(err)
@@ -437,7 +459,7 @@ func cleanupContext(parent context.Context) (context.Context, context.CancelFunc
 
 func isStateChangingCommand(commandType string) bool {
 	switch commandType {
-	case "connect", "disconnect", "open-terminal", "close-terminal", "terminal-input", "update-config", "update-routing-rules", "update-routing", "start-dataplane", "stop-dataplane", "shutdown":
+	case "connect", "disconnect", "open-terminal", "close-terminal", "terminal-input", "update-config", "update-routing-rules", "update-routing", "start-dataplane", "stop-dataplane", "recover-routes", "shutdown":
 		return true
 	default:
 		return false

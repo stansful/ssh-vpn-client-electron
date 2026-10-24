@@ -45,6 +45,10 @@ const LINKS = [
   "VLESS://u@upper.example.org:443?type=grpc&security=tls#caps",
   "trojan://b71e0c2a9d4f6e83@203.0.113.77:443?security=tls&type=tcp#trojan-tokyo",
   "trojan://secret@trojan.example.com:443",
+  // A trojan-gfw link names no security: Trojan is TLS by definition.
+  "trojan://secret@trojan.example.com:443?sni=trojan.example.com#gfw",
+  "trojan://secret@trojan.example.com:443?security=none#plain",
+  "trojan://secret@trojan.example.com:443?tls=0#legacy-plain",
   "vless://u@bad-name.example:443#%E0%A4%A",
   vmess(vmessPayload),
   vmess({ ...vmessPayload, ps: "" }),
@@ -52,6 +56,15 @@ const LINKS = [
   vmess(vmessPayload, (encoded) => encoded.replace(/=+$/u, "").replace(/\+/gu, "-").replace(/\//gu, "_")),
   vmess(vmessPayload, (encoded) => `${encoded.slice(0, 10)}\n ${encoded.slice(10)}`),
   vmess(vmessPayload, (encoded) => `${encoded.slice(0, 12)}$${encoded.slice(12)}`),
+  // Internationalised hosts are shown as punycode, fingerprinted as before.
+  "vless://11111111-1111-4111-8111-111111111111@пример.рф:443?type=ws&security=tls#idn",
+  "trojan://secret@MÜNCHEN.de:443?security=tls",
+  "vless://u@%zz.example:443",
+  vmess({ ...vmessPayload, add: "Пример.рф", ps: "" }),
+  // Panels that write tls and net as other JSON types.
+  vmess({ ...vmessPayload, tls: true }),
+  vmess({ ...vmessPayload, tls: false, net: 7 }),
+  vmess(null),
   `hysteria2://letmein@hy.example.com:443/?sni=real.example.com&obfs=salamander&obfs-password=gawrgura&pinSHA256=${PIN}&insecure=1&up=50&down=200#fi-hel-hy2`,
   "hy2://letmein@hy.example.com#short",
   "HYSTERIA2://letmein@Upper.Example.ORG:8443#caps",

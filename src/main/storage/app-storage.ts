@@ -1,6 +1,6 @@
 import { app, safeStorage } from "electron";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
-import { access, chmod, mkdir, open, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, open, rename, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -17,7 +17,9 @@ import {
   RUSSIA_OUTSIDE_DIRECT_LIST_URL,
   STORE_SCHEMA_VERSION
 } from "../../shared/defaults.js";
-import { normalizeProxyProfileName, validateCheckEndpoint, validateSshServerFingerprint } from "../../shared/validation.js";
+import { canonicalIpRuleValue, normalizeProxyProfileName, validateCheckEndpoint, validateSshServerFingerprint } from "../../shared/validation.js";
+import { shareLinkHostToAscii } from "../../core/proxy/share-link-fields.js";
+import { isInsecureSecretFallbackAllowed } from "../app/packaged-runtime.js";
 import type {
   ImportProxyProfilesInput,
   ImportProxyProfilesResult,
@@ -87,6 +89,9 @@ export class StorageUnreadableError extends Error {
   }
 }
 
+/** A routing list to store; without `enabled` the stored switch stays as it is. */
+export type RoutingListUpdate<T extends RoutingProxyList | RoutingDirectList> = Omit<T, "enabled"> & { enabled?: boolean };
+
 export interface StorageInitResult {
   /**
    * Everything was read and is in use, but writing its migrated form back
@@ -104,6 +109,12 @@ export class AppStorage {
   private secrets: SecretStore = { schemaVersion: 1, secrets: {} };
   private secretsRevision = 0;
   /**
+   * The secrets file holds records memory no longer has: a failed save took
+   * them back in memory, and could not write the file back with them (see
+   * restoreStoreSecrets). The next store save writes the secrets file first.
+   */
+  private secretsFileStale = false;
+  /**
    * False until `init` succeeds. A store that could not be read is never
    * written over: the next save would replace whatever the user still had on
    * disk with defaults, so every mutation is refused until it is recovered.
@@ -113,6 +124,15 @@ export class AppStorage {
   private unreadableFiles: StorageFile[] | undefined;
   private readonly storeWriter: CoalescingAtomicJsonWriter;
   private readonly secretsWriter: CoalescingAtomicJsonWriter;
+  /** Public mutations run one at a time, so a failed save can be undone exactly. */
+  private mutationTail: Promise<void> = Promise.resolve();
+  /**
+   * What the running mutation goes back to when a save fails: the state last
+   * made durable. `storeSecrets` are the secret records that go with `store` -
+   * a key, password or link saved over its record in place belongs to the
+   * store change that names it, and goes back with it.
+   */
+  private rollbackPoint: MutationRollbackPoint | undefined;
 
   constructor(dataDir = path.join(app.getPath("userData"), "storage")) {
     this.dataDir = dataDir;
@@ -260,6 +280,7 @@ export class AppStorage {
     }
     const removedOrphanedSecrets = this.removeOrphanedSecrets();
     this.backfillKeyMetadata();
+    this.backfillTrojanSecurity();
 
     let writeError: Error | undefined;
     try {
@@ -330,323 +351,408 @@ export class AppStorage {
   }
 
   async upsertConfig(input: UpsertSshConfigInput): Promise<AppStore> {
-    this.assertWritable();
-    const fingerprintValidation = validateSshServerFingerprint(input.expectedServerFingerprint);
-    if (!fingerprintValidation.ok) {
-      throw new Error(fingerprintValidation.message);
-    }
-    const now = new Date().toISOString();
-    const existing = input.id ? this.store.sshConfigs.find((config) => config.id === input.id) : undefined;
-    const passwordSecretId =
-      input.password !== undefined && input.password.length > 0
-        ? await this.saveSecret("ssh-password", input.password, existing?.passwordSecretId)
-        : existing?.passwordSecretId;
+    return this.mutate(async () => {
+      const fingerprintValidation = validateSshServerFingerprint(input.expectedServerFingerprint);
+      if (!fingerprintValidation.ok) {
+        throw new Error(fingerprintValidation.message);
+      }
+      if (input.authType === "private-key" && input.privateKeyId && !this.store.sshKeys.some((key) => key.id === input.privateKeyId)) {
+        throw new Error("The selected SSH key no longer exists. Pick another key.");
+      }
+      const now = new Date().toISOString();
+      const existing = input.id ? this.store.sshConfigs.find((config) => config.id === input.id) : undefined;
+      const passwordSecretId =
+        input.password !== undefined && input.password.length > 0
+          ? await this.saveSecret("ssh-password", input.password, existing?.passwordSecretId)
+          : existing?.passwordSecretId;
 
-    const config: SshConfig = {
-      id: existing?.id ?? randomUUID(),
-      name: input.name.trim(),
-      host: input.host.trim(),
-      port: Number(input.port),
-      username: input.username.trim(),
-      authType: input.authType,
-      passwordSecretId,
-      privateKeyId: input.authType === "private-key" ? input.privateKeyId : undefined,
-      privateKeyPassphraseSecretId: undefined,
-      expectedServerFingerprint: input.expectedServerFingerprint.trim(),
-      keepaliveIntervalSec: Math.max(60, Number(input.keepaliveIntervalSec)),
-      note: input.note.trim(),
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
+      const host = input.host.trim();
+      const port = Number(input.port);
+      const expectedServerFingerprint = input.expectedServerFingerprint.trim();
+      const config: SshConfig = {
+        id: existing?.id ?? randomUUID(),
+        name: input.name.trim(),
+        host,
+        port,
+        username: input.username.trim(),
+        authType: input.authType,
+        passwordSecretId,
+        privateKeyId: input.authType === "private-key" ? input.privateKeyId : undefined,
+        privateKeyPassphraseSecretId: undefined,
+        expectedServerFingerprint,
+        ...keptHostKeyTrust(existing, { host, port, expectedServerFingerprint }),
+        ...keptPinnedHostKeyType(existing, expectedServerFingerprint),
+        keepaliveIntervalSec: Math.max(60, Number(input.keepaliveIntervalSec)),
+        note: input.note.trim(),
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now
+      };
+
+      if (existing) {
+        this.store.sshConfigs = this.store.sshConfigs.map((candidate) => (candidate.id === config.id ? config : candidate));
+      } else {
+        this.store.sshConfigs = [...this.store.sshConfigs, config];
+      }
+
+      if (!this.store.selectedConfigId) {
+        this.store.selectedConfigId = config.id;
+      }
+
+      await this.persistStore();
+      return this.getStore();
+    });
+  }
+
+  /**
+   * Trust on first use: saves the host key a server proved on its first
+   * authenticated connection, so later connections must find the same one.
+   *
+   * Only for the server as it is saved now - same host and port - and only
+   * while nothing is pinned or trusted yet: a pinned fingerprint is the
+   * user's word and wins, and a trusted key is replaced only by the user
+   * (pinning or clearing a pin, or editing the address, forgets it). Returns
+   * whether anything was saved.
+   */
+  async trustHostKeyOnFirstUse(input: { configId: string; host: string; port: number; fingerprint: string; keyType?: string }): Promise<boolean> {
+    const fingerprint = input.fingerprint.trim();
+    const eligible = (): SshConfig | undefined => {
+      const config = this.store.sshConfigs.find((candidate) => candidate.id === input.configId);
+      if (
+        !config ||
+        config.expectedServerFingerprint?.trim() ||
+        config.trustedHostKeyFingerprint ||
+        !sameSshEndpoint(config, input) ||
+        !validateSshServerFingerprint(fingerprint, false).ok
+      ) {
+        return undefined;
+      }
+      return config;
     };
-
-    if (existing) {
-      this.store.sshConfigs = this.store.sshConfigs.map((candidate) => (candidate.id === config.id ? config : candidate));
-    } else {
-      this.store.sshConfigs = [...this.store.sshConfigs, config];
+    // Answered without queueing in the common case: every Connected status
+    // asks, and only the first connection to a server has anything to save.
+    if (!this.initialized || !eligible()) {
+      return false;
     }
+    return this.mutate(async () => {
+      const config = eligible();
+      if (!config) {
+        return false;
+      }
+      const trusted: SshConfig = {
+        ...config,
+        trustedHostKeyFingerprint: fingerprint,
+        // The type saves nothing on its own; it makes a key of the same type
+        // that does not match final (see SshLiveClient.connect).
+        ...(isHostKeyType(input.keyType) ? { trustedHostKeyType: input.keyType } : {}),
+        trustedHostKeyAt: new Date().toISOString()
+      };
+      this.store.sshConfigs = this.store.sshConfigs.map((candidate) => (candidate.id === config.id ? trusted : candidate));
+      await this.persistStore();
+      return true;
+    });
+  }
 
-    if (!this.store.selectedConfigId) {
-      this.store.selectedConfigId = config.id;
+  /**
+   * Saves the type of a pinned host key once a session has verified the pin,
+   * so the first connect of every later run already knows it: a key of that
+   * type that does not match is then final, and an impostor cannot turn the
+   * mismatch into a retried network error by dropping the connection that
+   * asks for the other type (see SshLiveClient.connect). Only for the pin as
+   * it is saved now. Returns whether anything was saved.
+   */
+  async rememberPinnedHostKeyType(input: { configId: string; fingerprint: string; keyType?: string }): Promise<boolean> {
+    const fingerprint = input.fingerprint.trim();
+    const eligible = (): SshConfig | undefined => {
+      const config = this.store.sshConfigs.find((candidate) => candidate.id === input.configId);
+      if (
+        !config ||
+        !fingerprint ||
+        config.expectedServerFingerprint?.trim() !== fingerprint ||
+        !isHostKeyType(input.keyType) ||
+        config.pinnedHostKeyType === input.keyType
+      ) {
+        return undefined;
+      }
+      return config;
+    };
+    // Every Connected status asks; only the first verified connect after a
+    // pin was set has anything to save.
+    if (!this.initialized || !eligible()) {
+      return false;
     }
-
-    await this.persistStore();
-    return this.getStore();
+    return this.mutate(async () => {
+      const config = eligible();
+      if (!config || !isHostKeyType(input.keyType)) {
+        return false;
+      }
+      const remembered: SshConfig = { ...config, pinnedHostKeyType: input.keyType };
+      this.store.sshConfigs = this.store.sshConfigs.map((candidate) => (candidate.id === config.id ? remembered : candidate));
+      await this.persistStore();
+      return true;
+    });
   }
 
   async deleteConfig(id: string): Promise<AppStore> {
-    this.assertWritable();
-    const existing = this.store.sshConfigs.find((config) => config.id === id);
-    if (!existing) {
+    return this.mutate(async () => {
+      const existing = this.store.sshConfigs.find((config) => config.id === id);
+      if (!existing) {
+        return this.getStore();
+      }
+
+      this.store.sshConfigs = this.store.sshConfigs.filter((config) => config.id !== id);
+      if (this.store.selectedConfigId === id) {
+        this.store.selectedConfigId = this.store.sshConfigs[0]?.id;
+      }
+
+      await this.persistStore();
+      await this.deleteSecretsIfUnreferenced([
+        existing.passwordSecretId,
+        existing.privateKeyPassphraseSecretId
+      ]);
       return this.getStore();
-    }
-
-    this.store.sshConfigs = this.store.sshConfigs.filter((config) => config.id !== id);
-    if (this.store.selectedConfigId === id) {
-      this.store.selectedConfigId = this.store.sshConfigs[0]?.id;
-    }
-
-    await this.persistStore();
-    await this.deleteSecretsIfUnreferenced([
-      existing.passwordSecretId,
-      existing.privateKeyPassphraseSecretId
-    ]);
-    return this.getStore();
+    });
   }
 
   async selectConfig(id: string): Promise<AppStore> {
-    this.assertWritable();
-    if (!this.store.sshConfigs.some((config) => config.id === id)) {
-      throw new Error("SSH configuration does not exist.");
-    }
-    if (this.store.selectedConfigId === id) {
+    return this.mutate(async () => {
+      if (!this.store.sshConfigs.some((config) => config.id === id)) {
+        throw new Error("SSH configuration does not exist.");
+      }
+      if (this.store.selectedConfigId === id) {
+        return this.getStore();
+      }
+      this.store.selectedConfigId = id;
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.selectedConfigId = id;
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
   async upsertKey(input: UpsertSshKeyInput): Promise<AppStore> {
-    this.assertWritable();
-    const now = new Date().toISOString();
-    const existing = input.id ? this.store.sshKeys.find((key) => key.id === input.id) : undefined;
-    if (!existing && !input.privateKey) {
-      throw new Error("Private key is required for a new key.");
-    }
-    const normalizedPrivateKey =
-      input.privateKey !== undefined && input.privateKey.length > 0 ? normalizeSshPrivateKeyText(input.privateKey) : undefined;
-    if (normalizedPrivateKey !== undefined) {
-      assertSshPrivateKeyText(normalizedPrivateKey);
-    }
+    return this.mutate(async () => {
+      const now = new Date().toISOString();
+      const existing = input.id ? this.store.sshKeys.find((key) => key.id === input.id) : undefined;
+      if (!existing && !input.privateKey) {
+        throw new Error("Private key is required for a new key.");
+      }
+      const normalizedPrivateKey =
+        input.privateKey !== undefined && input.privateKey.length > 0 ? normalizeSshPrivateKeyText(input.privateKey) : undefined;
+      if (normalizedPrivateKey !== undefined) {
+        assertSshPrivateKeyText(normalizedPrivateKey);
+      }
 
-    const secretsRevisionBefore = this.secretsRevision;
-    const privateKeySecretId =
-      normalizedPrivateKey !== undefined
-        ? await this.saveSecret("private-key", normalizedPrivateKey, existing?.privateKeySecretId, false)
-        : existing?.privateKeySecretId;
-    const privateKeyPassphraseSecretId =
-      input.privateKeyPassphrase !== undefined && input.privateKeyPassphrase.length > 0
-        ? await this.saveSecret("private-key-passphrase", input.privateKeyPassphrase, existing?.privateKeyPassphraseSecretId, false)
-        : existing?.privateKeyPassphraseSecretId;
+      const secretsRevisionBefore = this.secretsRevision;
+      const privateKeySecretId =
+        normalizedPrivateKey !== undefined
+          ? await this.saveSecret("private-key", normalizedPrivateKey, existing?.privateKeySecretId, false)
+          : existing?.privateKeySecretId;
+      const privateKeyPassphraseSecretId =
+        input.privateKeyPassphrase !== undefined && input.privateKeyPassphrase.length > 0
+          ? await this.saveSecret("private-key-passphrase", input.privateKeyPassphrase, existing?.privateKeyPassphraseSecretId, false)
+          : existing?.privateKeyPassphraseSecretId;
 
-    if (!privateKeySecretId) {
-      throw new Error("Private key secret is missing.");
-    }
-    if (this.secretsRevision !== secretsRevisionBefore) {
-      await this.persistSecrets();
-    }
+      if (!privateKeySecretId) {
+        throw new Error("Private key secret is missing.");
+      }
+      if (this.secretsRevision !== secretsRevisionBefore) {
+        await this.persistSecrets();
+      }
 
-    const passphrase = input.privateKeyPassphrase || this.readSecretQuietly(privateKeyPassphraseSecretId);
-    const metadata = normalizedPrivateKey !== undefined
-      ? detectSshKeyMetadata(normalizedPrivateKey, passphrase)
-      : existing && hasKnownKeyMetadata(existing)
-        ? { keyType: existing.keyType, keyFormat: existing.keyFormat, encryptedOpenSsh: existing.encryptedOpenSsh }
-        : this.detectStoredKeyMetadata(privateKeySecretId, passphrase);
-    const key: SshKeyMetadata = {
-      id: existing?.id ?? randomUUID(),
-      name: input.name.trim(),
-      privateKeySecretId,
-      privateKeyPassphraseSecretId,
-      fingerprint: normalizedPrivateKey ? fingerprintSecret(normalizedPrivateKey) : existing?.fingerprint ?? "",
-      ...metadata,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
-    };
+      const passphrase = input.privateKeyPassphrase || this.readSecretQuietly(privateKeyPassphraseSecretId);
+      const metadata = normalizedPrivateKey !== undefined
+        ? withSecurityKeyChecked(detectSshKeyMetadata(normalizedPrivateKey, passphrase))
+        : existing && hasKnownKeyMetadata(existing)
+          ? {
+              keyType: existing.keyType,
+              keyFormat: existing.keyFormat,
+              encryptedOpenSsh: existing.encryptedOpenSsh,
+              ...(existing.securityKey !== undefined ? { securityKey: existing.securityKey } : {}),
+              ...(existing.unsupportedOpenSshCipher !== undefined ? { unsupportedOpenSshCipher: existing.unsupportedOpenSshCipher } : {}),
+              ...(existing.excessiveBcryptRounds !== undefined ? { excessiveBcryptRounds: existing.excessiveBcryptRounds } : {})
+            }
+          : this.detectStoredKeyMetadata(privateKeySecretId, passphrase);
+      const key: SshKeyMetadata = {
+        id: existing?.id ?? randomUUID(),
+        name: input.name.trim(),
+        privateKeySecretId,
+        privateKeyPassphraseSecretId,
+        fingerprint: normalizedPrivateKey ? fingerprintSecret(normalizedPrivateKey) : existing?.fingerprint ?? "",
+        ...metadata,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now
+      };
 
-    if (existing) {
-      this.store.sshKeys = this.store.sshKeys.map((candidate) => (candidate.id === key.id ? key : candidate));
-    } else {
-      this.store.sshKeys = [...this.store.sshKeys, key];
-    }
+      if (existing) {
+        this.store.sshKeys = this.store.sshKeys.map((candidate) => (candidate.id === key.id ? key : candidate));
+      } else {
+        this.store.sshKeys = [...this.store.sshKeys, key];
+      }
 
-    await this.persistStore();
-    return this.getStore();
+      await this.persistStore();
+      return this.getStore();
+    });
   }
 
   async deleteKey(id: string): Promise<AppStore> {
-    this.assertWritable();
-    if (this.store.sshConfigs.some((config) => config.privateKeyId === id)) {
-      throw new Error("This private key is used by at least one SSH configuration.");
-    }
+    return this.mutate(async () => {
+      if (this.store.sshConfigs.some((config) => config.privateKeyId === id)) {
+        throw new Error("This private key is used by at least one SSH configuration.");
+      }
 
-    const existing = this.store.sshKeys.find((key) => key.id === id);
-    if (existing) {
-      this.store.sshKeys = this.store.sshKeys.filter((key) => key.id !== id);
-      await this.persistStore();
-      await this.deleteSecretsIfUnreferenced([
-        existing.privateKeySecretId,
-        existing.privateKeyPassphraseSecretId
-      ]);
-    }
+      const existing = this.store.sshKeys.find((key) => key.id === id);
+      if (existing) {
+        this.store.sshKeys = this.store.sshKeys.filter((key) => key.id !== id);
+        await this.persistStore();
+        await this.deleteSecretsIfUnreferenced([
+          existing.privateKeySecretId,
+          existing.privateKeyPassphraseSecretId
+        ]);
+      }
 
-    return this.getStore();
+      return this.getStore();
+    });
   }
 
   async updateSettings(patch: Partial<AppSettings>): Promise<AppStore> {
-    this.assertWritable();
-    const checkEndpoint = patch.checkEndpoint?.trim();
-    // Only a changed endpoint is checked: a settings patch may carry back an
-    // endpoint saved before the rules got stricter, and that must not block
-    // every other setting.
-    if (checkEndpoint !== undefined && checkEndpoint !== this.store.settings.checkEndpoint) {
-      const validation = validateCheckEndpoint(checkEndpoint);
-      if (!validation.ok) {
-        throw new Error(validation.message);
+    return this.mutate(async () => {
+      const checkEndpoint = patch.checkEndpoint?.trim();
+      // Only a changed endpoint is checked: a settings patch may carry back an
+      // endpoint saved before the rules got stricter, and that must not block
+      // every other setting.
+      if (checkEndpoint !== undefined && checkEndpoint !== this.store.settings.checkEndpoint) {
+        const validation = validateCheckEndpoint(checkEndpoint);
+        if (!validation.ok) {
+          throw new Error(validation.message);
+        }
       }
-    }
-    const nextSettings: AppSettings = {
-      ...this.store.settings,
-      ...patch,
-      ...(checkEndpoint !== undefined ? { checkEndpoint } : {}),
-      customTheme: patch.customTheme
-        ? { ...this.store.settings.customTheme, ...patch.customTheme }
-        : this.store.settings.customTheme
-    };
-    if (isDeepStrictEqual(nextSettings, this.store.settings)) {
+      const nextSettings: AppSettings = {
+        ...this.store.settings,
+        ...patch,
+        ...(checkEndpoint !== undefined ? { checkEndpoint } : {}),
+        customTheme: patch.customTheme
+          ? { ...this.store.settings.customTheme, ...patch.customTheme }
+          : this.store.settings.customTheme
+      };
+      if (isDeepStrictEqual(nextSettings, this.store.settings)) {
+        return this.getStore();
+      }
+      this.store.settings = nextSettings;
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.settings = nextSettings;
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
   async updateRoutingMode(mode: RoutingMode): Promise<AppStore> {
-    this.assertWritable();
-    if (mode === this.store.routingMode) {
+    return this.mutate(async () => {
+      if (mode !== "proxy-all" && mode !== "selected-rules") {
+        throw new Error("Routing mode is invalid.");
+      }
+      if (mode === this.store.routingMode) {
+        return this.getStore();
+      }
+      this.store.routingMode = mode;
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.routingMode = mode;
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
   async updateRoutingRules(rules: RoutingRule[]): Promise<AppStore> {
-    this.assertWritable();
-    if (!Array.isArray(rules) || rules.length > MAX_ROUTING_RULES) {
-      throw new Error(`Routing rule count exceeds the ${MAX_ROUTING_RULES} rule limit.`);
-    }
-    if (isDeepStrictEqual(rules, this.store.routingRules)) {
+    return this.mutate(async () => {
+      if (!Array.isArray(rules) || rules.length > MAX_ROUTING_RULES) {
+        throw new Error(`Routing rule count exceeds the ${MAX_ROUTING_RULES} rule limit.`);
+      }
+      if (isDeepStrictEqual(rules, this.store.routingRules)) {
+        return this.getStore();
+      }
+      this.store.routingRules = rules;
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.routingRules = rules;
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
-  async updateRoutingProxyList(list: RoutingProxyList): Promise<AppStore> {
-    this.assertWritable();
-    const nextList: RoutingProxyList = {
-      enabled: list.enabled,
-      sourceUrl: list.sourceUrl.trim() || RUSSIA_INSIDE_PROXY_LIST_URL,
-      domains: normalizeDomainList(list.domains),
-      updatedAt: list.updatedAt
-    };
-    if (isDeepStrictEqual(nextList, this.store.routingProxyList)) {
+  /** A list update that leaves out `enabled` keeps the stored switch, whatever it became meanwhile. */
+  async updateRoutingProxyList(list: RoutingListUpdate<RoutingProxyList>): Promise<AppStore> {
+    return this.mutate(async () => {
+      const nextList: RoutingProxyList = {
+        enabled: list.enabled ?? this.store.routingProxyList.enabled,
+        sourceUrl: list.sourceUrl.trim() || RUSSIA_INSIDE_PROXY_LIST_URL,
+        domains: normalizeDomainList(list.domains),
+        updatedAt: list.updatedAt
+      };
+      if (isDeepStrictEqual(nextList, this.store.routingProxyList)) {
+        return this.getStore();
+      }
+      this.store.routingProxyList = nextList;
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.routingProxyList = nextList;
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
-  async updateRoutingDirectList(list: RoutingDirectList): Promise<AppStore> {
-    this.assertWritable();
-    const nextList: RoutingDirectList = {
-      enabled: list.enabled,
-      sourceUrl: list.sourceUrl.trim() || RUSSIA_OUTSIDE_DIRECT_LIST_URL,
-      domains: normalizeDomainList(list.domains),
-      updatedAt: list.updatedAt
-    };
-    if (isDeepStrictEqual(nextList, this.store.routingDirectList)) {
+  async updateRoutingDirectList(list: RoutingListUpdate<RoutingDirectList>): Promise<AppStore> {
+    return this.mutate(async () => {
+      const nextList: RoutingDirectList = {
+        enabled: list.enabled ?? this.store.routingDirectList.enabled,
+        sourceUrl: list.sourceUrl.trim() || RUSSIA_OUTSIDE_DIRECT_LIST_URL,
+        domains: normalizeDomainList(list.domains),
+        updatedAt: list.updatedAt
+      };
+      if (isDeepStrictEqual(nextList, this.store.routingDirectList)) {
+        return this.getStore();
+      }
+      this.store.routingDirectList = nextList;
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.routingDirectList = nextList;
-    await this.persistStore();
-    return this.getStore();
+    });
+  }
+
+  /** Turns Blocked in Russia on or off, keeping the domains the store holds when the change runs. */
+  async setRoutingProxyListEnabled(enabled: boolean): Promise<AppStore> {
+    return this.mutate(async () => {
+      if (this.store.routingProxyList.enabled === enabled) {
+        return this.getStore();
+      }
+      this.store.routingProxyList = { ...this.store.routingProxyList, enabled };
+      await this.persistStore();
+      return this.getStore();
+    });
+  }
+
+  /** Turns Russian services on or off, keeping the domains the store holds when the change runs. */
+  async setRoutingDirectListEnabled(enabled: boolean): Promise<AppStore> {
+    return this.mutate(async () => {
+      if (this.store.routingDirectList.enabled === enabled) {
+        return this.getStore();
+      }
+      this.store.routingDirectList = { ...this.store.routingDirectList, enabled };
+      await this.persistStore();
+      return this.getStore();
+    });
   }
 
   async upsertProxyProfile(input: UpsertProxyProfileInput): Promise<AppStore> {
-    this.assertWritable();
-    const parsed = parseProxyShareLink(input.rawUri.trim());
-    const now = new Date().toISOString();
-    const existingById = input.id ? this.store.proxyProfiles.find((profile) => profile.id === input.id) : undefined;
-    const existingByFingerprint = this.store.proxyProfiles.find((profile) => profile.fingerprint === parsed.fingerprint);
-    const existing = existingById ?? existingByFingerprint;
-    assertStoredProxyProfileCapacity(this.store.proxyProfiles.length, existing ? 0 : 1);
-    const rawUriSecretId = await this.saveSecret("proxy-uri", parsed.rawUri, existing?.rawUriSecretId);
-    const profile: ProxyProfile = {
-      id: existing?.id ?? randomUUID(),
-      name: input.name.trim() || parsed.name,
-      protocol: parsed.protocol,
-      host: parsed.host,
-      port: parsed.port,
-      // Built field by field, so a new link without a hop list or the insecure flag drops the stored one.
-      ...(parsed.hopPorts ? { hopPorts: parsed.hopPorts } : {}),
-      ...(parsed.insecureWithoutPin ? { insecureWithoutPin: true } : {}),
-      transport: parsed.transport,
-      security: parsed.security,
-      flow: parsed.flow,
-      source: input.source ?? existing?.source ?? "manual",
-      sourceUrl: existing?.sourceUrl,
-      rawUriSecretId,
-      fingerprint: parsed.fingerprint,
-      isSelected: existing?.isSelected ?? false,
-      isPinned: existing?.isPinned ?? false,
-      isStale: false,
-      lastTestStatus: existing?.lastTestStatus ?? "unknown",
-      lastLatencyMs: existing?.lastLatencyMs,
-      lastTestAt: existing?.lastTestAt,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-      lastSeenAt: now
-    };
-
-    this.store.proxyProfiles = existing
-      ? this.store.proxyProfiles.map((candidate) => (candidate.id === existing.id ? profile : candidate))
-      : [...this.store.proxyProfiles, profile];
-    this.ensureProxySelection();
-    await this.persistStore();
-    return this.getStore();
-  }
-
-  async importProxyProfiles(input: ImportProxyProfilesInput): Promise<{ store: AppStore; result: ImportProxyProfilesResult }> {
-    this.assertWritable();
-    const parsed = parseProxyShareLinks(input.text);
-    const knownFingerprints = new Set(this.store.proxyProfiles.map((profile) => profile.fingerprint));
-    let additionalProfiles = 0;
-    for (const profile of parsed.profiles) {
-      if (!knownFingerprints.has(profile.fingerprint)) {
-        knownFingerprints.add(profile.fingerprint);
-        additionalProfiles += 1;
-      }
-    }
-    assertStoredProxyProfileCapacity(this.store.proxyProfiles.length, additionalProfiles);
-    const now = new Date().toISOString();
-    const secretsRevisionBefore = this.secretsRevision;
-    const nextProfiles = [...this.store.proxyProfiles];
-    const profilesByFingerprint = new Map(nextProfiles.map((profile) => [profile.fingerprint, profile]));
-    const profileIndexById = new Map(nextProfiles.map((profile, index) => [profile.id, index]));
-    let imported = 0;
-    let updated = 0;
-
-    for (const profileInput of parsed.profiles) {
-      const existing = profilesByFingerprint.get(profileInput.fingerprint);
-      const rawUriSecretId = await this.saveSecret("proxy-uri", profileInput.rawUri, existing?.rawUriSecretId, false);
+    return this.mutate(async () => {
+      const parsed = parseProxyShareLink(input.rawUri.trim());
+      const now = new Date().toISOString();
+      const existingById = input.id ? this.store.proxyProfiles.find((profile) => profile.id === input.id) : undefined;
+      const existingByFingerprint = this.store.proxyProfiles.find((profile) => profile.fingerprint === parsed.fingerprint);
+      const existing = existingById ?? existingByFingerprint;
+      assertStoredProxyProfileCapacity(this.store.proxyProfiles.length, existing ? 0 : 1);
+      const rawUriSecretId = await this.saveSecret("proxy-uri", parsed.rawUri, existing?.rawUriSecretId);
       const profile: ProxyProfile = {
         id: existing?.id ?? randomUUID(),
-        name: existing?.name || profileInput.name,
-        protocol: profileInput.protocol,
-        host: profileInput.host,
-        port: profileInput.port,
-        ...(profileInput.hopPorts ? { hopPorts: profileInput.hopPorts } : {}),
-        ...(profileInput.insecureWithoutPin ? { insecureWithoutPin: true } : {}),
-        transport: profileInput.transport,
-        security: profileInput.security,
-        flow: profileInput.flow,
-        source: input.source,
-        sourceUrl: input.sourceUrl,
+        name: input.name.trim() || parsed.name,
+        protocol: parsed.protocol,
+        host: parsed.host,
+        port: parsed.port,
+        // Built field by field, so a new link without a hop list or the insecure flag drops the stored one.
+        ...(parsed.hopPorts ? { hopPorts: parsed.hopPorts } : {}),
+        ...(parsed.insecureWithoutPin ? { insecureWithoutPin: true } : {}),
+        transport: parsed.transport,
+        security: parsed.security,
+        flow: parsed.flow,
+        source: input.source ?? existing?.source ?? "manual",
+        sourceUrl: existing?.sourceUrl,
         rawUriSecretId,
-        fingerprint: profileInput.fingerprint,
+        fingerprint: parsed.fingerprint,
         isSelected: existing?.isSelected ?? false,
         isPinned: existing?.isPinned ?? false,
         isStale: false,
@@ -657,76 +763,140 @@ export class AppStorage {
         updatedAt: now,
         lastSeenAt: now
       };
-      if (existing) {
-        updated += 1;
-        const index = profileIndexById.get(existing.id);
-        if (index !== undefined) {
-          nextProfiles[index] = profile;
+
+      this.store.proxyProfiles = existing
+        ? this.store.proxyProfiles.map((candidate) => (candidate.id === existing.id ? profile : candidate))
+        : [...this.store.proxyProfiles, profile];
+      this.ensureProxySelection();
+      await this.persistStore();
+      return this.getStore();
+    });
+  }
+
+  async importProxyProfiles(input: ImportProxyProfilesInput): Promise<{ store: AppStore; result: ImportProxyProfilesResult }> {
+    return this.mutate(async () => {
+      const parsed = parseProxyShareLinks(input.text);
+      const knownFingerprints = new Set(this.store.proxyProfiles.map((profile) => profile.fingerprint));
+      let additionalProfiles = 0;
+      for (const profile of parsed.profiles) {
+        if (!knownFingerprints.has(profile.fingerprint)) {
+          knownFingerprints.add(profile.fingerprint);
+          additionalProfiles += 1;
         }
-      } else {
-        imported += 1;
-        profileIndexById.set(profile.id, nextProfiles.length);
-        nextProfiles.push(profile);
       }
-      profilesByFingerprint.set(profile.fingerprint, profile);
-    }
+      assertStoredProxyProfileCapacity(this.store.proxyProfiles.length, additionalProfiles);
+      const now = new Date().toISOString();
+      const secretsRevisionBefore = this.secretsRevision;
+      const nextProfiles = [...this.store.proxyProfiles];
+      const profilesByFingerprint = new Map(nextProfiles.map((profile) => [profile.fingerprint, profile]));
+      const profileIndexById = new Map(nextProfiles.map((profile, index) => [profile.id, index]));
+      let imported = 0;
+      let updated = 0;
 
-    this.store.proxyProfiles = nextProfiles;
+      for (const profileInput of parsed.profiles) {
+        const existing = profilesByFingerprint.get(profileInput.fingerprint);
+        const rawUriSecretId = await this.saveSecret("proxy-uri", profileInput.rawUri, existing?.rawUriSecretId, false);
+        const profile: ProxyProfile = {
+          id: existing?.id ?? randomUUID(),
+          name: existing?.name || profileInput.name,
+          protocol: profileInput.protocol,
+          host: profileInput.host,
+          port: profileInput.port,
+          ...(profileInput.hopPorts ? { hopPorts: profileInput.hopPorts } : {}),
+          ...(profileInput.insecureWithoutPin ? { insecureWithoutPin: true } : {}),
+          transport: profileInput.transport,
+          security: profileInput.security,
+          flow: profileInput.flow,
+          source: input.source,
+          sourceUrl: input.sourceUrl,
+          rawUriSecretId,
+          fingerprint: profileInput.fingerprint,
+          isSelected: existing?.isSelected ?? false,
+          isPinned: existing?.isPinned ?? false,
+          isStale: false,
+          lastTestStatus: existing?.lastTestStatus ?? "unknown",
+          lastLatencyMs: existing?.lastLatencyMs,
+          lastTestAt: existing?.lastTestAt,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+          lastSeenAt: now
+        };
+        if (existing) {
+          updated += 1;
+          const index = profileIndexById.get(existing.id);
+          if (index !== undefined) {
+            nextProfiles[index] = profile;
+          }
+        } else {
+          imported += 1;
+          profileIndexById.set(profile.id, nextProfiles.length);
+          nextProfiles.push(profile);
+        }
+        profilesByFingerprint.set(profile.fingerprint, profile);
+      }
 
-    if (input.source === "remote" && input.sourceUrl) {
-      const fingerprints = new Set(parsed.profiles.map((profile) => profile.fingerprint));
-      this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
-        profile.source === "remote" && profile.sourceUrl === input.sourceUrl && !fingerprints.has(profile.fingerprint)
-          ? { ...profile, isStale: true, updatedAt: now }
-          : profile
-      );
-      // Kept apart from the profiles, which "Remove unpinned" can delete.
-      this.store.publicProxyRefresh = { at: now, listed: fingerprints.size };
-    }
+      // The links are saved before any profile that needs one is shown: a
+      // failed save leaves the store as it was instead of naming secrets
+      // that were never written.
+      if (this.secretsRevision !== secretsRevisionBefore) {
+        await this.persistSecrets();
+      }
+      this.store.proxyProfiles = nextProfiles;
 
-    if (this.secretsRevision !== secretsRevisionBefore) {
-      await this.persistSecrets();
-    }
-    this.ensureProxySelection();
-    await this.persistStore();
-    const result: ImportProxyProfilesResult = {
-      imported,
-      updated,
-      skipped: parsed.skipped,
-      failed: parsed.errors.length,
-      errors: parsed.errors.slice(0, MAX_IMPORT_ERRORS_RETURNED)
-    };
-    return { store: this.getStore(), result };
+      if (input.source === "remote" && input.sourceUrl) {
+        const fingerprints = new Set(parsed.profiles.map((profile) => profile.fingerprint));
+        this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
+          profile.source === "remote" && profile.sourceUrl === input.sourceUrl && !fingerprints.has(profile.fingerprint)
+            ? { ...profile, isStale: true, updatedAt: now }
+            : profile
+        );
+        // Kept apart from the profiles, which "Remove unpinned" can delete.
+        this.store.publicProxyRefresh = { at: now, listed: fingerprints.size };
+      }
+
+      this.ensureProxySelection();
+      await this.persistStore();
+      const result: ImportProxyProfilesResult = {
+        imported,
+        updated,
+        skipped: parsed.skipped,
+        failed: parsed.errors.length,
+        errors: parsed.errors.slice(0, MAX_IMPORT_ERRORS_RETURNED)
+      };
+      return { store: this.getStore(), result };
+    });
   }
 
   async selectProxyProfile(id: string): Promise<AppStore> {
-    this.assertWritable();
-    const profile = this.store.proxyProfiles.find((candidate) => candidate.id === id);
-    if (!profile) {
-      throw new Error("Proxy profile does not exist.");
-    }
-    if (!isSupportedProxyProfile(profile)) {
-      throw new Error(UNSUPPORTED_PROXY_PROFILE_MESSAGE);
-    }
-    if (this.store.selectedProxyProfileId === id) {
+    return this.mutate(async () => {
+      const profile = this.store.proxyProfiles.find((candidate) => candidate.id === id);
+      if (!profile) {
+        throw new Error("Proxy profile does not exist.");
+      }
+      if (!isSupportedProxyProfile(profile)) {
+        throw new Error(UNSUPPORTED_PROXY_PROFILE_MESSAGE);
+      }
+      if (this.store.selectedProxyProfileId === id) {
+        return this.getStore();
+      }
+      this.store.selectedProxyProfileId = id;
+      this.store.proxyProfiles = this.store.proxyProfiles.map((candidate) => ({ ...candidate, isSelected: candidate.id === id }));
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.selectedProxyProfileId = id;
-    this.store.proxyProfiles = this.store.proxyProfiles.map((candidate) => ({ ...candidate, isSelected: candidate.id === id }));
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
   async toggleProxyProfilePin(id: string): Promise<AppStore> {
-    this.assertWritable();
-    if (!this.store.proxyProfiles.some((profile) => profile.id === id)) {
+    return this.mutate(async () => {
+      if (!this.store.proxyProfiles.some((profile) => profile.id === id)) {
+        return this.getStore();
+      }
+      this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
+        profile.id === id ? { ...profile, isPinned: !profile.isPinned, updatedAt: new Date().toISOString() } : profile
+      );
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
-      profile.id === id ? { ...profile, isPinned: !profile.isPinned, updatedAt: new Date().toISOString() } : profile
-    );
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
   /**
@@ -735,49 +905,52 @@ export class AppStorage {
    * name). A blank name brings back the one import gave the link.
    */
   async renameProxyProfile(id: string, name: string): Promise<AppStore> {
-    this.assertWritable();
-    if (typeof id !== "string" || typeof name !== "string") {
-      throw new Error("Proxy profile name is invalid.");
-    }
-    const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
-    if (!existing) {
-      throw new Error("Proxy profile does not exist.");
-    }
-    const nextName = normalizeProxyProfileName(name) || this.linkProfileName(existing);
-    if (nextName === existing.name) {
+    return this.mutate(async () => {
+      if (typeof id !== "string" || typeof name !== "string") {
+        throw new Error("Proxy profile name is invalid.");
+      }
+      const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
+      if (!existing) {
+        throw new Error("Proxy profile does not exist.");
+      }
+      const nextName = normalizeProxyProfileName(name) || this.linkProfileName(existing);
+      if (nextName === existing.name) {
+        return this.getStore();
+      }
+      this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
+        profile.id === id ? { ...profile, name: nextName, updatedAt: new Date().toISOString() } : profile
+      );
+      await this.persistStore();
       return this.getStore();
-    }
-    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) =>
-      profile.id === id ? { ...profile, name: nextName, updatedAt: new Date().toISOString() } : profile
-    );
-    await this.persistStore();
-    return this.getStore();
+    });
   }
 
   async deleteProxyProfile(id: string): Promise<AppStore> {
-    this.assertWritable();
-    const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
-    if (!existing) {
+    return this.mutate(async () => {
+      const existing = this.store.proxyProfiles.find((profile) => profile.id === id);
+      if (!existing) {
+        return this.getStore();
+      }
+      this.store.proxyProfiles = this.store.proxyProfiles.filter((profile) => profile.id !== id);
+      this.ensureProxySelection();
+      await this.persistStore();
+      await this.deleteSecretsIfUnreferenced([existing.rawUriSecretId]);
       return this.getStore();
-    }
-    this.store.proxyProfiles = this.store.proxyProfiles.filter((profile) => profile.id !== id);
-    this.ensureProxySelection();
-    await this.persistStore();
-    await this.deleteSecretsIfUnreferenced([existing.rawUriSecretId]);
-    return this.getStore();
+    });
   }
 
   async deleteUnpinnedProxyProfiles(): Promise<AppStore> {
-    this.assertWritable();
-    const deleted = this.store.proxyProfiles.filter((profile) => !profile.isPinned);
-    if (deleted.length === 0) {
+    return this.mutate(async () => {
+      const deleted = this.store.proxyProfiles.filter((profile) => !profile.isPinned);
+      if (deleted.length === 0) {
+        return this.getStore();
+      }
+      this.store.proxyProfiles = this.store.proxyProfiles.filter((profile) => profile.isPinned);
+      this.ensureProxySelection();
+      await this.persistStore();
+      await this.deleteSecretsIfUnreferenced(deleted.map((profile) => profile.rawUriSecretId));
       return this.getStore();
-    }
-    this.store.proxyProfiles = this.store.proxyProfiles.filter((profile) => profile.isPinned);
-    this.ensureProxySelection();
-    await this.persistStore();
-    await this.deleteSecretsIfUnreferenced(deleted.map((profile) => profile.rawUriSecretId));
-    return this.getStore();
+    });
   }
 
   resolveServiceSecrets(config: SshConfig): SshServiceSecrets {
@@ -1024,39 +1197,184 @@ export class AppStorage {
   private detectStoredKeyMetadata(
     privateKeySecretId: string,
     passphrase: string | undefined
-  ): Partial<Pick<SshKeyMetadata, "keyType" | "keyFormat" | "encryptedOpenSsh">> {
+  ): Partial<
+    Pick<SshKeyMetadata, "keyType" | "keyFormat" | "encryptedOpenSsh" | "securityKey" | "unsupportedOpenSshCipher" | "excessiveBcryptRounds">
+  > {
     const privateKey = this.readSecretQuietly(privateKeySecretId);
-    return privateKey === undefined ? {} : detectSshKeyMetadata(privateKey, passphrase);
+    return privateKey === undefined ? {} : withSecurityKeyChecked(detectSshKeyMetadata(privateKey, passphrase));
   }
 
   /**
    * Keys saved before their type was recorded get it on the first start that
-   * can decrypt them. A key that cannot be decrypted right now is left alone
-   * and tried again next time.
+   * can decrypt them. OpenSSH keys saved before security-key (FIDO) keys were
+   * told apart are checked for that once: 2.6.1 stored an `sk-ecdsa-…` key as
+   * plain ECDSA and an `sk-ssh-ed25519` key as Ed25519, so nothing warned
+   * about them until Connect failed. The public section names the algorithm,
+   * so no passphrase is needed. The same check records how a passphrase-
+   * protected key is encrypted when the SSH core cannot open it - a cipher
+   * other than AES, or too many bcrypt rounds - which 2.6.1 did not look at
+   * either. A key that cannot be decrypted right now is left alone and tried
+   * again next time.
    */
   private backfillKeyMetadata(): void {
-    if (!this.store.sshKeys.some((key) => key.keyType === undefined)) {
+    if (!this.store.sshKeys.some((key) => key.keyType === undefined || needsSecurityKeyCheck(key))) {
       return;
     }
     this.store.sshKeys = this.store.sshKeys.map((key) => {
-      if (key.keyType !== undefined) {
-        return key;
+      if (key.keyType === undefined) {
+        const metadata = this.detectStoredKeyMetadata(
+          key.privateKeySecretId,
+          this.readSecretQuietly(key.privateKeyPassphraseSecretId)
+        );
+        return metadata.keyType === undefined ? key : { ...key, ...metadata };
       }
-      const metadata = this.detectStoredKeyMetadata(
-        key.privateKeySecretId,
-        this.readSecretQuietly(key.privateKeyPassphraseSecretId)
-      );
-      return metadata.keyType === undefined ? key : { ...key, ...metadata };
+      if (needsSecurityKeyCheck(key)) {
+        const privateKey = this.readSecretQuietly(key.privateKeySecretId);
+        if (privateKey === undefined) {
+          return key;
+        }
+        const { securityKey, unsupportedOpenSshCipher, excessiveBcryptRounds } = detectSshKeyMetadata(privateKey);
+        return {
+          ...key,
+          securityKey: securityKey === true,
+          ...(unsupportedOpenSshCipher !== undefined ? { unsupportedOpenSshCipher } : {}),
+          ...(excessiveBcryptRounds !== undefined ? { excessiveBcryptRounds } : {})
+        };
+      }
+      return key;
     });
   }
 
+  /**
+   * A trojan:// link with neither `security` nor `tls` used to be read as
+   * plaintext and saved with `security: "none"`; it is TLS (uriSecurityText),
+   * and that is how it connects now, since every connect reads the link
+   * itself. The saved label - on its card, in search, in the log - is
+   * brought in line from the link, which only main can read. Only a
+   * profile still labelled "none" is read; the link is not touched.
+   */
+  private backfillTrojanSecurity(): void {
+    if (!this.store.proxyProfiles.some((profile) => profile.protocol === "trojan" && profile.security === "none")) {
+      return;
+    }
+    this.store.proxyProfiles = this.store.proxyProfiles.map((profile) => {
+      if (profile.protocol !== "trojan" || profile.security !== "none") {
+        return profile;
+      }
+      const rawUri = this.readSecretQuietly(profile.rawUriSecretId);
+      if (rawUri === undefined) {
+        return profile;
+      }
+      try {
+        const { security } = parseProxyShareLink(rawUri);
+        return security === profile.security ? profile : { ...profile, security };
+      } catch {
+        return profile;
+      }
+    });
+  }
+
+  /**
+   * Runs a public mutation after the ones before it. Memory never keeps a
+   * change its file didn't get: when a save fails, the store (or the secrets)
+   * go back to the state last written, and the error goes to the caller.
+   */
+  private mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationTail.then(async () => {
+      this.assertWritable();
+      this.rollbackPoint = { store: { ...this.store }, secrets: { ...this.secrets.secrets }, storeSecrets: { ...this.secrets.secrets } };
+      try {
+        return await operation();
+      } finally {
+        this.rollbackPoint = undefined;
+      }
+    });
+    this.mutationTail = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
   private async persistStore(): Promise<void> {
-    await this.storeWriter.write(this.store);
+    try {
+      if (this.secretsFileStale) {
+        // Nothing else would write it: most saves change the store only.
+        // Until it is, the next start would read the records a failed save
+        // took back - a key every connect signs with under another key's
+        // fingerprint and type.
+        await this.secretsWriter.write(this.secrets);
+        this.secretsFileStale = false;
+        if (this.rollbackPoint) {
+          this.rollbackPoint.secrets = { ...this.secrets.secrets };
+        }
+      }
+      await this.storeWriter.write(this.store);
+    } catch (error) {
+      if (this.rollbackPoint) {
+        this.store = { ...this.rollbackPoint.store };
+        await this.restoreStoreSecrets(this.rollbackPoint);
+      }
+      throw error;
+    }
+    if (this.rollbackPoint) {
+      this.rollbackPoint.store = { ...this.store };
+      this.rollbackPoint.storeSecrets = { ...this.secrets.secrets };
+    }
+  }
+
+  /**
+   * After a failed store write, puts back the secret records the store that
+   * is still on disk goes with. upsertKey, upsertConfig and
+   * upsertProxyProfile save a new key, password or link over the record the
+   * entry already names, and write the secrets first: left alone, a save
+   * reported as failed would still have changed the key every connect signs
+   * with, under the old key's fingerprint and type. Rewriting the secrets
+   * file is best effort - the store write that failed is the error to
+   * report - and memory goes back either way. When the rewrite fails too,
+   * the file is marked stale, and the next store save writes it first.
+   */
+  private async restoreStoreSecrets(point: MutationRollbackPoint): Promise<void> {
+    const current = this.secrets.secrets;
+    const before = point.storeSecrets;
+    const changed =
+      Object.keys(current).length !== Object.keys(before).length || Object.keys(current).some((id) => current[id] !== before[id]);
+    if (!changed) {
+      return;
+    }
+    this.secrets.secrets = { ...before };
+    this.secretsRevision += 1;
+    try {
+      await this.secretsWriter.write(this.secrets);
+      this.secretsFileStale = false;
+      point.secrets = { ...this.secrets.secrets };
+    } catch {
+      // The file keeps what it has until the next save writes it again.
+      this.secretsFileStale = true;
+    }
   }
 
   private async persistSecrets(): Promise<void> {
-    await this.secretsWriter.write(this.secrets);
+    try {
+      await this.secretsWriter.write(this.secrets);
+    } catch (error) {
+      if (this.rollbackPoint) {
+        this.secrets.secrets = { ...this.rollbackPoint.secrets };
+        this.secretsRevision += 1;
+      }
+      throw error;
+    }
+    this.secretsFileStale = false;
+    if (this.rollbackPoint) {
+      this.rollbackPoint.secrets = { ...this.secrets.secrets };
+    }
   }
+}
+
+interface MutationRollbackPoint {
+  store: AppStore;
+  secrets: Record<string, SecretRecord>;
+  storeSecrets: Record<string, SecretRecord>;
 }
 
 function normalizeStore(input: AppStore): AppStore {
@@ -1097,10 +1415,27 @@ function normalizeStore(input: AppStore): AppStore {
     if (migrated.sourceUrl && LEGACY_PUBLIC_PROXY_LIST_URLS.includes(migrated.sourceUrl)) {
       migrated = { ...migrated, sourceUrl: PUBLIC_PROXY_LIST_URL };
     }
+    // A vless:// or trojan:// link with an internationalised name, imported
+    // before such names were converted, kept the percent-encoded host WHATWG
+    // URL gives those schemes. No resolver answers it: the TUN path found no
+    // server address to protect, and every label showed the encoding. It
+    // converts to the punycode the parser now stores; the link is untouched.
+    if (typeof migrated.host === "string" && migrated.host.includes("%")) {
+      const host = shareLinkHostToAscii(migrated.host);
+      if (host) {
+        migrated = { ...migrated, host };
+      }
+    }
     return migrated;
   });
   assertStoredProxyProfileCapacity(proxyProfiles.length, 0);
-  const routingRules = Array.isArray(input.routingRules) ? input.routingRules : [];
+  // IP rules saved before zero-padded prefixes were refused keep working
+  // (see canonicalIpRuleValue).
+  const routingRules = (Array.isArray(input.routingRules) ? input.routingRules : []).map((rule) =>
+    isPlainObject(rule) && rule.type === "ip" && typeof rule.value === "string" && canonicalIpRuleValue(rule.value) !== rule.value
+      ? { ...rule, value: canonicalIpRuleValue(rule.value) }
+      : rule
+  );
   if (routingRules.length > MAX_ROUTING_RULES) {
     throw new Error(`Routing rule count exceeds the ${MAX_ROUTING_RULES} rule limit.`);
   }
@@ -1134,7 +1469,7 @@ function normalizeStore(input: AppStore): AppStore {
         storedSchemaVersion
       )
     },
-    sshConfigs: Array.isArray(input.sshConfigs) ? input.sshConfigs : [],
+    sshConfigs: normalizeSshConfigs(input.sshConfigs),
     sshKeys: Array.isArray(input.sshKeys) ? input.sshKeys : [],
     proxyProfiles,
     selectedProxyProfileId: input.selectedProxyProfileId,
@@ -1143,6 +1478,121 @@ function normalizeStore(input: AppStore): AppStore {
     routingDirectList: normalizeRoutingDirectList(input.routingDirectList, defaults.routingDirectList),
     publicProxyRefresh: normalizePublicProxyRefresh(input.publicProxyRefresh)
   };
+}
+
+/**
+ * The trusted host key an edited server keeps. It is forgotten when the host
+ * or the port changes - that may be another machine - and whenever the
+ * pinned fingerprint is set, changed or cleared: a pin overrides it, and
+ * clearing one means the user wants the next key learned afresh.
+ */
+function keptHostKeyTrust(
+  existing: SshConfig | undefined,
+  next: { host: string; port: number; expectedServerFingerprint: string }
+): Pick<SshConfig, "trustedHostKeyFingerprint" | "trustedHostKeyType" | "trustedHostKeyAt"> {
+  if (
+    !existing?.trustedHostKeyFingerprint ||
+    next.expectedServerFingerprint ||
+    (existing.expectedServerFingerprint ?? "").trim() !== next.expectedServerFingerprint ||
+    !sameSshEndpoint(existing, next)
+  ) {
+    return {};
+  }
+  return {
+    trustedHostKeyFingerprint: existing.trustedHostKeyFingerprint,
+    ...(existing.trustedHostKeyType ? { trustedHostKeyType: existing.trustedHostKeyType } : {}),
+    ...(existing.trustedHostKeyAt ? { trustedHostKeyAt: existing.trustedHostKeyAt } : {})
+  };
+}
+
+/**
+ * The type an edited server keeps for its pinned key. A fingerprint names one
+ * key and so one type, so the type stays with the pin as long as the pin does,
+ * whatever else changes; a new pin starts without one - unless it is the key
+ * Shadow already trusted, whose type was saved with it.
+ */
+function keptPinnedHostKeyType(existing: SshConfig | undefined, expectedServerFingerprint: string): Pick<SshConfig, "pinnedHostKeyType"> {
+  if (!existing || !expectedServerFingerprint) {
+    return {};
+  }
+  if ((existing.expectedServerFingerprint ?? "").trim() === expectedServerFingerprint && isHostKeyType(existing.pinnedHostKeyType)) {
+    return { pinnedHostKeyType: existing.pinnedHostKeyType };
+  }
+  if (existing.trustedHostKeyFingerprint === expectedServerFingerprint && isHostKeyType(existing.trustedHostKeyType)) {
+    return { pinnedHostKeyType: existing.trustedHostKeyType };
+  }
+  return {};
+}
+
+/** The host key types the SSH client verifies, as OpenSSH names them. */
+function isHostKeyType(value: unknown): value is string {
+  return value === "ssh-ed25519" || value === "ssh-rsa";
+}
+
+/** Host names compare without case or IPv6 brackets; the port must be the same number. */
+function sameSshEndpoint(left: Pick<SshConfig, "host" | "port">, right: { host: string; port: number }): boolean {
+  const host = (value: string): string => value.trim().replace(/^\[(.*)\]$/u, "$1").toLowerCase();
+  return host(left.host) === host(right.host) && Number(left.port) === Number(right.port);
+}
+
+/**
+ * Drops a trusted host key that is not a fingerprint (an edited or damaged
+ * file), so it is learned again rather than failing every connection. Every
+ * other server is passed through as it is.
+ */
+function normalizeSshConfigs(value: unknown): SshConfig[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((input: SshConfig) => {
+    if (typeof input !== "object" || input === null) {
+      return input;
+    }
+    const config = withReadablePinnedHostKeyType(input);
+    const fingerprint: unknown = config.trustedHostKeyFingerprint;
+    const keyType: unknown = config.trustedHostKeyType;
+    const at: unknown = config.trustedHostKeyAt;
+    if (fingerprint === undefined && keyType === undefined && at === undefined) {
+      return config;
+    }
+    const validFingerprint = typeof fingerprint === "string" &&
+      fingerprint === fingerprint.trim() &&
+      validateSshServerFingerprint(fingerprint, false).ok;
+    const validKeyType = keyType === undefined || isHostKeyType(keyType);
+    if (validFingerprint && validKeyType && (at === undefined || typeof at === "string")) {
+      return config;
+    }
+    const repaired: SshConfig = { ...config };
+    if (!validFingerprint || !validKeyType) {
+      // A type that cannot be read is dropped with the rest: a wrong one
+      // would make the server's real key of the other type look like an
+      // impostor's.
+      delete repaired.trustedHostKeyType;
+    }
+    if (!validFingerprint || typeof at !== "string") {
+      delete repaired.trustedHostKeyAt;
+    }
+    if (validFingerprint) {
+      return repaired;
+    }
+    delete repaired.trustedHostKeyFingerprint;
+    return repaired;
+  });
+}
+
+/**
+ * Drops a pinned key's type that cannot be read, or that outlived its pin: a
+ * wrong one would make the server's real key of the other type look like an
+ * impostor's.
+ */
+function withReadablePinnedHostKeyType(config: SshConfig): SshConfig {
+  const keyType: unknown = config.pinnedHostKeyType;
+  if (keyType === undefined || (isHostKeyType(keyType) && typeof config.expectedServerFingerprint === "string" && config.expectedServerFingerprint.trim())) {
+    return config;
+  }
+  const repaired: SshConfig = { ...config };
+  delete repaired.pinnedHostKeyType;
+  return repaired;
 }
 
 function normalizePublicProxyRefresh(value: unknown): AppStore["publicProxyRefresh"] {
@@ -1191,6 +1641,19 @@ function normalizeSecretStore(input: SecretStore): SecretStore {
 
 function hasKnownKeyMetadata(key: SshKeyMetadata): boolean {
   return key.keyType !== undefined && key.keyType !== "unknown";
+}
+
+/**
+ * Records for an OpenSSH key whether it is a security-key (FIDO) key, false
+ * included, so the check on start (backfillKeyMetadata) runs once per key.
+ * Only OpenSSH keys can be one.
+ */
+function withSecurityKeyChecked<T extends Pick<SshKeyMetadata, "keyFormat" | "securityKey">>(metadata: T): T {
+  return metadata.keyFormat === "openssh" ? { ...metadata, securityKey: metadata.securityKey === true } : metadata;
+}
+
+function needsSecurityKeyCheck(key: SshKeyMetadata): boolean {
+  return key.keyFormat === "openssh" && key.securityKey === undefined;
 }
 
 /** Xray cannot run a profile whose security mode or transport the parser did not recognise. */
@@ -1277,7 +1740,7 @@ function normalizeDomainList(input: unknown): string[] {
 }
 
 function encryptSecret(value: string, dataDir: string): Pick<SecretRecord, "backend" | "ciphertext"> {
-  const insecureFallbackAllowed = process.env.SHADOW_SSH_ALLOW_INSECURE_SECRET_FALLBACK === "1";
+  const insecureFallbackAllowed = isInsecureSecretFallbackAllowed(app.isPackaged);
   const selectedBackend = process.platform === "linux" ? safeStorage.getSelectedStorageBackend?.() : undefined;
   if (isSafeStorageBackendUsable(safeStorage.isEncryptionAvailable(), process.platform, selectedBackend, insecureFallbackAllowed)) {
     return {
@@ -1320,7 +1783,7 @@ export function isProductionSecretStorageRuntime(isPackaged: boolean | undefined
 }
 
 export function decryptSecretForService(record: SecretRecord, dataDir: string): string {
-  const insecureFallbackAllowed = process.env.SHADOW_SSH_ALLOW_INSECURE_SECRET_FALLBACK === "1";
+  const insecureFallbackAllowed = isInsecureSecretFallbackAllowed(app.isPackaged);
   const productionRuntime = isProductionSecretStorageRuntime(app.isPackaged, process.env.NODE_ENV);
   if (record.backend === "electron-safe-storage") {
     const selectedBackend = process.platform === "linux" ? safeStorage.getSelectedStorageBackend?.() : undefined;
@@ -1411,12 +1874,68 @@ async function writeJsonTextAtomic(filePath: string, serialized: string): Promis
   const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
     await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(tmpPath, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    await rename(tmpPath, filePath);
+    const handle = await open(tmpPath, "wx", 0o600);
+    try {
+      await handle.writeFile(serialized, "utf8");
+      // On disk before the rename makes it the file: after a power cut the
+      // store is the old version or the new one, never an empty file.
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await renameWithRetry(tmpPath, filePath);
     await chmod(filePath, 0o600);
   } catch (error) {
     await rm(tmpPath, { force: true }).catch(() => undefined);
     throw error;
+  }
+  await syncDirectory(path.dirname(filePath));
+}
+
+/** Errors Windows returns while an antivirus scanner, the indexer or a backup tool has the target open. */
+const TRANSIENT_WINDOWS_RENAME_ERRORS = new Set(["EPERM", "EBUSY", "EACCES"]);
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200];
+
+export async function renameWithRetry(
+  from: string,
+  to: string,
+  options: {
+    platform?: NodeJS.Platform;
+    rename?: (from: string, to: string) => Promise<void>;
+    delaysMs?: readonly number[];
+    sleep?: (ms: number) => Promise<void>;
+  } = {}
+): Promise<void> {
+  const renameFile = options.rename ?? rename;
+  const delays = (options.platform ?? process.platform) === "win32" ? options.delaysMs ?? WINDOWS_RENAME_RETRY_DELAYS_MS : [];
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await renameFile(from, to);
+      return;
+    } catch (error) {
+      const delay = delays[attempt];
+      if (delay === undefined || !TRANSIENT_WINDOWS_RENAME_ERRORS.has(String((error as NodeJS.ErrnoException).code))) {
+        throw error;
+      }
+      await sleep(delay);
+    }
+  }
+}
+
+/** Makes the rename itself durable. Windows can't open a directory for this, and NTFS journals the rename anyway. */
+async function syncDirectory(directory: string): Promise<void> {
+  if (process.platform === "win32") {
+    return;
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(directory, "r");
+    await handle.sync();
+  } catch {
+    // Best effort: the file itself was already synced.
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 

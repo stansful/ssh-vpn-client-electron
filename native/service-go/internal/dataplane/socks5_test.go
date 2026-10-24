@@ -1,12 +1,14 @@
 package dataplane
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -53,17 +55,30 @@ func startFakeSocks5(t *testing.T, reply func(command byte, destination netip.Ad
 			raw = make([]byte, 6)
 		case socksAddrIPv6:
 			raw = make([]byte, 18)
+		case socksAddrDomain:
+			length := make([]byte, 1)
+			if _, err := io.ReadFull(conn, length); err != nil {
+				return
+			}
+			raw = make([]byte, int(length[0])+2)
 		default:
 			return
 		}
 		if _, err := io.ReadFull(conn, raw); err != nil {
 			return
 		}
-		address, _ := netip.AddrFromSlice(raw[:len(raw)-2])
-		destination := netip.AddrPortFrom(address.Unmap(), binary.BigEndian.Uint16(raw[len(raw)-2:]))
-		requests <- socksRequest{Version: header[0], Command: header[1], Destination: destination}
+		request := socksRequest{Version: header[0], Command: header[1], AddressType: header[3]}
+		port := binary.BigEndian.Uint16(raw[len(raw)-2:])
+		if header[3] == socksAddrDomain {
+			request.Name = string(raw[:len(raw)-2])
+			request.Destination = netip.AddrPortFrom(netip.Addr{}, port)
+		} else {
+			address, _ := netip.AddrFromSlice(raw[:len(raw)-2])
+			request.Destination = netip.AddrPortFrom(address.Unmap(), port)
+		}
+		requests <- request
 
-		status, bound := reply(header[1], destination)
+		status, bound := reply(header[1], request.Destination)
 		response := append([]byte{socksVersion, status, 0x00}, encodeSocksAddress(bound)...)
 		if _, err := conn.Write(response); err != nil {
 			return
@@ -79,7 +94,11 @@ func startFakeSocks5(t *testing.T, reply func(command byte, destination netip.Ad
 type socksRequest struct {
 	Version     byte
 	Command     byte
+	AddressType byte
+	// Destination is the requested address, or only its port when the
+	// request named a host.
 	Destination netip.AddrPort
+	Name        string
 }
 
 func TestDialTCPSendsAConnectRequest(t *testing.T) {
@@ -89,7 +108,7 @@ func TestDialTCPSendsAConnectRequest(t *testing.T) {
 	client := &Socks5Client{Endpoint: endpoint}
 
 	destination := netip.MustParseAddrPort("149.154.167.51:443")
-	conn, err := client.DialTCP(context.Background(), destination)
+	conn, err := client.DialTCP(context.Background(), destination, "")
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -100,8 +119,8 @@ func TestDialTCPSendsAConnectRequest(t *testing.T) {
 		if request.Version != socksVersion || request.Command != socksCmdConnect {
 			t.Fatalf("expected a SOCKS5 CONNECT, got %+v", request)
 		}
-		if request.Destination != destination {
-			t.Fatalf("expected %s, got %s", destination, request.Destination)
+		if request.AddressType != socksAddrIPv4 || request.Destination != destination {
+			t.Fatalf("expected %s by address, got %+v", destination, request)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the proxy never saw a request")
@@ -113,12 +132,51 @@ func TestDialTCPSendsAConnectRequest(t *testing.T) {
 	}
 }
 
+func TestDialTCPAsksTheProxyForTheNameWhenOneIsGiven(t *testing.T) {
+	// The address came from the local resolver, which may have been poisoned
+	// for a blocked site. With the name the far end resolves it itself.
+	endpoint, requests := startFakeSocks5(t, func(byte, netip.AddrPort) (byte, netip.AddrPort) {
+		return socksReplySucceeded, netip.MustParseAddrPort("0.0.0.0:0")
+	})
+	client := &Socks5Client{Endpoint: endpoint}
+	conn, err := client.DialTCP(context.Background(), netip.MustParseAddrPort("10.10.34.35:443"), "blocked.example.org")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	select {
+	case request := <-requests:
+		if request.Command != socksCmdConnect || request.AddressType != socksAddrDomain {
+			t.Fatalf("expected a CONNECT by name, got %+v", request)
+		}
+		if request.Name != "blocked.example.org" || request.Destination.Port() != 443 {
+			t.Fatalf("expected blocked.example.org:443, got %q:%d", request.Name, request.Destination.Port())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the proxy never saw a request")
+	}
+}
+
+func TestEncodeSocksDomainRefusesWhatIsNotAHostName(t *testing.T) {
+	for _, name := range []string{"", "203.0.113.7", "2001:db8::7", strings.Repeat("a", 256)} {
+		if _, ok := encodeSocksDomain(name, 443); ok {
+			t.Fatalf("expected %q to be sent as an address", name)
+		}
+	}
+	encoded, ok := encodeSocksDomain("example.org", 8443)
+	want := append([]byte{socksAddrDomain, byte(len("example.org"))}, "example.org"...)
+	want = append(want, 0x20, 0xfb)
+	if !ok || !bytes.Equal(encoded, want) {
+		t.Fatalf("encoded %x, want %x", encoded, want)
+	}
+}
+
 func TestDialTCPReportsARefusedRequest(t *testing.T) {
 	endpoint, _ := startFakeSocks5(t, func(byte, netip.AddrPort) (byte, netip.AddrPort) {
 		return 0x05, netip.MustParseAddrPort("0.0.0.0:0") // connection refused
 	})
 	client := &Socks5Client{Endpoint: endpoint}
-	if _, err := client.DialTCP(context.Background(), netip.MustParseAddrPort("1.1.1.1:443")); err == nil {
+	if _, err := client.DialTCP(context.Background(), netip.MustParseAddrPort("1.1.1.1:443"), ""); err == nil {
 		t.Fatalf("expected a refused request to fail")
 	}
 }

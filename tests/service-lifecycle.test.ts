@@ -3,6 +3,7 @@ import { Socks5Proxy } from "../src/core/network/socks5-proxy.js";
 import type { WindowsSystemProxyManager } from "../src/core/network/windows-system-proxy.js";
 import { SshLiveClient, type SshLiveClientEvent } from "../src/core/ssh/live-client.js";
 import { LiveSshServiceBridge } from "../src/service/live-ssh-service.js";
+import type { ProcessRouteLearner } from "../src/service/process-route-learning.js";
 import type { ConnectRequest, RuntimeStatus } from "../src/shared/types.js";
 
 describe("live SSH service lifecycle", () => {
@@ -54,6 +55,50 @@ describe("live SSH service lifecycle", () => {
     expect(client.disconnect).toHaveBeenCalledWith("SSH connection was superseded.");
     expect(Socks5Proxy.prototype.start).not.toHaveBeenCalled();
     expect(service.getStatus()).toMatchObject({ state: "Disconnected", realTunnelAvailable: false });
+  });
+
+  it("cancels a connect in flight on quit instead of waiting out its timeouts", async () => {
+    const signals: Array<AbortSignal | undefined> = [];
+    vi.spyOn(SshLiveClient, "connect").mockImplementation((_options, signal) => {
+      signals.push(signal);
+      return new Promise<SshLiveClient>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(Object.assign(new Error("SSH connect was cancelled."), { name: "AbortError" })));
+      });
+    });
+    vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+    const service = createService();
+
+    const connecting = service.connect(connectRequest("quit-while-dialling"));
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    await service.dispose();
+    await connecting;
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(service.getStatus().state).toBe("Disconnected");
+  });
+
+  it("cancels the attempt a newer Connect replaces", async () => {
+    const signals: Array<AbortSignal | undefined> = [];
+    const client = new FakeSshClient();
+    vi.spyOn(SshLiveClient, "connect")
+      .mockImplementationOnce((_options, signal) => {
+        signals.push(signal);
+        return new Promise<SshLiveClient>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(Object.assign(new Error("SSH connect was cancelled."), { name: "AbortError" })));
+        });
+      })
+      .mockResolvedValueOnce(client.asClient());
+    vi.spyOn(Socks5Proxy.prototype, "start").mockResolvedValue({ host: "127.0.0.1", port: 31_087 });
+    vi.spyOn(Socks5Proxy.prototype, "stop").mockResolvedValue();
+    const service = createService();
+
+    const first = service.connect(connectRequest("first-hangs"));
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    await Promise.all([first, service.connect(connectRequest("second"))]);
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(service.getStatus()).toMatchObject({ state: "Connected", activeConfigId: "second" });
+    await service.dispose();
   });
 
   it("keeps routing and the listener while a failed runtime is rebuilt", async () => {
@@ -253,23 +298,21 @@ describe("live SSH service lifecycle", () => {
       processRoutingRefreshIntervalMs: () => refreshIntervalMs
     });
     const internals = service as unknown as {
-      currentProcessRoutingRefreshIntervalMs(): number;
-      currentProcessRoutingTtlMs(): number;
-      nextProcessRoutingRefreshIntervalMs(): number;
+      processRoutes: ProcessRouteLearner;
     };
 
-    expect(internals.currentProcessRoutingRefreshIntervalMs()).toBe(60_000);
-    expect(internals.currentProcessRoutingTtlMs()).toBe(5 * 60_000);
+    expect(internals.processRoutes.refreshIntervalMs()).toBe(60_000);
+    expect(internals.processRoutes.ttlMs()).toBe(5 * 60_000);
     expect([
-      internals.nextProcessRoutingRefreshIntervalMs(),
-      internals.nextProcessRoutingRefreshIntervalMs(),
-      internals.nextProcessRoutingRefreshIntervalMs(),
-      internals.nextProcessRoutingRefreshIntervalMs(),
-      internals.nextProcessRoutingRefreshIntervalMs()
+      internals.processRoutes.nextRefreshIntervalMs(),
+      internals.processRoutes.nextRefreshIntervalMs(),
+      internals.processRoutes.nextRefreshIntervalMs(),
+      internals.processRoutes.nextRefreshIntervalMs(),
+      internals.processRoutes.nextRefreshIntervalMs()
     ]).toEqual([1_000, 2_000, 4_000, 8_000, 60_000]);
     refreshIntervalMs = 120_000;
-    expect(internals.currentProcessRoutingRefreshIntervalMs()).toBe(120_000);
-    expect(internals.currentProcessRoutingTtlMs()).toBe(360_000);
+    expect(internals.processRoutes.refreshIntervalMs()).toBe(120_000);
+    expect(internals.processRoutes.ttlMs()).toBe(360_000);
   });
 
   it("learns a late process connection during the discovery burst and reapplies routing", async () => {
@@ -656,7 +699,7 @@ describe("live SSH service lifecycle", () => {
     const service = new LiveSshServiceBridge(initialStatus(), { systemProxy, processConnectionsProvider });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const processRequest = (value: string): ConnectRequest => ({
       ...connectRequest(value),
@@ -666,10 +709,10 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(processRequest("telegram"));
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["149.154.167.41"]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set(["149.154.167.41"]));
 
       await internals.learnProcessRoutingIps(processRequest("chrome"));
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["142.250.74.110"]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set(["142.250.74.110"]));
     } finally {
       try {
         await service.dispose();
@@ -711,9 +754,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("session-domain-lease"),
@@ -731,21 +772,21 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
 
       now.mockReturnValue(1_001_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
 
       now.mockReturnValue(1_601_001);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set());
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
 
       now.mockReturnValue(1_602_001);
@@ -753,8 +794,8 @@ describe("live SSH service lifecycle", () => {
         ...request,
         routingDirectDomains: [".custom-app.example"]
       })).resolves.toBe(true);
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
-      expect(internals.processRoutingSessionLeases.size).toBe(0);
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set());
+      expect(internals.processRoutes.sessionLeases.size).toBe(0);
     } finally {
       try {
         await service.dispose();
@@ -790,8 +831,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("short-lived-process-route"),
@@ -809,13 +849,13 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
 
       now.mockReturnValue(5_001_000);
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
     } finally {
       try {
         await service.dispose();
@@ -856,9 +896,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("ambiguous-session-domain"),
@@ -876,15 +914,15 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([firstDomain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([firstDomain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
 
       now.mockReturnValue(2_010_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([firstDomain, secondDomain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([firstDomain, secondDomain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
     } finally {
       try {
         await service.dispose();
@@ -925,9 +963,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("leased-address-probe"),
@@ -945,26 +981,26 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([leasedDomain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
 
       now.mockReturnValue(3_001_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([leasedDomain]));
 
       now.mockReturnValue(3_011_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([leasedDomain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
 
       now.mockReturnValue(3_021_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([leasedDomain, addedDomain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([leasedDomain, addedDomain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
     } finally {
       try {
         await service.dispose();
@@ -995,9 +1031,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("shared-process-address"),
@@ -1014,9 +1048,9 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(0);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(0);
     } finally {
       try {
         await service.dispose();
@@ -1048,9 +1082,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("direct-conflict"),
@@ -1068,9 +1100,9 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
-      expect(internals.processRoutingSessionLeases.size).toBe(0);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set());
+      expect(internals.processRoutes.sessionLeases.size).toBe(0);
     } finally {
       try {
         await service.dispose();
@@ -1110,9 +1142,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("bounded-session-domains"),
@@ -1130,15 +1160,15 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(request);
-      expect(internals.processRoutingSessionLeases.size).toBe(256);
-      expect(internals.currentProcessRoutingIps().size).toBe(257);
-      expect(internals.currentProcessRoutingDomains().size).toBe(257);
+      expect(internals.processRoutes.sessionLeases.size).toBe(256);
+      expect(internals.processRoutes.currentIps().size).toBe(257);
+      expect(internals.processRoutes.currentDomains().size).toBe(257);
 
       now.mockReturnValue(4_001_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
-      expect(internals.processRoutingSessionLeases.size).toBe(256);
-      expect(internals.currentProcessRoutingIps().size).toBe(257);
-      expect(internals.currentProcessRoutingDomains().size).toBe(257);
+      expect(internals.processRoutes.sessionLeases.size).toBe(256);
+      expect(internals.processRoutes.currentIps().size).toBe(257);
+      expect(internals.processRoutes.currentDomains().size).toBe(257);
 
       connections = [...connections, {
         processName: "many-endpoints.exe",
@@ -1148,9 +1178,9 @@ describe("live SSH service lifecycle", () => {
       }];
       now.mockReturnValue(4_002_000);
       await internals.learnProcessRoutingIps(request);
-      expect(internals.processRoutingSessionLeases.size).toBe(256);
-      expect(internals.currentProcessRoutingIps().has(overflowAddress)).toBe(true);
-      expect(internals.currentProcessRoutingDomains().has(
+      expect(internals.processRoutes.sessionLeases.size).toBe(256);
+      expect(internals.processRoutes.currentIps().has(overflowAddress)).toBe(true);
+      expect(internals.processRoutes.currentDomains().has(
         "endpoint-11-0-1-4.many-endpoints.example"
       )).toBe(true);
     } finally {
@@ -1202,8 +1232,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("dns-process-routing"),
@@ -1221,8 +1250,8 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["203.0.113.44"]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect(internals.processRoutes.currentIps()).toEqual(new Set(["203.0.113.44"]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set());
       expect([...(processDnsEntriesProvider.mock.calls[0]?.[0] ?? [])]).toEqual(["203.0.113.44"]);
 
       now.mockReturnValue(1_009_000);
@@ -1232,7 +1261,7 @@ describe("live SSH service lifecycle", () => {
       now.mockReturnValue(1_010_000);
       await internals.learnProcessRoutingIps(request);
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(2);
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set(["gateway.custom.example"]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set(["gateway.custom.example"]));
 
       // Past the 120s DNS TTL, and deliberately still routed. Once a
       // destination is in the PAC the application dials the loopback proxy
@@ -1241,14 +1270,14 @@ describe("live SSH service lifecycle", () => {
       // sending back to DIRECT. Every successful discovery cycle renews it.
       now.mockReturnValue(1_131_000);
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set(["gateway.custom.example"]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set(["gateway.custom.example"]));
 
       // It is retired only once discovery itself has been failing for a full
       // TTL - decay is driven by losing sight of the process, not by age.
       processConnectionsProvider.mockRejectedValue(new Error("process table unavailable"));
       now.mockReturnValue(1_431_001);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set());
     } finally {
       try {
         await service.dispose();
@@ -1289,8 +1318,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("generic-dns-ttl-refresh"),
@@ -1308,19 +1336,19 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
 
       now.mockReturnValue(1_030_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
 
       now.mockReturnValue(1_090_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(3);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
     } finally {
       try {
         await service.dispose();
@@ -1362,8 +1390,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("process-snapshot-expiry"),
@@ -1381,13 +1408,13 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
 
       now.mockReturnValue(1_300_001);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect(internals.processRoutes.currentIps()).toEqual(new Set());
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set());
     } finally {
       try {
         await service.dispose();
@@ -1446,8 +1473,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("discord-process-routing"),
@@ -1465,8 +1491,8 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["198.51.100.77"]));
-      const domains = internals.currentProcessRoutingDomains();
+      expect(internals.processRoutes.currentIps()).toEqual(new Set(["198.51.100.77"]));
+      const domains = internals.processRoutes.currentDomains();
       expect([...domains]).toEqual(expect.arrayContaining([
         "discord.com",
         "*.discord.com",
@@ -1480,8 +1506,8 @@ describe("live SSH service lifecycle", () => {
       now.mockReturnValue(1_060_001);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(2);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set(["198.51.100.77"]));
-      expect(internals.currentProcessRoutingDomains().has("unrelated.cloudflare.example")).toBe(false);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set(["198.51.100.77"]));
+      expect(internals.processRoutes.currentDomains().has("unrelated.cloudflare.example")).toBe(false);
     } finally {
       try {
         await service.dispose();
@@ -1531,7 +1557,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("mixed-to-profiled-process-routing"),
@@ -1559,12 +1585,12 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([sharedAddress]));
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
 
       now.mockReturnValue(1_001_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(internals.processRoutes.currentIps()).toEqual(new Set());
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
     } finally {
       try {
@@ -1614,7 +1640,7 @@ describe("live SSH service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(request: ConnectRequest): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const request: ConnectRequest = {
       ...connectRequest("mixed-process-routing"),
@@ -1642,12 +1668,12 @@ describe("live SSH service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(request);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([sharedAddress]));
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
 
       now.mockReturnValue(1_001_000);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([sharedAddress]));
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
 
       // An empty snapshot is still a *successful* discovery cycle, so the route
@@ -1655,13 +1681,13 @@ describe("live SSH service lifecycle", () => {
       // as the session can still see the process.
       now.mockReturnValue(1_300_001);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(false);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([sharedAddress]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([sharedAddress]));
 
       // Only discovery failing for a full TTL retires it.
       processConnectionsProvider.mockRejectedValue(new Error("process table unavailable"));
       now.mockReturnValue(1_600_002);
       await expect(internals.learnProcessRoutingIps(request)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
+      expect(internals.processRoutes.currentIps()).toEqual(new Set());
     } finally {
       try {
         await service.dispose();

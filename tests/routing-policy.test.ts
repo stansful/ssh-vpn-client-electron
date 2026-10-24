@@ -1,33 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { DomainIpCache } from "../src/core/routing/dns-cache.js";
 import { TrafficPolicy } from "../src/core/routing/traffic-policy.js";
 import type { RoutingRule } from "../src/shared/types.js";
 
-describe("DNS cache and traffic policy", () => {
-  it("stores domain-to-IP entries with TTL and reverse lookup", () => {
-    const cache = new DomainIpCache();
-    cache.set("YouTube.com.", ["1.1.1.1", "1.1.1.1", "2a00:1450::1"], 1000, 10);
-
-    expect(cache.get("youtube.com", 20)).toEqual(["1.1.1.1", "2a00:1450::1"]);
-    expect(cache.findDomainsForIp("1.1.1.1", 20)).toEqual(["youtube.com"]);
-    expect(cache.get("youtube.com", 1011)).toEqual([]);
-  });
-
-  it("bounds DNS entries and keeps the reverse index consistent across LRU eviction", () => {
-    const cache = new DomainIpCache({ maxEntries: 2, maxAddressesPerEntry: 2, maxTtlMs: 1000 });
-    cache.set("first.example", ["1.1.1.1", "1.1.1.2", "1.1.1.3"], 60_000, 0);
-    cache.set("second.example", ["2.2.2.2"], 60_000, 0);
-    expect(cache.get("first.example", 10)).toEqual(["1.1.1.1", "1.1.1.2"]);
-
-    cache.set("third.example", ["3.3.3.3"], 60_000, 10);
-
-    expect(cache.size).toBe(2);
-    expect(cache.get("second.example", 20)).toEqual([]);
-    expect(cache.findDomainsForIp("2.2.2.2", 20)).toEqual([]);
-    expect(cache.findDomainsForIp("1.1.1.1", 20)).toEqual(["first.example"]);
-    expect(cache.get("first.example", 1001)).toEqual([]);
-  });
-
+describe("traffic policy", () => {
   it("blocks UDP when TCP-only policy is configured", () => {
     const policy = new TrafficPolicy("proxy-all", [], false);
 
@@ -52,6 +27,66 @@ describe("DNS cache and traffic policy", () => {
     expect(policy.decide("tcp", { destinationDomain: "example.com" })).toMatchObject({ shouldProxy: false, reason: "no-match" });
   });
 
+  it("applies the shared routing order: rules, local, process, direct list, proxy-all, proxy list", () => {
+    const rules: RoutingRule[] = [
+      ruleOf("domain", "mail.service.ru"),
+      ruleOf("ip", "10.0.0.0/8"),
+      ruleOf("domain", "corp.local"),
+      ruleOf("process.name", "telegram.exe")
+    ];
+    const lists = { proxyListDomains: [".ru", "blocked.example"], directListDomains: [".ru"] };
+    const split = new TrafficPolicy("selected-rules", rules, lists);
+    const full = new TrafficPolicy("proxy-all", rules, lists);
+
+    for (const policy of [split, full]) {
+      // 2. A domain or IP rule wins, for the local network too: 10.0.0.0/8 is
+      // how a user reaches the network behind the server.
+      expect(policy.decide("tcp", { destinationIp: "10.1.2.3" })).toMatchObject({ shouldProxy: true, reason: "ip" });
+      expect(policy.decide("tcp", { destinationIp: "::ffff:10.1.2.3", processName: "telegram.exe" })).toMatchObject({ reason: "ip" });
+      expect(policy.decide("tcp", { destinationDomain: "wiki.corp.local" })).toMatchObject({ shouldProxy: true, reason: "domain" });
+      // ...and beats the direct list.
+      expect(policy.decide("tcp", { destinationDomain: "mail.service.ru" })).toMatchObject({ shouldProxy: true, reason: "domain" });
+      // 3. A local destination no rule names stays direct, even for a selected process.
+      expect(policy.decide("tcp", { destinationIp: "192.168.1.1", processName: "telegram.exe" })).toMatchObject({
+        shouldProxy: false,
+        blockedReason: "local-destination"
+      });
+      expect(policy.decide("tcp", { destinationDomain: "nas.local", processName: "telegram.exe" })).toMatchObject({
+        shouldProxy: false,
+        blockedReason: "local-destination"
+      });
+      expect(policy.decide("tcp", { destinationIp: "::ffff:192.168.1.1" })).toMatchObject({ blockedReason: "local-destination" });
+      // 4. A process rule beats the direct list.
+      expect(policy.decide("tcp", { destinationDomain: "news.service.ru", processName: "Telegram.exe" })).toMatchObject({
+        shouldProxy: true,
+        reason: "process.name"
+      });
+      // 5. The direct list beats proxy-all and the proxy list.
+      expect(policy.decide("tcp", { destinationDomain: "news.service.ru" })).toEqual({
+        protocol: "tcp",
+        shouldProxy: false,
+        reason: "direct-list"
+      });
+      // 7. The proxy list proxies what nothing else claimed.
+      expect(policy.decide("tcp", { destinationDomain: "cdn.blocked.example" })).toMatchObject({ shouldProxy: true });
+    }
+
+    // 6 and 8: proxy-all proxies the rest, split routing leaves it direct.
+    expect(full.decide("tcp", { destinationDomain: "example.com" })).toMatchObject({ shouldProxy: true, reason: "proxy-all" });
+    expect(split.decide("tcp", { destinationDomain: "example.com" })).toMatchObject({ shouldProxy: false, reason: "no-match" });
+    expect(split.decide("tcp", { destinationDomain: "cdn.blocked.example" })).toMatchObject({ reason: "proxy-list" });
+
+    // Without a rule for it, the same private address stays direct.
+    for (const mode of ["selected-rules", "proxy-all"] as const) {
+      const noLanRule = new TrafficPolicy(mode, [ruleOf("process.name", "telegram.exe")], lists);
+      expect(noLanRule.decide("tcp", { destinationIp: "10.1.2.3" })).toMatchObject({ shouldProxy: false, blockedReason: "local-destination" });
+      expect(noLanRule.decide("tcp", { destinationIp: "10.1.2.3", processName: "telegram.exe" })).toMatchObject({
+        shouldProxy: false,
+        blockedReason: "local-destination"
+      });
+    }
+  });
+
   it("bypasses the protected SSH connection to prevent tunnel loops", () => {
     const policy = new TrafficPolicy("proxy-all", [], {
       protectedSshEndpoint: {
@@ -70,3 +105,14 @@ describe("DNS cache and traffic policy", () => {
     });
   });
 });
+
+function ruleOf(type: RoutingRule["type"], value: string): RoutingRule {
+  return {
+    id: `${type}:${value}`,
+    type,
+    value,
+    enabled: true,
+    createdAt: "2026-06-12T00:00:00.000Z",
+    updatedAt: "2026-06-12T00:00:00.000Z"
+  };
+}

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { ServiceEvent } from "../shared/ipc.js";
 import {
   BoundedUtf8LineDecoder,
   encodeWireMessage,
@@ -32,8 +33,31 @@ export interface NativeHelperClientOptions {
   onStderrLine?: (line: string) => void;
   /** Called once when the helper stops answering, for any reason. */
   onClosed?: (error: Error) => void;
+  /**
+   * Receives the events the helper sends beside its responses - the
+   * diagnostics a command produced, such as "TUN dataplane started.".
+   */
+  onEvent?: (event: ServiceEvent) => void;
   /** Extra environment for the spawned helper, merged over this process's own. */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Lets the helper outlive this process. On Windows every other child is
+   * put in a job that is killed the moment Electron exits, which cut short
+   * whatever a helper was still undoing - a quit that passed its deadline
+   * mid-teardown left routes behind. A detached helper reads the end of its
+   * input instead and finishes its teardown on its own.
+   */
+  detached?: boolean;
+}
+
+export interface NativeHelperDisposeOptions {
+  /**
+   * How long the helper may take to exit on its own once its input is
+   * closed, before it is killed. A helper that sees its input end tears
+   * down whatever it still owns - a dataplane, its routes - and killing it
+   * at once cuts that short. Zero kills at once.
+   */
+  exitGraceMs?: number;
 }
 
 export class NativeHelperClient {
@@ -56,7 +80,12 @@ export class NativeHelperClient {
     this.child.stderr.on("data", (chunk: Buffer) => this.handleStderr(chunk));
     this.child.stdin.on("error", (error: Error) => this.fail(error));
     this.child.on("error", (error: Error) => this.fail(error));
-    this.child.on("exit", (code, signal) => this.fail(new Error(`Native helper exited (${signal ?? code ?? "unknown"}).`)));
+    this.child.on("exit", (code, signal) => {
+      const error = new Error(`Native helper exited (${signal ?? code ?? "unknown"}).`);
+      // A helper that exits on purpose says why on its last stderr line, and
+      // the exit can be reported before that line has been read.
+      this.afterStderrDrained(() => this.fail(error));
+    });
   }
 
   /**
@@ -68,7 +97,8 @@ export class NativeHelperClient {
     const child = spawn(executablePath, ["--stdio"], {
       env: options.env ? { ...process.env, ...options.env } : process.env,
       stdio: "pipe",
-      windowsHide: true
+      windowsHide: true,
+      detached: options.detached === true
     });
     const client = new NativeHelperClient(child, options);
     try {
@@ -84,9 +114,23 @@ export class NativeHelperClient {
     }
   }
 
-  /** The handshake taken at start. */
+  /** The handshake taken at start, or by the latest {@link refreshCapabilities}. */
   get handshake(): NativeServiceHandshake | undefined {
     return this.capabilities;
+  }
+
+  /**
+   * Asks the helper again what it can do. Its answer about the adapter
+   * changes while it runs - `wintun.dll` can be put in place after it started
+   * - and the handshake taken at start would keep saying it cannot.
+   */
+  async refreshCapabilities(): Promise<NativeServiceHandshake> {
+    const handshake = await this.send<NativeServiceHandshake>({ id: randomUUID(), type: "get-capabilities" });
+    if (!isNativeServiceHandshake(handshake)) {
+      throw new Error("Native helper did not return a compatible capability handshake.");
+    }
+    this.capabilities = handshake;
+    return handshake;
   }
 
   /** True while the helper is running and answering. */
@@ -99,29 +143,58 @@ export class NativeHelperClient {
     return parseNativeProcessConnections(payload);
   }
 
-  async startDataplane(request: DataplaneStartRequest): Promise<void> {
-    await this.send({ id: randomUUID(), type: "start-dataplane", payload: request });
+  /**
+   * `signal` stops waiting for the answer. The helper is not told - it serves
+   * one command at a time and finishes this one - and its late answer is
+   * dropped.
+   */
+  async startDataplane(request: DataplaneStartRequest, signal?: AbortSignal): Promise<void> {
+    await this.send({ id: randomUUID(), type: "start-dataplane", payload: request }, signal);
   }
 
   async stopDataplane(): Promise<void> {
     await this.send({ id: randomUUID(), type: "stop-dataplane" });
   }
 
-  async dispose(): Promise<void> {
+  /**
+   * Undoes the routing changes a helper that was killed left in the journal.
+   * Only for a helper whose handshake advertises `routeRecovery`.
+   */
+  async recoverRoutes(journalPath: string): Promise<number> {
+    const payload = await this.send({ id: randomUUID(), type: "recover-routes", payload: { journalPath } });
+    const recovered = (payload as { recovered?: unknown } | undefined)?.recovered;
+    return typeof recovered === "number" && Number.isInteger(recovered) && recovered >= 0 ? recovered : 0;
+  }
+
+  async dispose(options: NativeHelperDisposeOptions = {}): Promise<void> {
     if (this.disposed) {
       return;
     }
     this.disposed = true;
     this.rejectAll(new Error("Native helper disposed."));
     this.child.stdin.end();
+    const exitGraceMs = options.exitGraceMs ?? 0;
+    if (exitGraceMs > 0 && this.child.exitCode === null && !this.child.killed) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, exitGraceMs);
+        timer.unref();
+        this.child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
     if (this.child.exitCode === null && !this.child.killed) {
       this.child.kill();
     }
   }
 
-  private send<TPayload extends ServiceResponsePayload>(command: ServiceCommand): Promise<TPayload | undefined> {
+  private send<TPayload extends ServiceResponsePayload>(command: ServiceCommand, signal?: AbortSignal): Promise<TPayload | undefined> {
     if (!this.running) {
       return Promise.reject(new Error("Native helper process is not running."));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(abandoned(command));
     }
     const encoded = encodeWireMessage(authenticated(command));
     return new Promise<TPayload | undefined>((resolve, reject) => {
@@ -129,9 +202,17 @@ export class NativeHelperClient {
         this.rejectPending(command.id, new Error(`Native helper ${command.type} request timed out.`));
       }, requestTimeoutMs(command.type));
       timer.unref();
+      const onAbort = (): void => this.rejectPending(command.id, abandoned(command));
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.pending.set(command.id, {
-        resolve: (payload) => resolve(payload as TPayload | undefined),
-        reject,
+        resolve: (payload) => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve(payload as TPayload | undefined);
+        },
+        reject: (error) => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(error);
+        },
         timer
       });
       const write = this.writeQueue.then(() => writeWithBackpressure(this.child.stdin, encoded));
@@ -151,6 +232,15 @@ export class NativeHelperClient {
       return;
     }
     for (const message of messages) {
+      if ("kind" in message && message.kind === "event") {
+        try {
+          this.options.onEvent?.(message.event);
+        } catch {
+          // An event is informational; a listener that fails must not cost
+          // the responses in the same chunk.
+        }
+        continue;
+      }
       if (!("kind" in message) || message.kind !== "response") {
         continue;
       }
@@ -187,6 +277,29 @@ export class NativeHelperClient {
     }
   }
 
+  private afterStderrDrained(callback: () => void): void {
+    const stderr = this.child.stderr;
+    if (stderr.readableEnded || stderr.destroyed) {
+      callback();
+      return;
+    }
+    let finished = false;
+    const finish = (): void => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      clearTimeout(timer);
+      stderr.off("end", finish);
+      stderr.off("close", finish);
+      callback();
+    };
+    const timer = setTimeout(finish, STDERR_DRAIN_AFTER_EXIT_MS);
+    timer.unref();
+    stderr.once("end", finish);
+    stderr.once("close", finish);
+  }
+
   private fail(error: Error): void {
     if (this.failed) {
       return;
@@ -217,6 +330,13 @@ export class NativeHelperClient {
     this.pending.clear();
   }
 }
+
+function abandoned(command: ServiceCommand): Error {
+  return new Error(`Native helper ${command.type} request was abandoned.`);
+}
+
+/** How long an exit waits for the helper's remaining stderr to be read. */
+const STDERR_DRAIN_AFTER_EXIT_MS = 250;
 
 function authenticated(command: ServiceCommand): ServiceCommand {
   const authToken = process.env.SHADOW_SSH_SERVICE_TOKEN;

@@ -27,7 +27,7 @@ const STUCK_PATTERNS: Array<{ pattern: RegExp; detail: string }> = [
     pattern: /no (?:compatible|matching|common) (?:algorithm|cipher|key exchange|host key|mac)|handshake failed: no/iu,
     detail: "The server and Shadow have no encryption method in common."
   },
-  { pattern: /host key (?:does not|doesn't) match|host key mismatch|fingerprint mismatch/iu, detail: "The server's host key doesn't match the pinned one." },
+  { pattern: /host key (?:does not|doesn't) match|host key mismatch|fingerprint mismatch/iu, detail: "The server's host key doesn't match the one Shadow expects." },
   { pattern: /authentication (?:failed|rejected)|permission denied/iu, detail: "The server rejected the sign-in." }
 ];
 

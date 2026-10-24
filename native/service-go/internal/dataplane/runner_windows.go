@@ -67,6 +67,11 @@ type WindowsOptions struct {
 	// next hop and would strand the transport.
 	EnforceIPv6 bool
 	Log         func(level string, message string)
+	// OnFatal is told, once, when the dataplane stopped on its own - its
+	// adapter failed - after the runner has taken itself down: route watcher,
+	// traffic guard, routes and adapter, as Close does. It is not called for a
+	// teardown Close was asked for. cause says what happened, for the user.
+	OnFatal func(runner *Runner, cause error)
 }
 
 // Runner owns a live Windows dataplane.
@@ -81,8 +86,14 @@ type Runner struct {
 	// step with the routing table, and routesWatchDone closes when it has.
 	stopRoutesWatch context.CancelFunc
 	routesWatchDone chan struct{}
-	closeOnce       sync.Once
-	closeErr        error
+	// fate settles whether Close or a dataplane failure takes the runner
+	// down (see fatal.go).
+	fate *runnerFate
+	// closeMu serialises Close. Close runs its teardown once; what it could
+	// not undo is left to the journal (see ErrLeftForRecovery), and a later
+	// Close finds the runner closed.
+	closeMu sync.Mutex
+	closed  bool
 }
 
 // StartWindows brings up the dataplane.
@@ -103,9 +114,24 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 	}
 
 	routes := winroute.NewManager(options.JournalPath, nil, log)
+	// A plan holds the journal locked against the other helpers for as long
+	// as it is applied; a start that fails after applying one lets it go,
+	// leaving what it could not roll back to the next recovery.
+	started := false
+	defer func() {
+		if !started {
+			routes.Release()
+		}
+	}()
 	// Anything a previous run left behind is undone before new state is
 	// created, so a crash cannot compound across restarts.
 	if err := routes.Recover(ctx); err != nil {
+		if errors.Is(err, winroute.ErrJournalInUse) {
+			// Another helper is still recovering it, or holds it for a
+			// dataplane of its own; capturing traffic beside that would leave
+			// two plans in one journal.
+			return nil, fmt.Errorf("undo routing changes from a previous run: %w", err)
+		}
 		log("warning", "Could not undo routing changes from a previous run: "+err.Error())
 	}
 
@@ -197,6 +223,7 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 		// Only a captured family needs to know whether the tunnel carries it.
 		probeIPv6 = func(ctx context.Context) IPv6Reach { return ProbeTunnelIPv6(ctx, tunnel) }
 	}
+	fate := newRunnerFate()
 	plane, err := Start(Options{
 		Adapter:         adapter,
 		Attribution:     NewOwnerTable(windowsOwnerSnapshot),
@@ -206,6 +233,7 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 		Domains:         NewDomainCache(0),
 		TunnelIPv6Probe: probeIPv6,
 		Log:             log,
+		OnFatal:         fate.reportFailure,
 	})
 	if err != nil {
 		if restoreErr := routes.Restore(ctx); restoreErr != nil {
@@ -219,7 +247,7 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 	// covers the ones that do not (see internal/winfirewall). Without it the
 	// tunnel still works for nearly everything, so failing to install it is a
 	// warning, not a reason to give up the dataplane.
-	runner := &Runner{options: options, routes: routes, plane: plane}
+	runner := &Runner{options: options, routes: routes, plane: plane, fate: fate}
 	guardPlan := buildGuardPlan(adapter.LUID(), interfaceIndex, enforceIPv6, options.ProtectedAddresses, log)
 	guard, guardErr := winfirewall.Start(guardPlan)
 	if guardErr == nil {
@@ -243,10 +271,25 @@ func StartWindows(ctx context.Context, options WindowsOptions) (*Runner, error) 
 		go runner.watchRoutes(watchCtx, guardPlan, adapter.LUID(), interfaceIndex, enforceIPv6)
 	}
 
+	started = true
 	log("info", fmt.Sprintf(
 		"TUN dataplane is up on interface %d (IPv6 capture %s, traffic guard %s, transport proxy %s).",
 		interfaceIndex, enabledLabel(enforceIPv6), enabledLabel(runner.guard != nil), options.TunnelEndpoint))
+	// Watched only now that the runner is whole: a failure reported meanwhile
+	// waits in fate and is acted on here.
+	go fate.supervise(runner.Close, runner.failed)
 	return runner, nil
+}
+
+// failed reports a dataplane that stopped on its own and has already been
+// taken down.
+func (r *Runner) failed(cause error, teardownErr error) {
+	err := dataplaneFailure(cause, teardownErr)
+	if r.options.OnFatal == nil {
+		r.options.Log("warning", err.Error())
+		return
+	}
+	r.options.OnFatal(r, err)
 }
 
 // guardProbeAddress is where the guard's self-check dials: TEST-NET-1, which
@@ -341,35 +384,50 @@ func (r *Runner) UpdatePolicy(policy *Policy) {
 	r.plane.UpdatePolicy(policy)
 }
 
-// Close tears the dataplane down. The traffic guard goes first, while the routes
-// still send everything to the adapter: the other way round, there would be a
-// moment in which interface-bound UDP is refused and nothing else carries it.
-// Routing is restored before the adapter goes away, so there is no moment in
-// which the machine has capture routes pointing at an interface that no longer
-// exists.
+// Close tears the dataplane down in the order runnerTeardown describes: route
+// watcher, traffic guard, routes, then the adapter. A Close that arrives while
+// a failed dataplane is taking itself down waits for that teardown, and finds
+// the runner closed.
+//
+// The teardown runs once. Once the adapter is closed nothing the runner still
+// holds can be put right by trying again: the routes and addresses on the
+// adapter went with it, and a host route that would not go is in the journal,
+// which the next start recovers - waiting for this runner's lock if need be,
+// and checking every entry against the interface it was made on. So a failed
+// teardown releases the journal and returns ErrLeftForRecovery - the only
+// error Close returns - and its owner lets the runner go. Keeping it to retry
+// used to wedge the helper: each retry failed on routes that could no longer
+// exist, and every start that followed took the failing close path first and
+// never got to recover anything.
 func (r *Runner) Close(ctx context.Context) error {
-	r.closeOnce.Do(func() {
-		if r.stopRoutesWatch != nil {
+	if r.fate != nil {
+		r.fate.claimClose()
+	}
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	teardown := runnerTeardown{
+		restoreRoutes: r.routes.Restore,
+		closePlane:    r.plane.Close,
+		log:           r.options.Log,
+	}
+	if r.stopRoutesWatch != nil {
+		teardown.stopRoutesWatch = func() {
 			r.stopRoutesWatch()
 			<-r.routesWatchDone
 		}
-		if r.guard != nil {
-			if err := r.guard.Close(); err != nil {
-				r.closeErr = err
-				r.options.Log("warning", "Removing the traffic guard reported: "+err.Error())
-			}
-		}
-		if err := r.routes.Restore(ctx); err != nil {
-			if r.closeErr == nil {
-				r.closeErr = err
-			}
-			r.options.Log("warning", "Routing restore reported: "+err.Error())
-		}
-		if err := r.plane.Close(); err != nil && r.closeErr == nil {
-			r.closeErr = err
-		}
-	})
-	return r.closeErr
+	}
+	if r.guard != nil {
+		teardown.closeGuard = r.guard.Close
+	}
+	if err := teardown.run(ctx); err != nil {
+		r.routes.Release()
+		return fmt.Errorf("%w: %w", ErrLeftForRecovery, err)
+	}
+	return nil
 }
 
 // routedPrefixes are the destinations the routing table sends by another
@@ -492,11 +550,15 @@ func windowsOwnerSnapshot() ([]OwnerRow, error) {
 		if err != nil {
 			continue
 		}
-		rows = append(rows, OwnerRow{
+		row := OwnerRow{
 			Protocol:    protocol,
 			Local:       netip.AddrPortFrom(address.WithZone("").Unmap(), uint16(connection.LocalPort)),
 			ProcessName: connection.ProcessName,
-		})
+		}
+		if connection.PID > 0 {
+			row.PID = uint32(connection.PID)
+		}
+		rows = append(rows, row)
 	}
 	return rows, nil
 }

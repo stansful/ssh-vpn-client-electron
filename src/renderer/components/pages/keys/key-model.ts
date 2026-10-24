@@ -1,5 +1,6 @@
 import { shortenMiddle } from "../../../lib/format.js";
 import type { SshConfig, SshKeyMetadata, SshKeyType } from "../../../../shared/types.js";
+import { openSshEncryptionWarning } from "./key-text.js";
 
 const KEY_TYPE_LABELS: Record<SshKeyType, string> = {
   ed25519: "Ed25519",
@@ -38,18 +39,29 @@ export function keyLockText(serverNames: readonly string[]): string {
 }
 
 /**
- * Keys that save fine but cannot sign in yet: the SSH core loads RSA and
- * Ed25519 keys, and passphrases only for PEM/PKCS#8.
+ * Keys that save fine but cannot sign in: the SSH core signs with Ed25519,
+ * ECDSA and RSA keys - not with a security-key (FIDO) one, which needs its
+ * hardware key - and a passphrase-protected OpenSSH key needs its passphrase
+ * saved with it, and to be encrypted in a way the core opens.
  */
-export function keySupportIssue(key: Pick<SshKeyMetadata, "keyType" | "encryptedOpenSsh">): string | undefined {
-  if (key.encryptedOpenSsh) {
-    return "Passphrase-protected OpenSSH keys can’t sign in yet.";
+export function keySupportIssue(
+  key: Pick<
+    SshKeyMetadata,
+    "keyType" | "encryptedOpenSsh" | "privateKeyPassphraseSecretId" | "securityKey" | "unsupportedOpenSshCipher" | "excessiveBcryptRounds"
+  >
+): string | undefined {
+  if (key.securityKey) {
+    return "Security-key (FIDO) keys can’t sign in. Use an Ed25519, ECDSA or RSA key.";
   }
-  if (key.keyType === "ecdsa") {
-    return "ECDSA keys can’t sign in yet.";
+  const encryption = key.encryptedOpenSsh ? openSshEncryptionWarning(key) : undefined;
+  if (encryption) {
+    return encryption;
+  }
+  if (key.encryptedOpenSsh && !key.privateKeyPassphraseSecretId) {
+    return "Passphrase-protected OpenSSH key with no saved passphrase. Edit the key and type its passphrase.";
   }
   if (key.keyType === "dsa") {
-    return "DSA keys can’t sign in yet.";
+    return "DSA keys can’t sign in. Use an Ed25519, ECDSA or RSA key.";
   }
   return undefined;
 }

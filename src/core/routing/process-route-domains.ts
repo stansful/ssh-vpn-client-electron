@@ -3,6 +3,15 @@ import { normalizeProxyDomain } from "./domain-proxy-list.js";
 
 export const MAX_PROCESS_ROUTE_SESSION_LEASES = 256;
 
+/**
+ * The id prefix of an IP rule that stands for an address process discovery
+ * learned on the PAC path, not for a rule of the user's (see
+ * buildSelectedRulesWithProcessIps). Unable to tell which application asks,
+ * the PAC ranks such a rule after the direct list (see buildProxyPac), where
+ * the process rule it stands for ranks before it on the paths that can.
+ */
+export const LEARNED_PROCESS_IP_RULE_PREFIX = "process-ip:";
+
 export interface ProcessRouteSessionEvidence {
   processName: string;
   address: string;

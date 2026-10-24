@@ -1,5 +1,6 @@
 import {
   app,
+  BaseWindow,
   BrowserWindow,
   clipboard,
   ipcMain,
@@ -25,12 +26,19 @@ import { detectTunEnvironment } from "./platform/tun-environment.js";
 import { createDefaultRuntimeStatus, RUSSIA_INSIDE_PROXY_LIST_URL, RUSSIA_OUTSIDE_DIRECT_LIST_URL } from "../shared/defaults.js";
 import { IPC_CHANNELS, type RendererEvent, type ServiceEvent } from "../shared/ipc.js";
 import { parseDomainProxyList } from "../core/routing/domain-proxy-list.js";
-import { recoverWindowsSystemProxy, WindowsSystemProxyManager } from "../core/network/windows-system-proxy.js";
+import {
+  recoverWindowsSystemProxy,
+  restoreWindowsSystemProxyBeforeQuit,
+  restoreWindowsSystemProxyNow,
+  WindowsSystemProxyManager
+} from "../core/network/windows-system-proxy.js";
 import { resolveUpdateFormat } from "../core/update/github-app-update.js";
 import { LocalIpcServiceBridge } from "../service/local-ipc-client.js";
 import { defaultServiceEndpoint } from "../service/local-ipc-protocol.js";
 import { NativeProcessServiceBridge } from "../service/native-process-client.js";
-import { LiveSshServiceBridge } from "../service/live-ssh-service.js";
+import { LiveSshServiceBridge, parseServiceTarget } from "../service/live-ssh-service.js";
+import { describeTunRouteRecovery, recoverLeftoverTunRoutes } from "../service/tun-route-recovery.js";
+import { TUN_ROUTING_JOURNAL_FILE } from "../service/tun-routing.js";
 import { XrayServiceBridge } from "../service/xray-service.js";
 import { applicationMenuTemplate } from "./app/app-menu.js";
 import { createMainWindow, fitWindowSize, type CrashPageTunnel } from "./app/main-window.js";
@@ -46,7 +54,7 @@ import {
   formatRuntimePath as formatRuntimePathValue,
   formatRuntimeUrl as formatRuntimeUrlValue
 } from "./app/runtime-format.js";
-import { assessRendererIpcTrust } from "./app/renderer-security.js";
+import { assessRendererIpcTrust, isRendererPermissionAllowed, isRendererPermissionCheckAllowed } from "./app/renderer-security.js";
 import { assertAllowedExternalUrl } from "./app/external-urls.js";
 import { TerminalOutputBatcher } from "./app/terminal-output-batcher.js";
 import { TrayController, resolveTrayIconPaths } from "./app/tray.js";
@@ -65,6 +73,27 @@ import {
   type AttentionInput
 } from "./app/attention-store.js";
 import { createAppEnvironment, deriveTunStatus, isLiveSessionState, type TunEnvironmentFacts } from "./app/environment.js";
+import {
+  appIdentity,
+  isInsecureSecretFallbackAllowed,
+  readAppPackageMetadata,
+  removeDeveloperOverrides,
+  resolveBuildChannel
+} from "./app/packaged-runtime.js";
+import { SecretClipboardGuard } from "./app/clipboard-guard.js";
+import { persistentDiagnosticMessage, withoutAccountNames } from "./app/persistent-log.js";
+import { settleBeforeDeadline, QUIT_DEADLINE_MS } from "./app/quit-deadline.js";
+import { SessionEndWatcher } from "./app/session-end-watcher.js";
+import {
+  parseBoolean,
+  parseCheckEndpointArgument,
+  parseImportProxyProfilesInput,
+  parseRoutingMode,
+  parseRoutingRules,
+  parseSettingsPatch,
+  parseUpsertSshConfigInput
+} from "./app/ipc-validation.js";
+import { unpinnedRemovalEndsSession } from "./app/profile-removal.js";
 import { ERROR_SETTLE_DELAY_MS, TunnelTransitionTracker, type TunnelTransition } from "./app/session-transitions.js";
 import { TunnelCheckSessionGuard } from "./app/tunnel-check-guard.js";
 import { shouldDeliverRendererEvent, SystemEnergyPolicy, type ThermalState } from "./app/energy-policy.js";
@@ -88,40 +117,38 @@ import type {
   DiagnosticsEntry,
   DiagnosticsSource,
   GlobalTab,
-  ImportProxyProfilesInput,
-  RoutingMode,
   RoutingMutationResult,
-  RoutingRule,
   RuntimeStatus,
   StorageHealth,
   TerminalLine,
   TunnelCheckResult,
   TunStatus,
   UpsertProxyProfileInput,
-  UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "../shared/types.js";
 import { InProcessServiceBridge } from "../service/in-process-service.js";
 import type { ServiceBridge } from "../service/service-bridge.js";
 
+/**
+ * Developer switches leave the environment before anything reads them, so a
+ * packaged build - and every helper it starts - never sees them.
+ */
+const ignoredDeveloperOverrides = removeDeveloperOverrides(process.env, app.isPackaged);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, "..", "..");
 const rendererDist = path.join(__dirname, "..", "renderer");
-const preloadPath = path.join(__dirname, "..", "preload", "preload.mjs");
+const preloadPath = path.join(__dirname, "..", "preload", "preload.cjs");
 const iconPath = app.isPackaged ? path.join(rendererDist, "icon.svg") : path.join(projectRoot, "icon.svg");
 const notificationIconPath = path.join(app.isPackaged ? process.resourcesPath : path.join(projectRoot, "resources"), "icons", "icon.png");
 const runtimeFormatOptions = { packaged: app.isPackaged, resourcesPath: process.resourcesPath };
 const trayIconPaths = resolveTrayIconPaths({ packaged: app.isPackaged, projectRoot, resourcesPath: process.resourcesPath });
-const developmentBuild = process.env.SHADOW_SSH_BUILD_CHANNEL === "development";
-/**
- * The name the OS keys this app's data by, kept from before the rename to
- * Shadow: it names the data folder and, through app.setName, the
- * "<name> Safe Storage" Keychain/keyring entry that encrypts saved secrets.
- * Changing it would orphan both. Mirrors bootstrap.cts.
- */
-const appSystemName = developmentBuild ? "Shadow SSH Dev" : "Shadow SSH";
-/** The name people see: windows, tray, menus and notifications. */
-const appDisplayName = developmentBuild ? "Shadow Dev" : "Shadow";
+/** Baked into package.json when packaged (packaged-runtime.ts). Mirrors bootstrap.cts. */
+const buildChannel = resolveBuildChannel({
+  packaged: app.isPackaged,
+  packageMetadata: app.isPackaged ? readAppPackageMetadata(app.getAppPath()) : undefined,
+  env: process.env
+});
+const { systemName: appSystemName, displayName: appDisplayName } = appIdentity(buildChannel);
 const explicitUserDataPath = resolveUserDataPath(appSystemName);
 const dataLayout = resolveAppDataLayout(explicitUserDataPath);
 const persistedStorePath = dataLayout.storePath;
@@ -142,6 +169,10 @@ const MAX_CLIPBOARD_TEXT_CHARACTERS = 2 * 1024 * 1024;
 const MAX_TERMINAL_INPUT_CHARACTERS = 64 * 1024;
 const TRAY_REFRESH_DELAY_MS = 120;
 const TUN_ENVIRONMENT_REFRESH_INTERVAL_MS = 10_000;
+/** Longest the services wait at startup for leftover TUN routes to be undone. */
+const TUN_ROUTE_RECOVERY_STARTUP_WAIT_MS = 5_000;
+/** How long an exit past the quit deadline waits for the Windows proxy to be given back. */
+const SYSTEM_PROXY_EXIT_RESTORE_MS = 5_000;
 const DARK_WINDOW_BACKGROUND = "#0A0B0D";
 const LIGHT_WINDOW_BACKGROUND = "#F3F3F0";
 
@@ -163,7 +194,9 @@ const windowBackgroundColor = (settings: AppSettings): string => {
 };
 const startMinimizedToTray = process.argv.includes(START_MINIMIZED_TO_TRAY_ARG);
 const electronSessionFetch: FetchImplementation = (input, init) => session.defaultSession.fetch(input, init);
-const trustedRendererEntryUrl = process.env.VITE_DEV_SERVER_URL ?? pathToFileURL(path.join(rendererDist, "index.html")).href;
+/** `npm run dev` only: a packaged build trusts nothing but its own file:// entry. */
+const devServerUrl = app.isPackaged ? undefined : process.env.VITE_DEV_SERVER_URL;
+const trustedRendererEntryUrl = devServerUrl ?? pathToFileURL(path.join(rendererDist, "index.html")).href;
 
 interface ConnectOptions {
   /** Only start when no newer user intent has arrived (auto-connect). */
@@ -201,6 +234,12 @@ let tunEnvironmentCheckedAt = 0;
 let tunEnvironmentRefresh: Promise<void> | undefined;
 /** `tunDataplaneEnabled` the current session started with. */
 let sessionTunSetting: boolean | undefined;
+/**
+ * The launch's replay of a TUN route journal left by a killed helper. Services
+ * wait for it for a few seconds; past that, a TUN start in another helper
+ * waits for it on the journal's lock instead (see winroute/journal_lock.go).
+ */
+let tunRouteRecovery: Promise<void> | undefined;
 let tunnelChecksInFlight = 0;
 /** Why the connection core didn't start (Connect runs the simulator), shown as "Preview only". */
 let startupFailure: string | undefined;
@@ -213,6 +252,20 @@ const attention = new AttentionStore();
 const tunnelTransitions = new TunnelTransitionTracker();
 const tunnelCheckSessions = new TunnelCheckSessionGuard();
 const trustedRendererWebContentsIds = new Set<number>();
+/** A copied private key or profile link leaves the clipboard after 45 s. */
+const secretClipboard = new SecretClipboardGuard(clipboard);
+/**
+ * Bumped by every Blocked in Russia / Russian services switch, so a list
+ * download that finishes late keeps a switch made while it ran.
+ */
+const routingListSwitches = { proxy: 0, direct: 0 };
+let systemSessionEnding = false;
+// The tray keeps Shadow running with no window at all, and Windows says a
+// session is ending only to windows (see SessionEndWatcher).
+const sessionEndWatcher = new SessionEndWatcher({
+  createWindow: () => new BaseWindow({ show: false, width: 1, height: 1, frame: false, skipTaskbar: true, focusable: false }),
+  onSessionEnd: (reasons) => handleSystemSessionEnding(`Windows ${reasons.join(", ") || "session end"}`)
+});
 let resolveApplicationServicesReady!: () => void;
 const applicationServicesReady = new Promise<void>((resolve) => {
   resolveApplicationServicesReady = resolve;
@@ -266,8 +319,12 @@ app.on("second-instance", requestWindowShow);
 await preloadLoggingPreference();
 await ensureExplicitUserDataPath();
 await writeMainLog(`Main module loaded. pid=${process.pid}, platform=${process.platform}, arch=${process.arch}, userData=${explicitUserDataPath}`);
+if (ignoredDeveloperOverrides.length > 0) {
+  await writeMainLog(`Ignored development overrides in a packaged build: ${ignoredDeveloperOverrides.join(", ")}.`);
+}
 
 await app.whenReady();
+installPermissionPolicy();
 const applicationMenu = applicationMenuTemplate(process.platform, appDisplayName);
 Menu.setApplicationMenu(applicationMenu ? Menu.buildFromTemplate(applicationMenu) : null);
 await writeMainLog(
@@ -289,11 +346,11 @@ const appEnvironment: AppEnvironment = createAppEnvironment({
   dataDirectory: explicitUserDataPath,
   logDirectory: dataLayout.logDirectory,
   isPackaged: app.isPackaged,
-  buildChannel: process.env.SHADOW_SSH_BUILD_CHANNEL,
+  buildChannel,
   secrets: {
     encryptionAvailable: safeStorage.isEncryptionAvailable(),
     selectedBackend: process.platform === "linux" ? safeStorage.getSelectedStorageBackend?.() : undefined,
-    insecureFallbackAllowed: process.env.SHADOW_SSH_ALLOW_INSECURE_SECRET_FALLBACK === "1"
+    insecureFallbackAllowed: isInsecureSecretFallbackAllowed(app.isPackaged)
   }
 });
 void refreshTunEnvironment(true);
@@ -318,6 +375,9 @@ powerMonitor.on("resume", () => {
 });
 if (process.platform === "darwin") {
   powerMonitor.on("thermal-state-change", ({ state }) => systemEnergyPolicy.setThermalState(state as ThermalState));
+}
+if (process.platform === "darwin" || process.platform === "linux") {
+  powerMonitor.on("shutdown", () => handleSystemSessionEnding("system shutdown"));
 }
 if (process.platform === "darwin" || process.platform === "win32") {
   powerMonitor.on("speed-limit-change", ({ limit }) => systemEnergyPolicy.setCpuSpeedLimitPercent(limit));
@@ -409,6 +469,7 @@ const desktopNotifier = new DesktopNotifier({
 });
 await initializeApplicationStorage();
 await restoreStaleWindowsProxyState();
+startTunRouteRecovery();
 registerIpcHandlers();
 windowCreationAllowed = true;
 // A minimized startup can omit Chromium entirely. If tray creation failed,
@@ -416,6 +477,7 @@ windowCreationAllowed = true;
 if (!startMinimizedToTray || !trayController.isCreated) {
   await createWindow();
 }
+updateSessionEndWatcher();
 if (windowShowRequested) {
   windowShowRequested = false;
   requestWindowShow();
@@ -461,11 +523,13 @@ app.on("before-quit", (event) => {
   clearTimer(trayRefreshTimer);
   cancelTransitionSettle();
   transportMutations.stopAcceptingIntents();
+  // Nothing would clear a copied secret once the app is gone.
+  clearSecretClipboard();
   // Release queued intents immediately. Shutdown still awaits the complete
   // initialization promise below; bridge connect/request operations have
   // their own deadlines, and a late acquired service is disposed before exit.
   markApplicationServicesReady();
-  void enqueueTransportMutation(async () => {
+  const cleanup = enqueueTransportMutation(async () => {
     const cleanups: Array<{ label: string; run: () => Promise<void> }> = [
       { label: "active SSH service", run: async () => service.dispose?.() },
       { label: "Xray service", run: async () => xrayService.dispose() },
@@ -480,17 +544,31 @@ app.on("before-quit", (event) => {
     // Close only after cleanup diagnostics have been appended. The logger can
     // otherwise reopen its lazy handle for a late failure message.
     await mainLogger.close().catch(() => undefined);
-  }).finally(() => {
-    try {
-      desktopNotifier.dispose();
-      trayController.destroy();
-      serviceEventUnsubscribe?.();
-      xrayEventUnsubscribe?.();
-    } finally {
-      allowFinalQuit = true;
-      app.quit();
-    }
   });
+  // The cleanup queues behind any transport change in flight, and a stuck
+  // connect can take minutes to give up. Quit was asked for: past the
+  // deadline the app exits anyway, giving the Windows proxy back first.
+  void settleBeforeDeadline(cleanup)
+    .then(async (outcome) => {
+      if (outcome === "deadline") {
+        await writeMainLog(`Shutdown cleanup did not finish within ${QUIT_DEADLINE_MS / 1000} s; quitting anyway.`);
+        await settleBeforeDeadline(restoreSystemProxyBeforeExit(), { deadlineMs: SYSTEM_PROXY_EXIT_RESTORE_MS });
+        // The TUN helper finishes its own teardown once the app is gone (it
+        // is started detached); Xray would just keep running.
+        xrayService.killProcessForExit();
+      }
+    })
+    .finally(() => {
+      try {
+        desktopNotifier.dispose();
+        trayController.destroy();
+        serviceEventUnsubscribe?.();
+        xrayEventUnsubscribe?.();
+      } finally {
+        allowFinalQuit = true;
+        app.quit();
+      }
+    });
 });
 
 async function createWindow(): Promise<void> {
@@ -510,11 +588,21 @@ async function createWindow(): Promise<void> {
     minHeight: MINIMUM_WINDOW_SIZE.height,
     backgroundColor: windowBackgroundColor(storage.getSettings()),
     startHidden: false,
-    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+    devServerUrl,
     onCreated: (window) => {
       const webContentsId = window.webContents.id;
       trustedRendererWebContentsIds.add(webContentsId);
-      window.once("closed", () => trustedRendererWebContentsIds.delete(webContentsId));
+      window.once("closed", () => {
+        trustedRendererWebContentsIds.delete(webContentsId);
+        // After "all windows closed" has had its say: a quit it started must
+        // not be held up by the stand-in window.
+        setImmediate(updateSessionEndWatcher);
+      });
+      updateSessionEndWatcher();
+      if (process.platform === "win32") {
+        // Sign-out, restart or shutdown: once this fires the session ends.
+        window.on("session-end", (event) => handleSystemSessionEnding(`Windows ${event.reasons.join(", ") || "session end"}`));
+      }
     },
     onClosed: () => undefined,
     onClose: handleWindowClose,
@@ -589,6 +677,89 @@ function quitApplication(): void {
   app.quit();
 }
 
+/**
+ * The OS is signing out, restarting or shutting down and may end the process
+ * before the queued shutdown gets to the Windows proxy, which would then
+ * point at a dead port until the next launch. The proxy goes back first,
+ * outside the transport queue and synchronously: once this handler returns
+ * Windows may end the process at any moment, and an asynchronous restore
+ * would be cut off. Then the app quits as usual.
+ */
+function handleSystemSessionEnding(reason: string): void {
+  if (systemSessionEnding) {
+    return;
+  }
+  systemSessionEnding = true;
+  const restored = restoreWindowsSystemProxyNow([routingDataPath, path.join(routingDataPath, "xray")]);
+  void writeMainLog(`System session is ending (${reason}).${restored ? " Restored the Windows proxy settings." : ""} Quitting.`);
+  quitApplication();
+}
+
+/** Keeps the stand-in window for session-end notices up while no other window exists. */
+function updateSessionEndWatcher(): void {
+  sessionEndWatcher.update({
+    windows: BrowserWindow.getAllWindows().some((window) => !window.isDestroyed()),
+    platform: process.platform,
+    quitting: applicationQuitting
+  });
+}
+
+/** Best effort: the proxy journal says what to give back, and is kept for startup recovery. */
+async function restoreSystemProxyBeforeExit(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+  try {
+    // Journals stay: the transport change the quit gave up on may still
+    // write Shadow's values after this, and startup recovery undoes that.
+    if (await restoreWindowsSystemProxyBeforeQuit([routingDataPath, path.join(routingDataPath, "xray")])) {
+      await writeMainLog("Restored the Windows proxy settings before exit.");
+    }
+  } catch (error) {
+    await writeMainLog(`Restoring the Windows proxy settings before exit failed: ${formatError(error)}`);
+  }
+}
+
+function clearSecretClipboard(): void {
+  try {
+    secretClipboard.clearIfStillHeld();
+  } catch (error) {
+    void writeMainLog(`Unable to clear the copied secret from the clipboard: ${formatError(error)}`);
+  }
+}
+
+/**
+ * Electron grants every web permission when no handler is set. The renderer
+ * gets only what it uses (see isRendererPermissionAllowed, and
+ * isRendererPermissionCheckAllowed for the checks Electron makes with no
+ * window); devices never.
+ */
+function installPermissionPolicy(): void {
+  const permissions = session.defaultSession;
+  permissions.setPermissionRequestHandler((contents, permission, callback, details) => {
+    callback(
+      isRendererPermissionAllowed({
+        permission,
+        fromApplicationWindow: !contents.isDestroyed() && trustedRendererWebContentsIds.has(contents.id),
+        requestingUrl: details.requestingUrl || contents.getURL(),
+        trustedUrl: trustedRendererEntryUrl
+      })
+    );
+  });
+  permissions.setPermissionCheckHandler((contents, permission, requestingOrigin, details) =>
+    isRendererPermissionCheckAllowed({
+      permission,
+      hasWebContents: Boolean(contents),
+      fromApplicationWindow: Boolean(contents && !contents.isDestroyed() && trustedRendererWebContentsIds.has(contents.id)),
+      requestingOrigin,
+      requestingUrl: details.requestingUrl || (contents && !contents.isDestroyed() ? contents.getURL() : ""),
+      filePath: details.filePath,
+      trustedUrl: trustedRendererEntryUrl
+    })
+  );
+  permissions.setDevicePermissionHandler(() => false);
+}
+
 function wakeTransports(reason: string): void {
   try {
     service.wake?.(reason);
@@ -626,6 +797,10 @@ function registerProcessErrorHandlers(): void {
 }
 
 async function initializeApplicationServices({ autoConnect }: { autoConnect: boolean }): Promise<void> {
+  // Every connect waits for the services to be ready, so routes a killed
+  // helper left behind are undone before a new dataplane can be started -
+  // but never at the cost of more than a few seconds of startup.
+  await waitForTunRouteRecovery();
   try {
     const initialRuntime: RuntimeStatus = {
       ...createDefaultRuntimeStatus(platformTarget),
@@ -792,7 +967,11 @@ async function restoreStaleWindowsProxyState(): Promise<void> {
     return;
   }
   try {
-    const recovered = await recoverWindowsSystemProxy([routingDataPath, path.join(routingDataPath, "xray")]);
+    const recovered = await recoverWindowsSystemProxy([routingDataPath, path.join(routingDataPath, "xray")], {
+      onDiagnostic: (message) => {
+        appendDiagnostic("warning", message);
+      }
+    });
     if (recovered) {
       await writeMainLog("Recovered stale Windows proxy state from the previous application run.");
       appendInfo("Recovered stale Windows proxy settings from the previous run. Direct settings are back.");
@@ -803,6 +982,55 @@ async function restoreStaleWindowsProxyState(): Promise<void> {
     appendError(message);
     await writeMainLog(message);
     recordAttention(systemProxyRecoveryFailedAttention());
+  }
+}
+
+/**
+ * Replays the TUN route journal a killed helper left behind, once per launch.
+ * The next dataplane start would do it too, but that may never come - a run
+ * without administrator rights or with TUN off has none - and meanwhile the
+ * server's host route stays on the network card.
+ */
+function startTunRouteRecovery(): void {
+  if (process.platform !== "win32" || !nativeBinaryAvailable || tunRouteRecovery) {
+    return;
+  }
+  tunRouteRecovery = recoverLeftoverTunRoutes({
+    journalPath: path.join(explicitUserDataPath, TUN_ROUTING_JOURNAL_FILE),
+    executablePath: resolveNativeServicePath(projectRoot, platformTarget),
+    isElevated: async () => {
+      await refreshTunEnvironment();
+      return tunEnvironment?.elevated === true;
+    }
+  })
+    .then(async (outcome) => {
+      const detail = outcome.kind === "recovered"
+        ? ` (${outcome.recovered} undone)`
+        : outcome.kind === "failed"
+          ? `: ${outcome.message}`
+          : "";
+      await writeMainLog(`TUN route journal at startup: ${outcome.kind}${detail}.`);
+      const summary = describeTunRouteRecovery(outcome);
+      if (summary) {
+        appendDiagnostic(summary.level, summary.message, "routing");
+      }
+    })
+    .catch(async (error: unknown) => {
+      await writeMainLog(`TUN route recovery at startup failed: ${formatError(error)}`);
+    });
+}
+
+async function waitForTunRouteRecovery(): Promise<void> {
+  const recovery = tunRouteRecovery;
+  if (!recovery) {
+    return;
+  }
+  if ((await settleBeforeDeadline(recovery, { deadlineMs: TUN_ROUTE_RECOVERY_STARTUP_WAIT_MS })) === "deadline") {
+    // A dataplane start waits for it on the journal's lock rather than undo
+    // the same routes at once, or have its own journal cleared under it.
+    await writeMainLog(
+      `TUN route recovery is still running after ${TUN_ROUTE_RECOVERY_STARTUP_WAIT_MS / 1000} s; starting services without waiting for it.`
+    );
   }
 }
 
@@ -827,7 +1055,8 @@ function registerIpcHandlers(): void {
     void refreshTunEnvironment();
     return createSnapshot();
   });
-  handleTrustedIpc(IPC_CHANNELS.upsertConfig, async (_event, input: UpsertSshConfigInput) => {
+  handleTrustedIpc(IPC_CHANNELS.upsertConfig, async (_event, value: unknown) => {
+    const input = parseUpsertSshConfigInput(value);
     const store = await storage.upsertConfig(input);
     const config = store.sshConfigs.find((candidate) => candidate.id === input.id) ?? store.sshConfigs.at(-1);
     if (config) {
@@ -848,7 +1077,7 @@ function registerIpcHandlers(): void {
     return createSnapshot(store);
   });
   handleTrustedIpc(IPC_CHANNELS.copyPrivateKey, (_event, id: string) => {
-    clipboard.writeText(storage.readPrivateKeyText(id));
+    secretClipboard.writeSecret(storage.readPrivateKeyText(id));
     return true;
   });
   handleTrustedIpc(IPC_CHANNELS.deleteKey, async (_event, id: string) => {
@@ -859,8 +1088,8 @@ function registerIpcHandlers(): void {
     const store = await storage.upsertProxyProfile(input);
     return createSnapshot(store);
   });
-  handleTrustedIpc(IPC_CHANNELS.importProxyProfiles, async (_event, input: ImportProxyProfilesInput) => {
-    const result = await storage.importProxyProfiles(input);
+  handleTrustedIpc(IPC_CHANNELS.importProxyProfiles, async (_event, value: unknown) => {
+    const result = await storage.importProxyProfiles(parseImportProxyProfilesInput(value));
     return { snapshot: createSnapshot(result.store), result: result.result };
   });
   handleTrustedIpc(IPC_CHANNELS.refreshProxyProfiles, async () => {
@@ -888,7 +1117,7 @@ function registerIpcHandlers(): void {
     return createSnapshot(store);
   });
   handleTrustedIpc(IPC_CHANNELS.copyProxyProfileLink, (_event, id: string) => {
-    clipboard.writeText(storage.readProxyProfileShareLink(id));
+    secretClipboard.writeSecret(storage.readProxyProfileShareLink(id));
     return true;
   });
   handleTrustedIpc(IPC_CHANNELS.deleteProxyProfile, async (_event, id: string) => {
@@ -899,13 +1128,20 @@ function registerIpcHandlers(): void {
     return createSnapshot(store);
   });
   handleTrustedIpc(IPC_CHANNELS.deleteUnpinnedProxyProfiles, async () => {
-    if (activeTransport === "xray") {
+    if (
+      unpinnedRemovalEndsSession({
+        activeTransport,
+        activeProfileId: xrayService.getStatus().activeConfigId,
+        profiles: storage.getStore().proxyProfiles
+      })
+    ) {
       await disconnectActiveTransport();
     }
     const store = await storage.deleteUnpinnedProxyProfiles();
     return createSnapshot(store);
   });
-  handleTrustedIpc(IPC_CHANNELS.updateSettings, async (_event, patch: Partial<AppSettings>) => {
+  handleTrustedIpc(IPC_CHANNELS.updateSettings, async (_event, value: unknown) => {
+    const patch = parseSettingsPatch(value);
     const previousSettings = storage.getSettings();
     const nextStore = await storage.updateSettings(patch);
     const nextSettings = nextStore.settings;
@@ -929,21 +1165,24 @@ function registerIpcHandlers(): void {
     }
     return createSnapshot(nextStore);
   });
-  handleTrustedIpc(IPC_CHANNELS.updateRoutingMode, async (_event, mode: RoutingMode) => {
-    await saveRoutingChange("The routing mode change wasn’t saved", () => storage.updateRoutingMode(mode));
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingMode, async (_event, value: unknown) => {
+    await saveRoutingChange("The routing mode change wasn’t saved", () => storage.updateRoutingMode(parseRoutingMode(value)));
     return applyRoutingAfterSave();
   });
-  handleTrustedIpc(IPC_CHANNELS.updateRoutingRules, async (_event, rules: RoutingRule[]) => {
-    await saveRoutingChange("Routing rules weren’t saved", () => storage.updateRoutingRules(rules));
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingRules, async (_event, value: unknown) => {
+    await saveRoutingChange("Routing rules weren’t saved", () =>
+      storage.updateRoutingRules(parseRoutingRules(value, storage.getStore().routingRules))
+    );
     return applyRoutingAfterSave();
   });
-  handleTrustedIpc(IPC_CHANNELS.updateRoutingProxyListEnabled, async (_event, enabled: boolean) => {
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingProxyListEnabled, async (_event, value: unknown) => {
+    const enabled = parseBoolean(value, "Blocked in Russia");
+    const switchId = (routingListSwitches.proxy += 1);
     await saveRoutingChange(`Couldn’t turn ${enabled ? "on" : "off"} Blocked in Russia`, async () => {
-      const current = storage.getStore().routingProxyList;
-      if (enabled && current.domains.length === 0) {
-        await refreshRoutingProxyList({ enabled: true });
+      if (enabled && storage.getStore().routingProxyList.domains.length === 0) {
+        await refreshRoutingProxyList({ enabled: true, switchId });
       } else {
-        await storage.updateRoutingProxyList({ ...current, enabled });
+        await storage.setRoutingProxyListEnabled(enabled);
       }
     });
     return applyRoutingAfterSave();
@@ -952,13 +1191,14 @@ function registerIpcHandlers(): void {
     await saveRoutingChange("Blocked in Russia wasn’t refreshed", () => refreshRoutingProxyList());
     return applyRoutingAfterSave();
   });
-  handleTrustedIpc(IPC_CHANNELS.updateRoutingDirectListEnabled, async (_event, enabled: boolean) => {
+  handleTrustedIpc(IPC_CHANNELS.updateRoutingDirectListEnabled, async (_event, value: unknown) => {
+    const enabled = parseBoolean(value, "Russian services");
+    const switchId = (routingListSwitches.direct += 1);
     await saveRoutingChange(`Couldn’t turn ${enabled ? "on" : "off"} Russian services`, async () => {
-      const current = storage.getStore().routingDirectList;
-      if (enabled && current.domains.length === 0) {
-        await refreshRoutingDirectList({ enabled: true });
+      if (enabled && storage.getStore().routingDirectList.domains.length === 0) {
+        await refreshRoutingDirectList({ enabled: true, switchId });
       } else {
-        await storage.updateRoutingDirectList({ ...current, enabled });
+        await storage.setRoutingDirectListEnabled(enabled);
       }
     });
     return applyRoutingAfterSave();
@@ -1000,8 +1240,8 @@ function registerIpcHandlers(): void {
     });
     return createSnapshot();
   });
-  handleTrustedIpc(IPC_CHANNELS.checkTunnel, async (_event, endpoint?: string) => {
-    await runTunnelCheck(typeof endpoint === "string" && endpoint.trim() ? endpoint.trim() : undefined);
+  handleTrustedIpc(IPC_CHANNELS.checkTunnel, async (_event, value: unknown) => {
+    await runTunnelCheck(parseCheckEndpointArgument(value));
     return createSnapshot();
   });
   handleTrustedIpc(IPC_CHANNELS.openTerminal, async () => {
@@ -1056,7 +1296,15 @@ function registerIpcHandlers(): void {
     return true;
   });
   handleTrustedIpc(IPC_CHANNELS.readClipboardText, () => {
-    const text = clipboard.readText();
+    // A key or link this app copied is not handed back: the renderer never
+    // gets a secret this way. The clipboard does hold it, so Paste says so
+    // rather than that it is empty; the keyboard pastes it as usual.
+    const text = secretClipboard.readText();
+    if (text === undefined) {
+      throw new Error(
+        `The clipboard holds the key or link Shadow just copied, which Paste doesn’t read back. Paste it with ${process.platform === "darwin" ? "⌘V" : "Ctrl+V"} instead.`
+      );
+    }
     if (text.length > MAX_CLIPBOARD_TEXT_CHARACTERS) {
       throw new Error("The clipboard holds more than 2,097,152 characters, so nothing was pasted. Copy a shorter part instead.");
     }
@@ -1455,12 +1703,25 @@ async function rememberLastConnectedTransport(transport: GlobalTab): Promise<voi
 }
 
 async function disconnectActiveTransport(): Promise<void> {
-  await requestTransportIntent(async (generation) => {
-    if (!transportMutations.isCurrent(generation)) {
-      return;
+  await requestTransportIntent(
+    async (generation) => {
+      if (!transportMutations.isCurrent(generation)) {
+        return;
+      }
+      await disconnectActiveTransportInternal();
+    },
+    undefined,
+    // The disconnect waits its turn behind whatever the queue is running - a
+    // Connect, a routing update - and that work may be waiting on an SSH dial
+    // or a TUN start for minutes. The session stops waiting for it now; the
+    // teardown above runs when its turn comes.
+    () => {
+      // Before the services are up there is no session to end yet.
+      if (applicationServicesReadyResolved && !applicationQuitting) {
+        activeTunnelService().beginDisconnect?.();
+      }
     }
-    await disconnectActiveTransportInternal();
-  });
+  );
 }
 
 /**
@@ -1551,7 +1812,8 @@ async function applyRoutingConfigurationAfterMutation(): Promise<void> {
 
 function requestTransportIntent(
   operation: (generation: number) => Promise<void>,
-  expectedGeneration?: number
+  expectedGeneration?: number,
+  preempt?: () => void
 ): Promise<boolean> {
   return transportMutations.requestIntent(async (generation) => {
     await applicationServicesReady;
@@ -1559,23 +1821,29 @@ function requestTransportIntent(
       return;
     }
     await operation(generation);
-  }, { expectedGeneration });
+  }, { expectedGeneration, preempt });
 }
 
 function enqueueTransportMutation<T>(operation: () => Promise<T>): Promise<T> {
   return transportMutations.enqueue(operation);
 }
 
-async function refreshRoutingProxyList(options: { enabled?: boolean } = {}): Promise<void> {
-  const current = storage.getStore().routingProxyList;
-  const sourceUrl = current.sourceUrl || RUSSIA_INSIDE_PROXY_LIST_URL;
+/**
+ * Downloads Blocked in Russia. The download runs outside every queue for up
+ * to 15 s, so it takes the on/off switch as it is when it finishes: only the
+ * switch that started it (`switchId`) may still turn the list on, and a
+ * newer one wins.
+ */
+async function refreshRoutingProxyList(options: { enabled?: boolean; switchId?: number } = {}): Promise<void> {
+  const switchAtStart = options.switchId ?? routingListSwitches.proxy;
+  const sourceUrl = storage.getStore().routingProxyList.sourceUrl || RUSSIA_INSIDE_PROXY_LIST_URL;
   const text = await fetchRoutingListText(sourceUrl);
   const domains = parseDomainProxyList(text);
   if (domains.length === 0) {
     throw new Error("Routing proxy list refresh returned no domains.");
   }
   await storage.updateRoutingProxyList({
-    enabled: options.enabled ?? current.enabled,
+    enabled: routingListSwitches.proxy === switchAtStart ? options.enabled : undefined,
     sourceUrl,
     domains,
     updatedAt: new Date().toISOString()
@@ -1583,16 +1851,17 @@ async function refreshRoutingProxyList(options: { enabled?: boolean } = {}): Pro
   appendInfo(`Routing proxy list refreshed: ${domains.length} domains from ${sourceUrl}.`, "routing");
 }
 
-async function refreshRoutingDirectList(options: { enabled?: boolean } = {}): Promise<void> {
-  const current = storage.getStore().routingDirectList;
-  const sourceUrl = current.sourceUrl || RUSSIA_OUTSIDE_DIRECT_LIST_URL;
+/** Downloads Russian services; the switch is handled as in refreshRoutingProxyList. */
+async function refreshRoutingDirectList(options: { enabled?: boolean; switchId?: number } = {}): Promise<void> {
+  const switchAtStart = options.switchId ?? routingListSwitches.direct;
+  const sourceUrl = storage.getStore().routingDirectList.sourceUrl || RUSSIA_OUTSIDE_DIRECT_LIST_URL;
   const text = await fetchRoutingListText(sourceUrl);
   const domains = parseDomainProxyList(text);
   if (domains.length === 0) {
     throw new Error("Routing direct list refresh returned no domains.");
   }
   await storage.updateRoutingDirectList({
-    enabled: options.enabled ?? current.enabled,
+    enabled: routingListSwitches.direct === switchAtStart ? options.enabled : undefined,
     sourceUrl,
     domains,
     updatedAt: new Date().toISOString()
@@ -1768,6 +2037,8 @@ function handleRuntimeEvent(source: GlobalTab, event: ServiceEvent): void {
       return;
     }
     runtime = event.status;
+    trustSshHostKeyOnFirstUse(source, event.status);
+    rememberPinnedSshHostKeyType(source, event.status);
     scheduleTunnelVerification(source, event.status);
     const checkCleared = handleActiveStatusChanged(source, event.status);
     broadcast(event);
@@ -1778,8 +2049,9 @@ function handleRuntimeEvent(source: GlobalTab, event: ServiceEvent): void {
   }
   if (event.type === "diagnostics-appended") {
     const entry = withDiagnosticSource(normalizeDiagnosticEntry(event.entry), source);
-    if (shouldPersistDiagnostic(entry)) {
-      void writeMainLog(`${entry.level.toUpperCase()} ${entry.message}`);
+    const persisted = persistentDiagnosticMessage(entry.message);
+    if (persisted !== undefined) {
+      void writeMainLog(`${entry.level.toUpperCase()} ${persisted}`);
     }
     recordDiagnosticAttention(source, entry);
     const appended = appendDiagnosticEntry(entry);
@@ -1802,8 +2074,74 @@ function handleRuntimeEvent(source: GlobalTab, event: ServiceEvent): void {
   }
   if (event.type === "error") {
     const entry = appendError(event.message, source);
-    void writeMainLog(`ERROR ${entry.message}`);
+    void writeMainLog(`ERROR ${withoutAccountNames(entry.message)}`);
   }
+}
+
+/**
+ * Trust on first use. The first time a server with no pinned fingerprint
+ * completes an authenticated connection, the host key it proved is saved, and
+ * every later connection must find the same one. The bridge already holds the
+ * session to that key across reconnects; this makes it outlast the session.
+ */
+function trustSshHostKeyOnFirstUse(source: GlobalTab, status: RuntimeStatus): void {
+  if (source !== "ssh" || status.state !== "Connected" || storageHealth.state !== "ok") {
+    return;
+  }
+  const fingerprint = status.observedHostKeyFingerprint;
+  const endpoint = parseServiceTarget(status.activeTarget);
+  if (!fingerprint || !status.activeConfigId || !endpoint) {
+    return;
+  }
+  const serverName = status.activeConfigName ?? endpoint.host;
+  void storage.trustHostKeyOnFirstUse({
+    configId: status.activeConfigId,
+    host: endpoint.host,
+    port: endpoint.port,
+    fingerprint,
+    keyType: status.observedHostKeyType
+  })
+    .then((trusted) => {
+      if (!trusted) {
+        return;
+      }
+      appendInfo(
+        `Trusted the host key ${fingerprint} of ${serverName} on the first connection. A different key will stop the connection until its fingerprint is pinned.`,
+        "ssh"
+      );
+      broadcastSnapshotInvalidated("ssh-host-key-trusted");
+    })
+    .catch((error: unknown) => {
+      // The session still holds the server to this key; only a later
+      // session would accept another one.
+      const message = `Saving the trusted host key of ${serverName} failed: ${errorMessage(error)}`;
+      appendDiagnostic("warning", message, "ssh");
+      void writeMainLog(`WARNING ${message}`);
+    });
+}
+
+/**
+ * Saves the type of a pinned host key the first time a session verifies it,
+ * so the first connect of the next run asks for that type and a key of that
+ * type that does not match stops it at once (SshLiveClient.connect). The
+ * bridge already remembers it for the rest of this run.
+ */
+function rememberPinnedSshHostKeyType(source: GlobalTab, status: RuntimeStatus): void {
+  if (source !== "ssh" || status.state !== "Connected" || storageHealth.state !== "ok") {
+    return;
+  }
+  const fingerprint = status.observedHostKeyFingerprint;
+  if (!fingerprint || !status.activeConfigId) {
+    return;
+  }
+  // Nothing the renderer shows changes, so windows are not told to reload.
+  void storage.rememberPinnedHostKeyType({ configId: status.activeConfigId, fingerprint, keyType: status.observedHostKeyType })
+    .catch((error: unknown) => {
+      // Only the next run's first connect misses it; the bridge knows it now.
+      const message = `Saving the type of the pinned host key of ${status.activeConfigName ?? "the server"} failed: ${errorMessage(error)}`;
+      appendDiagnostic("warning", message, "ssh");
+      void writeMainLog(`WARNING ${message}`);
+    });
 }
 
 /** Returns true when the tunnel check result was dropped, so windows must reload it. */
@@ -2081,23 +2419,6 @@ function appendDiagnosticEntry(entry: DiagnosticsEntry): DiagnosticsEntry | unde
   return normalized;
 }
 
-function shouldPersistDiagnostic(entry: DiagnosticsEntry): boolean {
-  if (isHighVolumeProxyDiagnostic(entry.message)) {
-    return false;
-  }
-  return true;
-}
-
-function isHighVolumeProxyDiagnostic(message: string): boolean {
-  return (
-    /^(HTTP CONNECT|HTTP proxy|SOCKS5 CONNECT) .+ from 127\.0\.0\.1:\d+\.$/u.test(message) ||
-    /^(HTTP CONNECT|HTTP proxy|SOCKS5 CONNECT) tunnel opened for .+\.$/u.test(message) ||
-    /^(HTTP proxy|SOCKS5|SOCKS\/HTTP proxy) socket closed during handshake\.$/u.test(message) ||
-    /^(read ECONNRESET|write after end)$/u.test(message) ||
-    /^Further proxy (connection diagnostics|warnings) are suppressed for this session\.$/u.test(message)
-  );
-}
-
 function broadcast(event: RendererEvent): void {
   for (const window of BrowserWindow.getAllWindows()) {
     const windowDestroyed = window.isDestroyed();
@@ -2142,11 +2463,13 @@ async function readMainLogContent(): Promise<string> {
   }
 }
 
+/** Rejects with a readable reason when main.log stays as it was, so Activity never claims it was emptied. */
 async function clearMainLogFiles(): Promise<string> {
   try {
     await mainLogger.clear();
-  } catch {
-    // Clearing logs should not destabilize the application.
+  } catch (error) {
+    void writeMainLog(`Clearing main.log failed: ${formatError(error)}`);
+    throw new Error(`main.log couldn’t be cleared: ${errorMessage(error)}. Close any program that has it open and try again.`);
   }
   return readMainLogContent();
 }

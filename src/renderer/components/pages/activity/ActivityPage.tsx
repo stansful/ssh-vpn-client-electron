@@ -49,7 +49,7 @@ function logFileNamesOf(paths: readonly string[]): string[] {
  * that outlive both until dismissed.
  */
 export function ActivityPage(): JSX.Element {
-  const { snapshot, store, runtime, environment, run, toast, navigate, setSnapshot, updateSettings, copyText } = useAppData();
+  const { snapshot, store, runtime, environment, run, toast, navigate, updateSettings, copyText } = useAppData();
   const settings = store.settings;
   const liveOn = settings.diagnosticsLoggingEnabled;
   const fileOn = settings.fileLoggingEnabled;
@@ -179,13 +179,22 @@ export function ActivityPage(): JSX.Element {
       archives: logSize.archives,
       archiveCount: logSize.archiveCount
     };
-    log.replace(await api.clearLogFile());
-    let next = await api.clearDiagnostics();
-    // Clearing also clears what Activity was asked to keep (the main process does it too).
-    if (next.attention.length > 0) {
-      next = await api.dismissAttention();
+    // Step by step, stopping at the first failure: `run` shows the error toast
+    // (and applies each returned snapshot), and nothing claims success.
+    const errorTitle = "Couldn’t clear activity";
+    const logText = await run(() => api.clearLogFile(), { errorTitle });
+    if (logText === undefined) {
+      return;
     }
-    setSnapshot(next);
+    log.replace(logText);
+    let next = await run(() => api.clearDiagnostics(), { errorTitle });
+    // Clearing also clears what Activity was asked to keep (the main process does it too).
+    if (next && next.attention.length > 0) {
+      next = await run(() => api.dismissAttention(), { errorTitle });
+    }
+    if (!next) {
+      return;
+    }
     setFrozen(null);
     setFilters(EMPTY_FILTERS);
     setOpenGroups(new Set());

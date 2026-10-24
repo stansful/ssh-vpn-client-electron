@@ -84,12 +84,15 @@ type Adapter interface {
 // means "unknown", which the policy treats as "no process rule matched"
 // rather than as an error: an unattributable flow must still be routed.
 type Attributor interface {
-	Owner(protocol Protocol, local netip.AddrPort) string
+	Process(protocol Protocol, local netip.AddrPort) SocketOwner
 }
 
 // TunnelDialer reaches the active transport.
 type TunnelDialer interface {
-	DialTCP(ctx context.Context, destination netip.AddrPort) (net.Conn, error)
+	// DialTCP opens a tunnelled connection to destination. A non-empty name is
+	// the host the flow itself named; the far end is then asked for the name
+	// and resolves it (see Socks5Client.DialTCP and Policy.DialsByName).
+	DialTCP(ctx context.Context, destination netip.AddrPort, name string) (net.Conn, error)
 	AssociateUDP(ctx context.Context) (*Socks5UDPSession, error)
 }
 
@@ -120,6 +123,12 @@ type Options struct {
 	// Log receives one line per notable event. Levels are "info" and
 	// "warning", matching the service's diagnostics vocabulary.
 	Log func(level string, message string)
+	// OnFatal is told when the adapter stops delivering packets while the
+	// dataplane is not being closed. Nothing reads the adapter after that, so
+	// whatever the routes still send to it is lost until the capture is taken
+	// down. It is called at most once, from the packet pump; it must return
+	// promptly and must not call Close, which waits for that pump.
+	OnFatal func(err error)
 }
 
 // Dataplane owns the userspace stack and every flow running through it.
@@ -135,6 +144,9 @@ type Dataplane struct {
 
 	// tunnelIPv6 is the last answer of the IPv6 probe.
 	tunnelIPv6 atomic.Bool
+	// adapterFailed is set once the adapter stopped delivering packets. Every
+	// write fails from then on, and one line already said why.
+	adapterFailed atomic.Bool
 	// udpWarnings keeps the UDP diagnostics to one line per destination.
 	udpWarnings logLimiter
 }
@@ -250,7 +262,11 @@ func (d *Dataplane) pumpInbound(ctx context.Context) {
 		packet, err := d.options.Adapter.ReceivePacket()
 		if err != nil {
 			if ctx.Err() == nil {
+				d.adapterFailed.Store(true)
 				d.options.Log("warning", "TUN read stopped: "+err.Error())
+				if d.options.OnFatal != nil {
+					d.options.OnFatal(err)
+				}
 			}
 			return
 		}
@@ -277,7 +293,7 @@ func (d *Dataplane) pumpOutbound(ctx context.Context) {
 			return
 		}
 		view := packet.ToView()
-		if err := d.options.Adapter.SendPacket(view.AsSlice()); err != nil && ctx.Err() == nil {
+		if err := d.options.Adapter.SendPacket(view.AsSlice()); err != nil && ctx.Err() == nil && !d.adapterFailed.Load() {
 			d.options.Log("warning", "TUN write failed: "+err.Error())
 		}
 		view.Release()
@@ -299,19 +315,40 @@ func ipVersion(packet []byte) (tcpip.NetworkProtocolNumber, bool) {
 	}
 }
 
+// trackedFlow is one flow while it is being routed: what the policy reads,
+// plus what is needed to ask who owns it, which is only done once the answer
+// turns on it (see decide).
+type trackedFlow struct {
+	Flow
+	// source is the application's own socket.
+	source     netip.AddrPort
+	attributed bool
+}
+
 // flowOf turns a forwarder request identity into the descriptor the policy
 // reads. gVisor names the fields from the stack's point of view: the packet's
 // destination is Local, and its source - the application's own socket - is
 // Remote.
-func (d *Dataplane) flowOf(protocol Protocol, id stack.TransportEndpointID) Flow {
+func (d *Dataplane) flowOf(protocol Protocol, id stack.TransportEndpointID) trackedFlow {
 	destination := netip.AddrPortFrom(addrOf(id.LocalAddress), id.LocalPort)
 	source := netip.AddrPortFrom(addrOf(id.RemoteAddress), id.RemotePort)
-	flow := Flow{Protocol: protocol, Destination: destination}
-	if d.options.Attribution != nil {
-		flow.ProcessName = d.options.Attribution.Owner(protocol, source)
-	}
+	flow := trackedFlow{Flow: Flow{Protocol: protocol, Destination: destination}, source: source}
 	flow.Domains = d.options.Domains.Lookup(destination.Addr())
 	return flow
+}
+
+// decide answers a flow, first asking which process owns it when - and only
+// when - the answer can turn on that. The owner tables are a snapshot of every
+// socket on the machine, and a socket missing from the last one is waited for
+// (see OwnerTable.Owner); a flow no process rule or transport process can
+// change should pay for neither.
+func (d *Dataplane) decide(policy *Policy, flow *trackedFlow) Decision {
+	if !flow.attributed && d.options.Attribution != nil && policy.OwnerMatters(flow.Flow) {
+		flow.attributed = true
+		owner := d.options.Attribution.Process(flow.Protocol, flow.source)
+		flow.ProcessName, flow.ProcessID = owner.Name, owner.PID
+	}
+	return policy.Decide(flow.Flow)
 }
 
 func addrOf(address tcpip.Address) netip.Addr {
@@ -327,9 +364,9 @@ func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 	id := request.ID()
 	flow := d.flowOf(ProtocolTCP, id)
 	policy := d.policy.Load()
-	decision := policy.Decide(flow)
-	heldForName := d.shouldSniff(policy, flow)
-	if decision.Verdict == VerdictDrop || d.refusesForIPv6(flow, decision, heldForName) {
+	decision := d.decide(policy, &flow)
+	heldForName := d.shouldSniff(policy, flow.Flow)
+	if decision.Verdict == VerdictDrop || d.refusesForIPv6(flow.Flow, decision, heldForName) {
 		// A reset tells the application immediately instead of leaving it to
 		// time out, which is what a user reads as "the app is broken". For an
 		// IPv6 flow the tunnel cannot carry it is also what makes the
@@ -350,16 +387,18 @@ func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 	go func() {
 		defer local.Close()
 
-		// The name the flow was opened for decides between a domain rule and
-		// nothing, and DNS learning does not see it for a client that resolved
-		// before the tunnel came up or resolves over DoH. Its first bytes do.
+		// The name the flow was opened for decides between a rule or a list
+		// and nothing, and DNS learning does not see it for a client that
+		// resolved before the tunnel came up or resolves over DoH. Its first
+		// bytes do.
 		var head []byte
+		var name string
 		if heldForName {
-			var name string
 			head, name = sniffTCP(local)
 			if name != "" {
 				flow.Domains = []string{name}
-				decision = policy.Decide(flow)
+				flow.NameSniffed = true
+				decision = d.decide(policy, &flow)
 				d.rememberSniffedName(flow.Destination, name)
 			}
 		}
@@ -367,11 +406,18 @@ func (d *Dataplane) handleTCP(request *tcp.ForwarderRequest) {
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		defer cancel()
 
-		remote, err := d.dialTCP(ctx, decision.Verdict, flow.Destination)
+		// Only a name that is the connected server's own is dialled by: the
+		// target of a request to an HTTP proxy routes the flow, but the flow
+		// still has to reach the proxy (see namesConnectedServer).
+		dialName := ""
+		if decision.Verdict == VerdictProxy && policy.DialsByName(name) && namesConnectedServer(head) {
+			dialName = name
+		}
+		remote, err := d.dialTCP(ctx, decision.Verdict, flow.Destination, dialName)
 		if err != nil {
 			d.options.Log("warning", fmt.Sprintf(
 				"TUN tcp %s -> %s (%s/%s) failed: %s",
-				describeProcess(flow.ProcessName), flow.Destination, decision.Verdict, decision.Reason, err))
+				describeProcess(flow.ProcessName), describeTarget(flow.Destination, name), decision.Verdict, decision.Reason, err))
 			return
 		}
 		defer remote.Close()
@@ -413,10 +459,17 @@ func sniffTCP(local net.Conn) (head []byte, name string) {
 }
 
 // shouldSniff says whether a flow's first bytes are worth reading for a
-// name: only when a rule could turn on it, and only when nothing else has
-// settled the flow already. A process rule or an address rule selects the
-// flow whatever it is named - the direct list never pre-empts a rule - and
-// the transport's own endpoint is settled before any rule.
+// name (see Policy.NameWorthReading): when a name could change where it goes,
+// and nothing else has settled the flow already. A process rule or an address
+// rule selects the flow whatever it is named - the direct list never pre-empts
+// a rule - and the transport's own endpoint and its process are settled before
+// any rule. In selected-rules a name can select the flow (a domain rule, the
+// proxy list); in proxy-all it can release it (the direct list); in either, a
+// domain rule can claim a flow to the local network, which is read on any port
+// but the well-known server-speaks-first ones. A tunnelled flow to a web port
+// is read as well, whatever selected it: a single-label name sends it to the
+// local network unless an address rule selected it, and a name the rules
+// select is what it is dialled by.
 //
 // Names the address was learned under do not settle it. One CDN address
 // serves many sites, and only the flow's own hello says which of them this
@@ -425,19 +478,19 @@ func sniffTCP(local net.Conn) (head []byte, name string) {
 // through the tunnel. The learned names stay as the fallback for a flow that
 // carries no hello.
 func (d *Dataplane) shouldSniff(policy *Policy, flow Flow) bool {
-	if !policy.NamesMatter() {
-		return false
-	}
-	nameless := flow
-	nameless.Domains = nil
-	settled := policy.Decide(nameless)
-	return settled.Verdict == VerdictDirect && settled.Reason != "protected-ssh-connection"
+	return policy.NameWorthReading(flow)
 }
 
 // rememberSniffedName teaches the domain cache what a flow revealed, so a
 // later flow to the same address that carries no hello - a QUIC attempt,
-// or a plain socket - is judged by the same name.
+// or a plain socket - is judged by the same name. A name that can only mean
+// the local network is not remembered: it says something only about the flow
+// that carried it (Flow.Domains), and only that flow may take it to the local
+// network. A domain rule for a `.local` name still selects that flow by it.
 func (d *Dataplane) rememberSniffedName(destination netip.AddrPort, name string) {
+	if isLocalName(name) {
+		return
+	}
 	d.options.Domains.Record([]dnsRecord{{Address: destination.Addr(), Names: []string{name}, TTL: sniffedNameTTL}})
 }
 
@@ -493,9 +546,13 @@ func guardedSniffQUICServerName(sink *cryptoReassembler, datagram []byte) (name 
 	return sniffQUICServerName(sink, datagram)
 }
 
-func (d *Dataplane) dialTCP(ctx context.Context, verdict Verdict, destination netip.AddrPort) (net.Conn, error) {
+// dialTCP opens the flow's upstream. A tunnelled flow given a name is dialled
+// by it (see Policy.DialsByName), so the far end resolves it rather than
+// following the local resolver's answer; everything else, and every direct
+// flow, is dialled by the address the application used.
+func (d *Dataplane) dialTCP(ctx context.Context, verdict Verdict, destination netip.AddrPort, name string) (net.Conn, error) {
 	if verdict == VerdictProxy {
-		return d.options.Tunnel.DialTCP(ctx, destination)
+		return d.options.Tunnel.DialTCP(ctx, destination, name)
 	}
 	return d.options.Direct.DialTCP(ctx, destination)
 }
@@ -543,37 +600,61 @@ func (d *Dataplane) handleUDP(request *udp.ForwarderRequest) bool {
 		defer local.Close()
 		flow := d.flowOf(ProtocolUDP, id)
 
-		// DNS is answered before the policy runs. With the default route
-		// captured, refusing a selected application's DNS - which the UDP drop
-		// rule would do on the SSH transport - would break it far more
-		// thoroughly than routing ever fixed. Queries go out the physical
-		// interface exactly as they did before the tunnel came up, and their
-		// answers teach the domain cache which address belongs to which name.
+		// DNS is answered before the policy runs, and goes direct by design in
+		// every mode. With the default route captured, refusing a selected
+		// application's DNS - which the UDP drop rule would do on the SSH
+		// transport - would break it far more thoroughly than routing ever
+		// fixed, and tunnelling only some of it would need the process before
+		// the flow that reveals it. Queries go out the physical interface
+		// exactly as they did before the tunnel came up, and their answers
+		// teach the domain cache which address belongs to which name. A
+		// poisoned answer for a site the rules select by name is not followed
+		// into the tunnel by a TCP flow whose first bytes were read and name
+		// the site as the server it is connected to: that flow is dialled
+		// there by name (see Policy.NameWorthReading, Policy.DialsByName and
+		// namesConnectedServer). A flow whose name was not read, one that
+		// names nothing, a request to an HTTP proxy and every datagram still
+		// go to the address they were given.
+		//
+		// Only a flow that opens with a DNS query is DNS, though. Port 53 is
+		// also where DNSCrypt and VPNs run to get past firewalls, and where
+		// the transport's own server may listen; the relay below would drop
+		// all of that, since none of it reads as a query or an answer. Such a
+		// flow is routed like any other, on what it sent first.
+		policy := d.policy.Load()
+		var head [][]byte
 		if flow.Destination.Port() == 53 {
-			d.serveDNS(local, flow)
-			return
+			first, err := readFirstDatagram(local)
+			if err != nil {
+				return
+			}
+			if query, ok := parseDNSExchange(first); ok && !query.response && !policy.isProtectedEndpoint(flow.Destination) {
+				d.serveDNS(local, flow.Flow, first)
+				return
+			}
+			head = [][]byte{first}
 		}
 
-		policy := d.policy.Load()
-		decision := policy.Decide(flow)
+		decision := d.decide(policy, &flow)
 		// A QUIC client's first datagram names the site it is opening (see
 		// quic.go). Reading it here is what lets a domain rule refuse the
 		// datagram flow of a site whose address no DNS answer has explained,
-		// so the client falls back to the TCP flow that is tunnelled.
-		var head [][]byte
-		if d.shouldSniff(policy, flow) {
+		// so the client falls back to the TCP flow that is tunnelled, and what
+		// lets the direct list release a site's QUIC in full tunnel.
+		if head == nil && d.shouldSniff(policy, flow.Flow) {
 			var name string
 			head, name = sniffUDP(local)
 			if name != "" {
 				flow.Domains = []string{name}
-				decision = policy.Decide(flow)
+				flow.NameSniffed = true
+				decision = d.decide(policy, &flow)
 				d.rememberSniffedName(flow.Destination, name)
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		defer cancel()
 		switch {
-		case decision.Verdict == VerdictDrop || d.refusesForIPv6(flow, decision, false):
+		case decision.Verdict == VerdictDrop || d.refusesForIPv6(flow.Flow, decision, false):
 			// The endpoint is held open and drained rather than closed, so the
 			// application's retransmits are swallowed here instead of
 			// re-entering this handler - and, on the packet pump, re-running
@@ -582,9 +663,9 @@ func (d *Dataplane) handleUDP(request *udp.ForwarderRequest) bool {
 			// flow the tunnel cannot carry, refused, which sends it to IPv4.
 			d.discardUDP(local)
 		case decision.Verdict == VerdictProxy:
-			d.relayUDPThroughTunnel(ctx, local, flow, head)
+			d.relayUDPThroughTunnel(ctx, local, flow.Flow, head)
 		default:
-			d.relayUDPDirect(ctx, local, flow, head)
+			d.relayUDPDirect(ctx, local, flow.Flow, head)
 		}
 	}()
 	return true
@@ -792,7 +873,34 @@ func (d *Dataplane) relayUDPDirect(ctx context.Context, local net.Conn, flow Flo
 	}
 }
 
-func (d *Dataplane) serveDNS(local net.Conn, flow Flow) {
+// readFirstDatagram reads the datagram the flow was created for. It is
+// already waiting - the endpoint exists because it arrived - so the deadline
+// only guards against a flow that is gone.
+func readFirstDatagram(local net.Conn) ([]byte, error) {
+	defer func() {
+		_ = local.SetReadDeadline(time.Time{})
+	}()
+	if err := local.SetReadDeadline(time.Now().Add(dnsTimeout)); err != nil {
+		return nil, err
+	}
+	buffer := make([]byte, udpDatagramMaxBytes)
+	read, err := local.Read(buffer)
+	if err != nil {
+		return nil, err
+	}
+	return buffer[:read], nil
+}
+
+// serveDNS relays one application's queries to the resolver it addressed, out
+// the physical interface, and hands back only the answers to them. first is
+// the query that opened the flow.
+//
+// The relay socket is unconnected, so anything that reaches its port can
+// write to it. A datagram is taken as the answer only when it comes from the
+// resolver the query went to and echoes the query's ID and question (RFC 1035
+// §7.3); anything else is dropped, so a guessed or stray datagram can neither
+// answer the application nor teach the domain cache a name for an address.
+func (d *Dataplane) serveDNS(local net.Conn, flow Flow, first []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), dnsTimeout)
 	defer cancel()
 	remote, err := d.options.Direct.ListenUDP(ctx, flow.Destination)
@@ -800,36 +908,78 @@ func (d *Dataplane) serveDNS(local net.Conn, flow Flow) {
 		return
 	}
 	defer remote.Close()
-	destination := net.UDPAddrFromAddrPort(flow.Destination)
+	resolver := flow.Destination
+	destination := net.UDPAddrFromAddrPort(resolver)
 
 	buffer := make([]byte, udpDatagramMaxBytes)
 	answer := make([]byte, udpDatagramMaxBytes)
-	for {
-		// A resolver client reuses one socket for several queries, so the
-		// exchange loops until the client goes quiet rather than serving a
-		// single question.
-		if err := local.SetReadDeadline(time.Now().Add(udpSessionIdleTimeout)); err != nil {
+	for datagram := first; ; datagram = nil {
+		if datagram == nil {
+			// A resolver client reuses one socket for several queries, so the
+			// exchange loops until the client goes quiet rather than serving
+			// a single question.
+			if err := local.SetReadDeadline(time.Now().Add(udpSessionIdleTimeout)); err != nil {
+				return
+			}
+			read, err := local.Read(buffer)
+			if err != nil {
+				return
+			}
+			datagram = buffer[:read]
+		}
+		query, ok := parseDNSExchange(datagram)
+		if !ok || query.response {
+			// Nothing an answer could be matched to, and nothing a resolver
+			// would answer with more than an error.
+			continue
+		}
+		if _, err := remote.WriteTo(datagram, destination); err != nil {
 			return
 		}
-		read, err := local.Read(buffer)
-		if err != nil {
-			return
-		}
-		if _, err := remote.WriteTo(buffer[:read], destination); err != nil {
-			return
-		}
+		// One deadline for the whole wait: datagrams that are not the answer
+		// cannot keep the exchange open.
 		if err := remote.SetReadDeadline(time.Now().Add(dnsTimeout)); err != nil {
 			return
 		}
-		answered, _, err := remote.ReadFrom(answer)
-		if err != nil {
-			return
+		var reply []byte
+		for reply == nil {
+			answered, from, err := remote.ReadFrom(answer)
+			if err != nil {
+				return
+			}
+			if !udpSourceIs(from, resolver) {
+				continue
+			}
+			if candidate, ok := parseDNSExchange(answer[:answered]); !ok || !candidate.answers(query) {
+				continue
+			}
+			reply = answer[:answered]
 		}
-		d.options.Domains.Record(parseDNSAnswers(answer[:answered]))
-		if _, err := local.Write(answer[:answered]); err != nil {
+		d.options.Domains.Record(parseDNSAnswers(reply))
+		if _, err := local.Write(reply); err != nil {
 			return
 		}
 	}
+}
+
+// udpSourceIs reports whether a datagram's source is want, comparing the
+// IPv4 and IPv4-mapped forms of one address as equal.
+func udpSourceIs(from net.Addr, want netip.AddrPort) bool {
+	var source netip.AddrPort
+	switch address := from.(type) {
+	case *net.UDPAddr:
+		source = address.AddrPort()
+	case nil:
+		return false
+	default:
+		parsed, err := netip.ParseAddrPort(from.String())
+		if err != nil {
+			return false
+		}
+		source = parsed
+	}
+	return source.Port() == want.Port() &&
+		source.Addr().WithZone("").Unmap() == want.Addr().WithZone("").Unmap()
 }
 
 func describeProcess(name string) string {
@@ -837,4 +987,13 @@ func describeProcess(name string) string {
 		return "(unattributed)"
 	}
 	return name
+}
+
+// describeTarget is the destination for a log line, with the name the flow
+// carried when it named one.
+func describeTarget(destination netip.AddrPort, name string) string {
+	if name == "" {
+		return destination.String()
+	}
+	return destination.String() + " (" + name + ")"
 }

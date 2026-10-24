@@ -340,7 +340,7 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
       return;
     }
     const before = latest.current.store;
-    const stopsXray = removal.kind === "bulk" && sessionWouldStop(latest.current.session);
+    const stopsXray = removal.kind === "bulk" && sessionWouldStop(latest.current.session, before.proxyProfiles);
     latest.current.removing = true;
     setRemoving(true);
     setRemoveError(undefined);
@@ -423,7 +423,8 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
       sshSessionName: sshName
     });
   }
-  const xrayStillUp = activeTransport === "xray" && runtime.state !== "Disconnected" && runtime.state !== "Error";
+  // Main stops Xray only for a session on a profile being removed.
+  const bulkStopsXray = sessionWouldStop(session, profiles);
 
   return (
     <>
@@ -594,7 +595,7 @@ export function ProfilesPage({ intent }: PageProps): JSX.Element {
       <RemoveUnpinnedDialog
         open={removalOpen && removal?.kind === "bulk"}
         copy={bulkCopyRef.current}
-        busyLabel={xrayStillUp ? "Stopping Xray…" : "Removing…"}
+        busyLabel={bulkStopsXray ? "Stopping Xray…" : "Removing…"}
         busy={removing}
         error={removeError}
         onConfirm={() => void confirmRemoval()}

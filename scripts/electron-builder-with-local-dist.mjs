@@ -31,6 +31,11 @@ if (isShadowDevBuild) {
   builderArgs.push("--config.productName=Shadow Dev");
   builderArgs.push("--config.portable.artifactName=shadow-ssh-dev-${version}-windows-portable-${arch}.${ext}");
 }
+// The packaged app reads its channel from its own package.json
+// (src/main/app/packaged-runtime.ts, bootstrap.cts): the environment it is
+// later started from says nothing about how it was built. A dev build thereby
+// gets its own data folder, keychain entry and single-instance lock.
+builderArgs.push(`--config.extraMetadata.shadowBuildChannel=${isShadowDevBuild ? "development" : "production"}`);
 
 // On CI electron-builder publishes implicitly and, without a GitHub token, fails
 // on the latest*.yml it writes for DMG and AppImage. Releases are published by

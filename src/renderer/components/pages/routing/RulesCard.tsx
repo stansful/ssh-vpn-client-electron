@@ -23,6 +23,7 @@ import {
   TabPanel,
   Tabs
 } from "../../ui/index.js";
+import { fullTunnelRulesNotice, hasEnabledAppRules } from "../connect/connect-target.js";
 import { RunningApps, TunCard, UdpNote, type ProcessLoad } from "./AppsTools.js";
 import {
   duplicateMessage,
@@ -205,7 +206,11 @@ export const RulesCard = forwardRef<HTMLElement, { ctl: RoutingController }>(fun
 
       {ctl.mode === "proxy-all" && rules.length > 0 ? (
         <Callout tone="info" className="anim-swap" title="Full tunnel is on">
-          Everything already goes through the tunnel, so these rules don’t change anything right now. They’re kept for Split tunnel.
+          {fullTunnelRulesNotice(
+            ctl.steers,
+            ctl.steers && ctl.directList.enabled && ctl.directList.domains.length > 0,
+            ctl.tunEnabled && hasEnabledAppRules(rules)
+          )}
         </Callout>
       ) : null}
 

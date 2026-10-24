@@ -19,6 +19,10 @@ import (
 )
 
 func main() {
+	// First, before anything loads a library by name.
+	if err := restrictDLLSearch(); err != nil {
+		fmt.Fprintln(os.Stderr, "Could not limit DLL loading to the system directory: "+err.Error())
+	}
 	os.Exit(run())
 }
 
@@ -60,11 +64,15 @@ func run() (exitCode int) {
 	}
 	defer func() {
 		// A successful protocol or SCM shutdown already performed the bounded
-		// routing rollback. Do not repeat the same potentially five-second cleanup
-		// while the desktop client or service manager is waiting for process exit.
+		// routing rollback. Do not repeat it while the desktop client or service
+		// manager is waiting for process exit: a dataplane teardown runs on its
+		// own budget of up to three minutes (two of them for the routing
+		// rollback), whatever deadline this context carries.
 		if routingCleanupCompleted.Load() {
 			return
 		}
+		// Only the driver's ClearRouting honours this deadline; the dataplane
+		// teardown inside Shutdown deliberately does not.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := service.Shutdown(cleanupCtx); err != nil {
@@ -116,7 +124,11 @@ func run() (exitCode int) {
 
 			// SCM must not receive SERVICE_STOPPED before routing rollback has
 			// completed. Retry once inside the service lifetime; the outer deferred
-			// cleanup remains a final fallback if both bounded attempts fail.
+			// cleanup remains a final fallback if both bounded attempts fail. Only
+			// the driver's routing cleanup can succeed on a retry: the dataplane
+			// teardown runs once, taking up to its three-minute budget, and what it
+			// could not undo is left to the routing journal for the next start, so
+			// a retry reports that failure again rather than a clean stop.
 			var cleanupErr error
 			for attempt := 0; attempt < 2; attempt++ {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

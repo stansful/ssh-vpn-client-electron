@@ -3,6 +3,7 @@ import { useRef, type KeyboardEvent } from "react";
 import { plural } from "../../../lib/format.js";
 import type { RoutingMode } from "../../../../shared/types.js";
 import { Badge, Card, CardHeader, Icon } from "../../ui/index.js";
+import { fullTunnelDescription, hasEnabledAppRules } from "../connect/connect-target.js";
 import { summaryCopy } from "./routing-model.js";
 import type { RoutingController } from "./useRoutingController.js";
 
@@ -89,7 +90,14 @@ export function ModeCard({ ctl }: { ctl: RoutingController }): JSX.Element {
           "Full tunnel",
           steers ? "Everything is protected" : "Everything sent to the proxy",
           ShieldCheck,
-          "All traffic goes through the tunnel. Sites on the Russian services list stay direct when the system proxy is used."
+          // Only Windows routing reads the Russian services list and keeps
+          // the local network direct; elsewhere apps send the local proxy
+          // everything.
+          fullTunnelDescription(
+            steers,
+            steers && ctl.directList.enabled && ctl.directList.domains.length > 0,
+            ctl.tunEnabled && hasEnabledAppRules(ctl.rules)
+          )
         )}
         {option(
           "selected-rules",

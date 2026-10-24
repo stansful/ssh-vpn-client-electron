@@ -1,11 +1,14 @@
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { WindowsSystemProxyManager } from "../src/core/network/windows-system-proxy.js";
+import type { DataplaneStartRequest } from "../src/service/local-ipc-protocol.js";
+import type { DataplaneController } from "../src/service/native-dataplane.js";
+import type { ProcessRouteLearner } from "../src/service/process-route-learning.js";
 import type { ProxyConnectRequest, RuntimeStatus } from "../src/shared/types.js";
 
 const runtime = vi.hoisted(() => ({
@@ -19,13 +22,22 @@ const childProcess = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("../src/service/xray/process-utils.js", () => runtime);
 vi.mock("node:child_process", () => ({ execFile: vi.fn(), spawn: childProcess.spawn }));
 
-import { XrayServiceBridge } from "../src/service/xray-service.js";
+import { bindRefusingLoopbackPorts, XrayServiceBridge } from "../src/service/xray-service.js";
+import {
+  forgetLocalProxyPort,
+  forgetXrayInboundPorts,
+  rememberLocalProxyPort
+} from "../src/service/local-proxy-port.js";
 
 const runtimeDirectories = new Set<string>();
 
 describe("Xray service lifecycle", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // A default spawn left by one case must not hand a process to the next.
+    childProcess.spawn.mockReset();
+    forgetXrayInboundPorts();
+    forgetLocalProxyPort();
     runtime.reserveDistinctLocalTcpPorts.mockResolvedValue([
       { host: "127.0.0.1", port: 32000 },
       { host: "127.0.0.1", port: 32001 }
@@ -174,11 +186,14 @@ describe("Xray service lifecycle", () => {
 
     processHandle.emit("close", 9, null);
 
-    expect(service.getStatus()).toMatchObject({ state: "Error", realTunnelAvailable: false });
+    expect(service.getStatus()).toMatchObject({ state: "Error", realTunnelAvailable: false, localProxy: undefined });
     await vi.waitFor(() => expect(service.getStatus().state).toBe("Reconnecting"));
-    expect(systemProxy.restore).toHaveBeenCalled();
     expect(runtime.terminateProcess).toHaveBeenCalledWith(processHandle);
+    // Routing is held for the restart, as the SSH transport holds it while it
+    // reconnects, instead of being released at once.
+    expect(systemProxy.restore).not.toHaveBeenCalled();
     await service.dispose();
+    expect(systemProxy.restore).toHaveBeenCalled();
   });
 
   it("learns a late process connection during the discovery burst and reapplies PAC routing", async () => {
@@ -545,8 +560,7 @@ describe("Xray service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(rules: ProxyConnectRequest["routingRules"]): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const rules: ProxyConnectRequest["routingRules"] = [{
       id: "custom-app",
@@ -560,23 +574,23 @@ describe("Xray service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
 
       now.mockReturnValue(1_030_000);
       await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
 
       now.mockReturnValue(1_090_000);
       await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(3);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
 
       now.mockReturnValue(1_390_001);
       await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
+      expect(internals.processRoutes.currentIps()).toEqual(new Set());
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set());
     } finally {
       try {
         await service.dispose();
@@ -631,8 +645,7 @@ describe("Xray service lifecycle", () => {
     });
     const internals = service as unknown as {
       learnProcessRoutingIps(rules: ProxyConnectRequest["routingRules"]): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
+      processRoutes: ProcessRouteLearner;
     };
     const rules: ProxyConnectRequest["routingRules"] = [{
       id: "discord",
@@ -646,14 +659,14 @@ describe("Xray service lifecycle", () => {
 
     try {
       await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(true);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
-      expect(internals.currentProcessRoutingDomains().has("unrelated.cloudflare.example")).toBe(false);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set());
+      expect(internals.processRoutes.currentDomains().has("unrelated.cloudflare.example")).toBe(false);
 
       now.mockReturnValue(1_060_001);
       await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(2);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set());
-      expect(internals.currentProcessRoutingDomains().has("unrelated.cloudflare.example")).toBe(false);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set());
+      expect(internals.processRoutes.currentDomains().has("unrelated.cloudflare.example")).toBe(false);
     } finally {
       try {
         await service.dispose();
@@ -693,9 +706,7 @@ describe("Xray service lifecycle", () => {
         rules: ProxyConnectRequest["routingRules"],
         directDomains?: string[]
       ): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const rules: ProxyConnectRequest["routingRules"] = [{
       id: "custom-app",
@@ -708,9 +719,9 @@ describe("Xray service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(rules, [".xray-direct.example"]);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set());
-      expect(internals.processRoutingSessionLeases.size).toBe(0);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set());
+      expect(internals.processRoutes.sessionLeases.size).toBe(0);
     } finally {
       try {
         await service.dispose();
@@ -752,9 +763,7 @@ describe("Xray service lifecycle", () => {
         rules: ProxyConnectRequest["routingRules"],
         directDomains?: string[]
       ): Promise<boolean>;
-      currentProcessRoutingIps(): Set<string>;
-      currentProcessRoutingDomains(): Set<string>;
-      processRoutingSessionLeases: Map<string, unknown>;
+      processRoutes: ProcessRouteLearner;
     };
     const rules: ProxyConnectRequest["routingRules"] = [{
       id: "short-lived-app",
@@ -768,15 +777,15 @@ describe("Xray service lifecycle", () => {
 
     try {
       await internals.learnProcessRoutingIps(rules);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
 
       now.mockReturnValue(6_001_000);
       await expect(internals.learnProcessRoutingIps(rules)).resolves.toBe(false);
-      expect(internals.currentProcessRoutingIps()).toEqual(new Set([address]));
-      expect(internals.currentProcessRoutingDomains()).toEqual(new Set([domain]));
-      expect(internals.processRoutingSessionLeases.size).toBe(1);
+      expect(internals.processRoutes.currentIps()).toEqual(new Set([address]));
+      expect(internals.processRoutes.currentDomains()).toEqual(new Set([domain]));
+      expect(internals.processRoutes.sessionLeases.size).toBe(1);
       expect(processDnsEntriesProvider).toHaveBeenCalledTimes(1);
     } finally {
       try {
@@ -857,6 +866,161 @@ describe("Xray service lifecycle", () => {
     expect(processHandle.stderr.listenerCount("data")).toBe(0);
     expect(processHandle.stdout.resume).toHaveBeenCalled();
     expect(processHandle.stderr.resume).toHaveBeenCalled();
+  });
+
+  // Xray reads its routing only at start, and its direct rule for the local
+  // network must give way to a user rule that names it.
+  it("restarts Xray with routing held when the rules for the local network change, and only then", async () => {
+    // Only on Windows does Xray keep the local network direct at all (for
+    // what the Windows proxy hands it), so only there do these rules matter.
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    onTestFinished(() => {
+      if (platform) {
+        Object.defineProperty(process, "platform", platform);
+      }
+    });
+    const first = new FakeXrayProcess();
+    const configs: WrittenXrayConfig[] = [];
+    spawnCapturingConfig(first, configs);
+    spawnCapturingConfig(new FakeXrayProcess(), configs);
+    const systemProxy = fakeSystemProxy();
+    const service = createService("local-rule-restart", systemProxy);
+    const diagnostics = collectDiagnostics(service);
+    const rule = (id: string, type: "domain" | "ip", value: string) => ({ id, type, value, enabled: true, createdAt: "", updatedAt: "" });
+    const site = rule("site", "domain", "example.org");
+    const update = (routingMode: "selected-rules" | "proxy-all", routingRules: ReturnType<typeof rule>[]) => ({
+      routingMode,
+      routingRules,
+      routingProxyDomains: [],
+      routingDirectDomains: [],
+      checkEndpoint: "example.com:443"
+    });
+
+    await service.connect({ ...proxyRequest("local-rules"), routingMode: "selected-rules", routingRules: [site] });
+    expect(configs).toHaveLength(1);
+    expect(configs[0].routing?.rules.every((entry) => entry.outboundTag === "direct")).toBe(true);
+    // A fresh connect clears whatever routing was left first.
+    const restoresAtConnect = vi.mocked(systemProxy.restore).mock.calls.length;
+
+    // A rule for a public range changes nothing Xray decides: applied in place.
+    await service.updateRoutingRules([site, rule("public", "ip", "91.108.4.0/22")]);
+    await settle(service);
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+
+    // 10.0.0.0/8 does: Xray comes back with it, and routing was never taken down.
+    const lanRules = [site, rule("lan", "ip", "10.0.0.0/8")];
+    await service.updateRoutingRules(lanRules);
+    await settle(service);
+    expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+    expect(runtime.terminateProcess).toHaveBeenCalledWith(first);
+    expect(configs[1].routing?.rules).toContainEqual({ type: "field", ip: ["10.0.0.0/8"], outboundTag: "proxy", inboundTag: ["http-in"] });
+    expect(systemProxy.restore).toHaveBeenCalledTimes(restoresAtConnect);
+    expect(vi.mocked(systemProxy.apply).mock.calls.at(-1)?.[0]).toMatchObject({ socksHost: "127.0.0.1", socksPort: 32001 });
+    expect(service.getStatus()).toMatchObject({ state: "Connected", activeConfigId: "local-rules" });
+    expect(diagnostics).toContainEqual({
+      level: "info",
+      message: "Routing rules for the local network changed, which Xray reads only at start: restarting Xray, with routing held until it is back."
+    });
+
+    // A mode switch with the same rules is applied in place again.
+    await service.updateRouting(update("proxy-all", lanRules));
+    await settle(service);
+    expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+    expect(service.getStatus().state).toBe("Connected");
+    await service.dispose();
+  });
+
+  it("applies a local-network rule change in place while the TUN adapter carries the traffic, and restarts once the proxy path takes over", async () => {
+    // Under TUN everything enters through Xray's SOCKS inbound, which those
+    // rules do not touch: a restart only reset every tunnelled flow.
+    await withWin32(async () => {
+      const configs: WrittenXrayConfig[] = [];
+      spawnCapturingConfig(new FakeXrayProcess(), configs);
+      spawnCapturingConfig(new FakeXrayProcess(), configs);
+      const systemProxy = fakeSystemProxy();
+      const dataplane = fakeDataplane();
+      const service = createService("local-rule-tun", systemProxy, dataplane);
+      const site = { id: "site", type: "domain" as const, value: "example.org", enabled: true, createdAt: "", updatedAt: "" };
+      const lan = { id: "lan", type: "ip" as const, value: "10.0.0.0/8", enabled: true, createdAt: "", updatedAt: "" };
+      await service.connect({ ...proxyRequest("local-rule-tun"), tunDataplaneEnabled: true, routingMode: "selected-rules", routingRules: [site] });
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+
+      await service.updateRoutingRules([site, lan]);
+      await settle(service);
+      expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+      expect(dataplane.started).toHaveLength(2);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+
+      // The adapter goes and cannot come back: the Windows proxy now points
+      // at the HTTP inbound, which needs the rule after all.
+      dataplane.probe = async () => ({ available: false, reason: "wintun.dll is missing" });
+      dataplane.die("Native helper exited (3).");
+      await settle(service);
+      expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+      expect(configs[1].routing?.rules).toContainEqual({ type: "field", ip: ["10.0.0.0/8"], outboundTag: "proxy", inboundTag: ["http-in"] });
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: false });
+      await service.dispose();
+    });
+  });
+
+  it("keeps what process discovery learned across the restart a local-network rule change starts", async () => {
+    // On the PAC path a learned destination is never seen connecting directly
+    // again once it goes through the proxy; dropping it at the restart sent
+    // it direct until discovery happened to learn it anew.
+    await withWin32(async () => {
+      spawnCapturingConfig(new FakeXrayProcess(), []);
+      spawnCapturingConfig(new FakeXrayProcess(), []);
+      const systemProxy = fakeSystemProxy();
+      const runtimeDirectory = runtimeDirectoryOf("held-restart-routes");
+      runtimeDirectories.add(runtimeDirectory);
+      let cycle = 0;
+      const service = new XrayServiceBridge(initialStatus(), {
+        executablePath: process.execPath,
+        runtimeDirectory,
+        systemProxy,
+        holdInboundPorts: async () => ({ release: async () => undefined }),
+        processConnectionsProvider: async () => {
+          cycle += 1;
+          return cycle === 1 ? [{ processName: "example-app.exe", remoteAddress: "203.0.113.10", remotePort: 443, state: "Established" }] : [];
+        },
+        processDnsEntriesProvider: async () => []
+      });
+      const app = { id: "app", type: "process.name" as const, value: "example-app.exe", enabled: true, createdAt: "", updatedAt: "" };
+      const lan = { id: "lan", type: "ip" as const, value: "10.0.0.0/8", enabled: true, createdAt: "", updatedAt: "" };
+      await service.connect({ ...proxyRequest("held-restart-routes"), routingMode: "selected-rules", routingRules: [app] });
+      const internals = service as unknown as { processRoutes: ProcessRouteLearner };
+      expect([...internals.processRoutes.ips.keys()]).toEqual(["203.0.113.10"]);
+
+      await service.updateRoutingRules([app, lan]);
+      await settle(service);
+
+      expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+      expect([...internals.processRoutes.ips.keys()]).toEqual(["203.0.113.10"]);
+      expect(JSON.stringify(vi.mocked(systemProxy.apply).mock.calls.at(-1)?.[0].rules)).toContain("203.0.113.10");
+      await service.dispose();
+    });
+  });
+
+  it("keeps the local network in the tunnel, and needs no restart for its rules, where nothing steers system traffic", async () => {
+    // macOS and Linux: whatever reaches Xray was sent to it by hand.
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+    onTestFinished(() => {
+      if (platform) {
+        Object.defineProperty(process, "platform", platform);
+      }
+    });
+    const configs: WrittenXrayConfig[] = [];
+    spawnCapturingConfig(new FakeXrayProcess(), configs);
+    const service = createService("manual-local");
+    await service.connect(proxyRequest("manual-local"));
+    expect(configs[0].routing?.rules).toEqual([]);
+
+    await service.updateRoutingRules([{ id: "lan", type: "ip", value: "10.0.0.0/8", enabled: true, createdAt: "", updatedAt: "" }]);
+    await settle(service);
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+    await service.dispose();
   });
 
   it("starts a Hysteria 2 profile with a config the bundled Xray accepts", async () => {
@@ -1011,9 +1175,533 @@ describe("Xray service lifecycle", () => {
     expect(vless.message).not.toContain("Hysteria 2");
     await service.dispose();
   });
+
+  it("hands Xray its config on stdin so the credentials never reach the disk", async () => {
+    const processHandle = new FakeXrayProcess();
+    const configs: WrittenXrayConfig[] = [];
+    spawnCapturingConfig(processHandle, configs);
+    const service = createService("stdin-config");
+    const runtimeDirectory = runtimeDirectoryOf("stdin-config");
+
+    await service.connect(proxyRequest("stdin"));
+
+    expect(service.getStatus().state).toBe("Connected");
+    expect(childProcess.spawn).toHaveBeenCalledWith(
+      process.execPath,
+      ["run", "-config", "stdin:"],
+      expect.objectContaining({ stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
+    );
+    // Written once and closed: Xray reads to the end of stdin before it starts.
+    expect(processHandle.stdin.ended).toBe(true);
+    expect(configs).toHaveLength(1);
+    expect(processHandle.stdin.text).toContain("11111111-1111-4111-8111-111111111111");
+    expect(existsSync(path.join(runtimeDirectory, "xray-config.json"))).toBe(false);
+    // A process that dies before reading has its pipe break under the write;
+    // that must not become an unhandled error.
+    expect(() => processHandle.stdin.emit("error", new Error("write EPIPE"))).not.toThrow();
+    await service.dispose();
+  });
+
+  it("sweeps a config an earlier version left on disk, and nothing else", async () => {
+    const runtimeDirectory = runtimeDirectoryOf("legacy-sweep");
+    await mkdir(runtimeDirectory, { recursive: true });
+    await writeFile(path.join(runtimeDirectory, "xray-config.json"), "{\"secret\":true}");
+    await writeFile(path.join(runtimeDirectory, `xray-config.json.${process.pid}.abc.tmp`), "{}");
+    await writeFile(path.join(runtimeDirectory, "unrelated.json"), "{}");
+
+    const service = createService("legacy-sweep");
+
+    await vi.waitFor(async () => expect((await readdir(runtimeDirectory)).sort()).toEqual(["unrelated.json"]));
+    await service.dispose();
+  });
+
+  it("keeps restarting after a failed restart, and a wake brings the next attempt forward", async () => {
+    const first = new FakeXrayProcess();
+    const third = new FakeXrayProcess();
+    childProcess.spawn
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(new FakeXrayProcess())
+      .mockReturnValueOnce(third);
+    const service = createService("restart-retry");
+    const diagnostics = collectDiagnostics(service);
+    await service.connect(proxyRequest("retry"));
+
+    first.emit("close", 1, null);
+    await settle(service);
+    expect(service.getStatus()).toMatchObject({ state: "Reconnecting", reconnectAttempt: 1 });
+
+    // The restart hits a slow start: once this ended recovery in Error for good.
+    runtime.waitForProcessStartup.mockRejectedValueOnce(new Error("Xray listeners did not become ready within 10000 ms."));
+    service.wake("test");
+    await settle(service);
+
+    expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+    expect(service.getStatus()).toMatchObject({
+      state: "Reconnecting",
+      reconnectAttempt: 2,
+      message: "Restarting Xray transport after failure: Xray listeners did not become ready within 10000 ms."
+    });
+    expect(diagnostics).toContainEqual({
+      level: "error",
+      message: "Xray restart failed: Xray listeners did not become ready within 10000 ms."
+    });
+
+    // The rescheduled attempt is a pending one a wake can bring forward.
+    service.wake("network change");
+    await settle(service);
+
+    expect(childProcess.spawn).toHaveBeenCalledTimes(3);
+    expect(service.getStatus()).toMatchObject({ state: "Connected", reconnectAttempt: 0, realTunnelAvailable: true });
+    await service.dispose();
+  });
+
+  it("stops the restart cycle when the user disconnects during an attempt", async () => {
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first).mockReturnValueOnce(new FakeXrayProcess());
+    const systemProxy = fakeSystemProxy();
+    const service = createService("restart-disconnect", systemProxy);
+    const internals = service as unknown as { reconnectTimer: NodeJS.Timeout | undefined };
+    await service.connect(proxyRequest("disconnect"));
+    first.emit("close", 1, null);
+    await settle(service);
+    runtime.waitForProcessStartup.mockImplementationOnce(async (_process, _endpoints, options) =>
+      new Promise<void>((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new Error("Xray startup was cancelled.")), { once: true });
+      })
+    );
+
+    service.wake("test");
+    await vi.waitFor(() => expect(runtime.waitForProcessStartup).toHaveBeenCalledTimes(2));
+    await service.disconnect();
+    await settle(service);
+
+    expect(service.getStatus()).toMatchObject({ state: "Disconnected", reconnectAttempt: 0 });
+    expect(internals.reconnectTimer).toBeUndefined();
+    // The disconnect released the routing the restart was holding.
+    expect(systemProxy.restore).toHaveBeenCalled();
+    service.wake("later");
+    expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+    await service.dispose();
+  });
+
+  it("holds routing while Xray restarts and returns the machine to direct routing after 30 s", async () => {
+    vi.useFakeTimers();
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first).mockImplementation(() => new FakeXrayProcess());
+    const systemProxy = fakeSystemProxy();
+    const service = createService("routing-hold", systemProxy);
+    const diagnostics = collectDiagnostics(service);
+
+    try {
+      await service.connect(proxyRequest("hold"));
+      vi.mocked(systemProxy.restore).mockClear();
+      runtime.waitForProcessStartup.mockRejectedValue(new Error("listeners timed out"));
+
+      first.emit("close", 1, null);
+      await settle(service);
+      expect(service.getStatus()).toMatchObject({ state: "Reconnecting", reconnectAttempt: 1 });
+      expect(systemProxy.restore).not.toHaveBeenCalled();
+
+      // A failed restart inside the hold keeps it.
+      await vi.advanceTimersByTimeAsync(1_300);
+      await settle(service);
+      expect(childProcess.spawn).toHaveBeenCalledTimes(2);
+      expect(service.getStatus()).toMatchObject({ state: "Reconnecting", reconnectAttempt: 2 });
+      expect(systemProxy.restore).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await settle(service);
+
+      expect(systemProxy.restore).toHaveBeenCalled();
+      expect(diagnostics).toContainEqual({
+        level: "warning",
+        message: "The tunnel has been down for 30 s; returning the machine to direct routing until the session is back."
+      });
+      // Direct routing does not mean giving up.
+      expect(service.getStatus().state).toBe("Reconnecting");
+    } finally {
+      try {
+        await service.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
+  it("takes held routing over on a restart, on the ports Xray had before", async () => {
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first).mockReturnValueOnce(new FakeXrayProcess());
+    const systemProxy = fakeSystemProxy();
+    const service = createService("restart-takeover", systemProxy);
+    await service.connect(proxyRequest("takeover"));
+    vi.mocked(systemProxy.restore).mockClear();
+
+    first.emit("close", 1, null);
+    await settle(service);
+    service.wake("test");
+    await settle(service);
+
+    expect(service.getStatus()).toMatchObject({
+      state: "Connected",
+      localProxy: { host: "127.0.0.1", httpPort: 32001, socksPort: 32000 }
+    });
+    // Re-applied over the held routing, never released in between.
+    expect(systemProxy.restore).not.toHaveBeenCalled();
+    expect(systemProxy.apply).toHaveBeenCalledTimes(2);
+    expect(runtime.reserveDistinctLocalTcpPorts).toHaveBeenLastCalledWith(2, undefined, expect.objectContaining({
+      preferredPorts: [32000, 32001]
+    }));
+    await service.dispose();
+  });
+
+  it("keeps the stopped Xray's ports bound while routing still points at them", async () => {
+    // Once xray.exe is gone its loopback ports are free, and held routing
+    // still sends everything there: whatever bound them first would get it.
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first).mockReturnValueOnce(new FakeXrayProcess());
+    const events: string[] = [];
+    const holdInboundPorts = vi.fn(async (endpoints: ReadonlyArray<{ host: string; port: number }>) => {
+      events.push(`hold ${endpoints.map((endpoint) => endpoint.port).join(",")}`);
+      return { release: vi.fn(async () => { events.push("release"); }) };
+    });
+    runtime.reserveDistinctLocalTcpPorts.mockImplementation(async () => {
+      events.push("reserve");
+      return [{ host: "127.0.0.1", port: 32000 }, { host: "127.0.0.1", port: 32001 }];
+    });
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory: runtimeDirectoryOf("hold-ports"),
+      systemProxy: fakeSystemProxy(),
+      holdInboundPorts
+    });
+    runtimeDirectories.add(runtimeDirectoryOf("hold-ports"));
+    await service.connect(proxyRequest("hold-ports"));
+    events.length = 0;
+
+    first.emit("close", 1, null);
+    await settle(service);
+    expect(holdInboundPorts).toHaveBeenCalledWith([{ host: "127.0.0.1", port: 32000 }, { host: "127.0.0.1", port: 32001 }]);
+
+    // The restart gets them back just before it binds them.
+    service.wake("test");
+    await settle(service);
+    expect(events).toEqual(["hold 32000,32001", "release", "reserve"]);
+    expect(service.getStatus().state).toBe("Connected");
+    await service.dispose();
+  });
+
+  it("binds held ports so nothing else can, refuses what connects, and lets go of all of them", async () => {
+    const free = await Promise.all([freeLoopbackPort(), freeLoopbackPort()]);
+    const endpoints = free.map((port) => ({ host: "127.0.0.1", port }));
+    const held = await bindRefusingLoopbackPorts(endpoints);
+    try {
+      await expect(listenOn(free[0])).rejects.toMatchObject({ code: "EADDRINUSE" });
+      // A connection is accepted and dropped at once, not served.
+      await expect(
+        new Promise<string>((resolve, reject) => {
+          const socket = net.connect({ host: "127.0.0.1", port: free[1] });
+          socket.on("error", reject);
+          socket.on("close", () => resolve("closed"));
+          socket.on("data", () => reject(new Error("the held port answered")));
+        })
+      ).resolves.toBe("closed");
+    } finally {
+      await held.release();
+    }
+    const again = await listenOn(free[0]);
+    await new Promise<void>((resolve) => again.close(() => resolve()));
+
+    // All or nothing: a port someone else has releases the ones already bound.
+    const taken = await listenOn(free[1]);
+    try {
+      await expect(bindRefusingLoopbackPorts(endpoints)).rejects.toMatchObject({ code: "EADDRINUSE" });
+      const released = await listenOn(free[0]);
+      await new Promise<void>((resolve) => released.close(() => resolve()));
+    } finally {
+      await new Promise<void>((resolve) => taken.close(() => resolve()));
+    }
+  });
+
+  it("gives held routing up at once when another program took Xray's port", async () => {
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first);
+    const systemProxy = fakeSystemProxy();
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath: process.execPath,
+      runtimeDirectory: runtimeDirectoryOf("ports-taken"),
+      systemProxy,
+      holdInboundPorts: async () => {
+        throw new Error("listen EADDRINUSE: address already in use 127.0.0.1:32000");
+      }
+    });
+    runtimeDirectories.add(runtimeDirectoryOf("ports-taken"));
+    const diagnostics = collectDiagnostics(service);
+    await service.connect(proxyRequest("ports-taken"));
+    vi.mocked(systemProxy.restore).mockClear();
+
+    first.emit("close", 1, null);
+    await settle(service);
+    expect(systemProxy.restore).toHaveBeenCalled();
+    expect(diagnostics.some((entry) => entry.message.startsWith("Another program took Xray's local port while Xray was down"))).toBe(true);
+    // The restart still comes; it just starts from direct routing.
+    expect(service.getStatus().state).toBe("Reconnecting");
+    await service.dispose();
+  });
+
+  it("ends in Error, and gives routing back, when the Xray runtime disappeared", async () => {
+    // An antivirus quarantined xray.exe: every restart would fail the same
+    // way, every few minutes, for as long as the app runs.
+    const directory = runtimeDirectoryOf("runtime-gone");
+    runtimeDirectories.add(directory);
+    await mkdir(directory, { recursive: true });
+    const executablePath = path.join(directory, "xray");
+    await writeFile(executablePath, "");
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first);
+    const systemProxy = fakeSystemProxy();
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath,
+      runtimeDirectory: directory,
+      systemProxy,
+      holdInboundPorts: async () => ({ release: async () => undefined })
+    });
+    await service.connect(proxyRequest("runtime-gone"));
+    vi.mocked(systemProxy.restore).mockClear();
+
+    await rm(executablePath);
+    first.emit("close", 1, null);
+    await settle(service);
+    service.wake("test");
+    await settle(service);
+
+    expect(service.getStatus()).toMatchObject({ state: "Error", message: `Xray runtime was not found at ${executablePath}.` });
+    expect((service as unknown as { reconnectTimer?: NodeJS.Timeout }).reconnectTimer).toBeUndefined();
+    expect(systemProxy.restore).toHaveBeenCalled();
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+    await service.dispose();
+  });
+
+  it("lets the held ports go only after routing stopped pointing at them", async () => {
+    // A blocked restart gives held routing up. Releasing the ports first left
+    // the proxy setting (and an adapter) aimed at free ports while it was
+    // taken down, for any local program to bind and receive.
+    const directory = runtimeDirectoryOf("release-order");
+    runtimeDirectories.add(directory);
+    await mkdir(directory, { recursive: true });
+    const executablePath = path.join(directory, "xray");
+    await writeFile(executablePath, "");
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first);
+    const events: string[] = [];
+    const systemProxy = fakeSystemProxy();
+    const service = new XrayServiceBridge(initialStatus(), {
+      executablePath,
+      runtimeDirectory: directory,
+      systemProxy,
+      holdInboundPorts: async () => ({ release: async () => { events.push("release"); } })
+    });
+    await service.connect(proxyRequest("release-order"));
+    vi.mocked(systemProxy.restore).mockImplementation(async () => {
+      events.push("restore");
+    });
+
+    await rm(executablePath);
+    first.emit("close", 1, null);
+    await settle(service);
+    service.wake("test");
+    await settle(service);
+
+    expect(service.getStatus().state).toBe("Error");
+    expect(events).toEqual(["restore", "release"]);
+    await service.dispose();
+  });
+
+  it("releases routing held for a restart when the user dismisses the error", async () => {
+    const first = new FakeXrayProcess();
+    childProcess.spawn.mockReturnValueOnce(first);
+    const systemProxy = fakeSystemProxy();
+    const service = createService("clear-error-hold", systemProxy);
+    await service.connect(proxyRequest("clear"));
+    vi.mocked(systemProxy.restore).mockClear();
+
+    first.emit("close", 1, null);
+    expect(service.getStatus().state).toBe("Error");
+    await service.clearError();
+    await settle(service);
+
+    expect(service.getStatus().state).toBe("Disconnected");
+    expect(systemProxy.restore).toHaveBeenCalled();
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+    await service.dispose();
+  });
+
+  it("never schedules a restart more than five minutes out", async () => {
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    vi.spyOn(Math, "random").mockReturnValue(0.999_999);
+    const service = createService("restart-cap");
+    const internals = service as unknown as {
+      status: RuntimeStatus;
+      lastRequest: ProxyConnectRequest | undefined;
+      lifecycleGeneration: number;
+      scheduleReconnect(reason: string, generation: number): void;
+    };
+    try {
+      internals.status = { ...internals.status, state: "Error", reconnectAttempt: 40 };
+      internals.lastRequest = proxyRequest("cap");
+      internals.scheduleReconnect("boom", internals.lifecycleGeneration);
+
+      const delay = timeouts.mock.calls.at(-1)?.[1];
+      expect(delay).toBeGreaterThanOrEqual(256_000);
+      expect(delay).toBeLessThanOrEqual(5 * 60 * 1000);
+    } finally {
+      vi.restoreAllMocks();
+      await service.dispose();
+    }
+  });
+
+  it("applies routing again at once when the TUN adapter dies under a connected session", async () => {
+    // The helper's death takes the adapter and its capture routes with it,
+    // and the Windows proxy setting went when TUN came up: selected traffic
+    // leaves directly while the session still reads Connected.
+    await withWin32(async () => {
+      childProcess.spawn.mockReturnValueOnce(new FakeXrayProcess());
+      const systemProxy = fakeSystemProxy();
+      const dataplane = fakeDataplane();
+      const service = createService("tun-death", systemProxy, dataplane);
+      const diagnostics = collectDiagnostics(service);
+      await service.connect({ ...proxyRequest("tun-death"), tunDataplaneEnabled: true });
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+
+      dataplane.die("Native helper exited (3).");
+      expect(service.getStatus().tunActive).toBe(false);
+      await settle(service);
+
+      // A fresh start brings the adapter back; Xray never stopped.
+      expect(dataplane.started).toHaveLength(2);
+      expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+      expect(systemProxy.apply).not.toHaveBeenCalled();
+      const warning = diagnostics.find((entry) => entry.message.startsWith("TUN dataplane stopped unexpectedly"));
+      expect(warning?.message).toContain("Native helper exited (3).");
+      expect(warning?.message).toContain("Routing is being applied again");
+      await service.dispose();
+    });
+  });
+
+  it("falls back to the proxy path for the session once the adapter keeps dying", async () => {
+    await withWin32(async () => {
+      childProcess.spawn.mockReturnValueOnce(new FakeXrayProcess()).mockReturnValueOnce(new FakeXrayProcess());
+      const systemProxy = fakeSystemProxy();
+      const dataplane = fakeDataplane();
+      const service = createService("tun-flap", systemProxy, dataplane);
+      const diagnostics = collectDiagnostics(service);
+      await service.connect({ ...proxyRequest("tun-flap"), tunDataplaneEnabled: true });
+
+      for (let death = 0; death < 3; death += 1) {
+        dataplane.die("the adapter read failed");
+        await settle(service);
+      }
+
+      // Two deaths were answered with a restart; the third ends the loop of
+      // adapters coming and going, and the proxy path takes over.
+      expect(dataplane.started).toHaveLength(3);
+      expect(dataplane.isActive).toBe(false);
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: false });
+      expect(diagnostics.some((entry) => entry.message.includes("Routing continues on the Windows proxy path"))).toBe(true);
+      expect(diagnostics.some((entry) => entry.message.startsWith("TUN routing is unavailable") && entry.message.includes("stopped unexpectedly 3 times"))).toBe(true);
+
+      // A new Connect gives the adapter another chance.
+      await service.connect({ ...proxyRequest("tun-flap"), tunDataplaneEnabled: true });
+      expect(dataplane.started).toHaveLength(4);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+      await service.dispose();
+    });
+  });
+
+  it("releases routing held for a restart when the adapter dies while Xray is down", async () => {
+    await withWin32(async () => {
+      const first = new FakeXrayProcess();
+      childProcess.spawn.mockReturnValueOnce(first).mockReturnValueOnce(new FakeXrayProcess());
+      const systemProxy = fakeSystemProxy();
+      const dataplane = fakeDataplane();
+      const service = createService("tun-death-held", systemProxy, dataplane);
+      const internals = service as unknown as { routingHeld: boolean };
+      const diagnostics = collectDiagnostics(service);
+      await service.connect({ ...proxyRequest("tun-death-held"), tunDataplaneEnabled: true });
+      vi.mocked(systemProxy.restore).mockClear();
+
+      first.emit("close", 1, null);
+      await settle(service);
+      // The adapter is what holds Xray's routing for the restart.
+      expect(service.getStatus().state).toBe("Reconnecting");
+      expect(internals.routingHeld).toBe(true);
+      expect(dataplane.stopped).toBe(0);
+
+      dataplane.die("Native helper exited (3).");
+      await settle(service);
+
+      // Nothing captures traffic any more, so there is nothing left to hold.
+      expect(internals.routingHeld).toBe(false);
+      expect(systemProxy.restore).toHaveBeenCalled();
+      expect(diagnostics.find((entry) => entry.message.startsWith("TUN dataplane stopped unexpectedly"))?.message)
+        .toContain("Routing is applied again when Xray is back");
+      expect(diagnostics.find((entry) => entry.message.startsWith("TUN dataplane stopped unexpectedly"))?.message)
+        .toContain("Until then apps connect directly.");
+
+      // The restart applies routing afresh, adapter included.
+      service.wake("test");
+      await settle(service);
+      expect(dataplane.started).toHaveLength(2);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+      await service.dispose();
+    });
+  });
+
+  it("prefers the ports the previous Xray listened on, never the routing listener's", async () => {
+    childProcess.spawn
+      .mockReturnValueOnce(new FakeXrayProcess())
+      .mockReturnValueOnce(new FakeXrayProcess())
+      .mockReturnValueOnce(new FakeXrayProcess());
+    rememberLocalProxyPort(50_817);
+    const service = createService("sticky-ports");
+
+    await service.connect(proxyRequest("first"));
+    expect(runtime.reserveDistinctLocalTcpPorts).toHaveBeenLastCalledWith(2, undefined, {
+      preferredPorts: [undefined, undefined],
+      avoidPorts: [50_817, undefined]
+    });
+
+    await service.connect(proxyRequest("second"));
+    expect(runtime.reserveDistinctLocalTcpPorts).toHaveBeenLastCalledWith(2, undefined, {
+      preferredPorts: [32000, 32001],
+      avoidPorts: [50_817, undefined]
+    });
+
+    // Xray exiting at startup on a remembered port - taken since the check -
+    // sends the next attempt to fresh ports.
+    const exiting = new FakeXrayProcess();
+    childProcess.spawn.mockReset().mockReturnValueOnce(exiting);
+    runtime.waitForProcessStartup.mockImplementationOnce(async () => {
+      exiting.exitCode = 23;
+      exiting.emit("close", 23, null);
+      throw new Error("Xray runtime exited during startup with code 23.");
+    });
+    await service.connect(proxyRequest("third"));
+    expect(service.getStatus().state).toBe("Error");
+
+    childProcess.spawn.mockReturnValueOnce(new FakeXrayProcess());
+    await service.connect(proxyRequest("fourth"));
+    expect(runtime.reserveDistinctLocalTcpPorts).toHaveBeenLastCalledWith(2, undefined, {
+      preferredPorts: [undefined, undefined],
+      avoidPorts: [50_817, undefined]
+    });
+    await service.dispose();
+  });
 });
 
 interface WrittenXrayConfig {
+  routing?: { rules: Array<{ ip?: string[]; domain?: string[]; outboundTag: string }> };
   outbounds: Array<{
     protocol: string;
     streamSettings?: {
@@ -1025,12 +1713,26 @@ interface WrittenXrayConfig {
   }>;
 }
 
-/** Hands out `processHandle` on the next spawn, keeping the config Xray was started with. */
+/** Hands out `processHandle` on the next spawn, keeping the config Xray was given on stdin. */
 function spawnCapturingConfig(processHandle: FakeXrayProcess, configs: WrittenXrayConfig[]): void {
   childProcess.spawn.mockImplementationOnce((_executable: string, args: string[]) => {
-    configs.push(JSON.parse(readFileSync(args[2], "utf8")) as WrittenXrayConfig);
+    expect(args).toEqual(["run", "-config", "stdin:"]);
+    processHandle.stdin.onEnd = (text) => configs.push(JSON.parse(text) as WrittenXrayConfig);
     return processHandle;
   });
+}
+
+/** Waits until every queued lifecycle step, including ones queued while waiting, has run. */
+async function settle(service: XrayServiceBridge): Promise<void> {
+  const internals = service as unknown as { mutationTail: Promise<void> };
+  let tail = internals.mutationTail;
+  for (;;) {
+    await tail;
+    if (internals.mutationTail === tail) {
+      return;
+    }
+    tail = internals.mutationTail;
+  }
 }
 
 function collectDiagnostics(service: XrayServiceBridge): Array<{ level: string; message: string }> {
@@ -1060,23 +1762,122 @@ class FakeOutput extends EventEmitter {
   }
 }
 
+/** Xray's stdin: what was written to it, and whether it was closed. */
+class FakeInput extends EventEmitter {
+  text = "";
+  ended = false;
+  onEnd: ((text: string) => void) | undefined;
+
+  write(chunk: string): boolean {
+    this.text += chunk;
+    return true;
+  }
+
+  end(chunk?: string): this {
+    if (chunk !== undefined) {
+      this.text += chunk;
+    }
+    this.ended = true;
+    this.onEnd?.(this.text);
+    return this;
+  }
+}
+
 class FakeXrayProcess extends EventEmitter {
   readonly stdout = new FakeOutput();
   readonly stderr = new FakeOutput();
-  readonly stdin = null;
+  readonly stdin = new FakeInput();
   readonly kill = vi.fn(() => true);
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
 }
 
-function createService(name: string, systemProxy = fakeSystemProxy()): XrayServiceBridge {
-  const runtimeDirectory = path.join(os.tmpdir(), `shadow-ssh-xray-lifecycle-${process.pid}-${name}`);
+function runtimeDirectoryOf(name: string): string {
+  return path.join(os.tmpdir(), `shadow-ssh-xray-lifecycle-${process.pid}-${name}`);
+}
+
+async function freeLoopbackPort(): Promise<number> {
+  const server = await listenOn(0);
+  const port = (server.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+function listenOn(port: number): Promise<net.Server> {
+  return new Promise<net.Server>((resolve, reject) => {
+    const server = net.createServer((socket) => socket.destroy());
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => resolve(server));
+  });
+}
+
+function createService(name: string, systemProxy = fakeSystemProxy(), dataplane?: DataplaneController): XrayServiceBridge {
+  const runtimeDirectory = runtimeDirectoryOf(name);
   runtimeDirectories.add(runtimeDirectory);
   return new XrayServiceBridge(initialStatus(), {
     executablePath: process.execPath,
     runtimeDirectory,
-    systemProxy
+    systemProxy,
+    // The mocked ports are fixed; binding them for real would make the
+    // result depend on what else the machine listens on.
+    holdInboundPorts: async () => ({ release: async () => undefined }),
+    ...(dataplane ? { dataplane, protectedAddressResolver: async () => ["203.0.113.9"] } : {})
   });
+}
+
+type FakeDataplane = DataplaneController & {
+  started: DataplaneStartRequest[];
+  stopped: number;
+  isActive: boolean;
+  /** Plays the helper dying under a running adapter. */
+  die(reason: string): void;
+};
+
+function fakeDataplane(): FakeDataplane {
+  const listeners = new Set<(reason: string) => void>();
+  // Like the real controller: active from a successful start until a stop
+  // or the helper's death.
+  const controller: FakeDataplane = {
+    started: [],
+    stopped: 0,
+    isActive: false,
+    probe: async () => ({ available: true }),
+    start: async (request) => {
+      controller.started.push(request);
+      controller.isActive = true;
+    },
+    stop: async () => {
+      controller.stopped += 1;
+      controller.isActive = false;
+    },
+    dispose: async () => undefined,
+    onUnexpectedStop: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    die: (reason) => {
+      if (!controller.isActive) {
+        return;
+      }
+      controller.isActive = false;
+      for (const listener of listeners) {
+        listener(reason);
+      }
+    }
+  };
+  return controller;
+}
+
+async function withWin32(run: () => Promise<void>): Promise<void> {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+  try {
+    await run();
+  } finally {
+    if (platform) {
+      Object.defineProperty(process, "platform", platform);
+    }
+  }
 }
 
 function fakeSystemProxy(): WindowsSystemProxyManager {

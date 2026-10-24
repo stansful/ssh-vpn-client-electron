@@ -267,6 +267,33 @@ func sniffHTTPHost(data []byte) (string, bool) {
 	return "", true
 }
 
+// namesConnectedServer reports whether the name sniffClientName read out of
+// head belongs to the server the flow is connected to: the server name of a
+// TLS ClientHello, or the Host of an origin-form HTTP request. A CONNECT, or
+// a request whose target is absolute-form (`GET http://example.org/`), is
+// addressed to an HTTP proxy, and the name it carries is the site that proxy
+// is asked to reach - dialled by that name, the flow would go to the site on
+// the proxy's port and never reach the proxy. Such a name may still route the
+// flow; it is never what the flow is dialled by.
+func namesConnectedServer(head []byte) bool {
+	if len(head) == 0 {
+		return false
+	}
+	if head[0] == tlsRecordHandshake {
+		return true
+	}
+	lineEnd := bytes.Index(head, []byte("\r\n"))
+	if lineEnd < 0 {
+		return false
+	}
+	parts := bytes.SplitN(head[:lineEnd], []byte(" "), 3)
+	if len(parts) < 3 || bytes.Equal(parts[0], []byte("CONNECT")) {
+		return false
+	}
+	target := parts[1]
+	return bytes.HasPrefix(target, []byte("/")) || bytes.Equal(target, []byte("*"))
+}
+
 // hostFromRequestTarget reads the authority of an absolute-form request line
 // such as `GET http://example.org/ HTTP/1.1`, which proxies see and origin
 // servers normally do not.
@@ -312,6 +339,12 @@ func stripHostPort(value string) string {
 // host name: an address literal adds nothing the flow did not already carry,
 // and a value with characters outside the DNS alphabet is not a name a rule
 // could have been written against.
+//
+// A single label - an intranet host such as `wiki`, or `localhost` - is a
+// name too. No rule or list can select it (a domain rule has a dot), but it
+// is what tells the policy the flow is for the local network (step 3), as the
+// system-proxy paths judge the same name; the caller keeps it out of the
+// domain cache (isLocalName).
 func normalizeSniffedName(value string) string {
 	name := strings.ToLower(strings.TrimSpace(value))
 	name = strings.TrimSuffix(name, ".")
@@ -322,12 +355,6 @@ func normalizeSniffedName(value string) string {
 		return ""
 	}
 	if _, err := netip.ParseAddr(name); err == nil {
-		return ""
-	}
-	if !strings.Contains(name, ".") {
-		// A single label (a LAN host, or "localhost") is never selected by a
-		// domain rule, which needs at least two labels; keep those flows
-		// unattributed rather than recording a name they would not match on.
 		return ""
 	}
 	for _, label := range strings.Split(name, ".") {

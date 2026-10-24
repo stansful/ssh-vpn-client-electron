@@ -13,6 +13,7 @@ import (
 	"shadowssh/service/internal/dataplane"
 	"shadowssh/service/internal/protocol"
 	"shadowssh/service/internal/routing"
+	"shadowssh/service/internal/winroute"
 )
 
 // The tunnel itself lives in the Electron process; this service only owns the
@@ -46,6 +47,20 @@ type DataplaneStartPayload struct {
 	EnforceIPv6  bool   `json:"enforceIpv6"`
 	AdapterName  string `json:"adapterName"`
 	JournalPath  string `json:"journalPath"`
+
+	// DirectProcesses are the processes whose flows always go direct: the
+	// transport's own, so its dials to a server address the protected routes
+	// do not cover are not captured and proxied back into it. Each is named
+	// by its process ID and image name; any other program with that name is
+	// routed as usual. Only the Xray bridge sends it, for its Xray child;
+	// older clients leave it out.
+	DirectProcesses []DirectProcessPayload `json:"directProcesses"`
+}
+
+// DirectProcessPayload is one entry of DataplaneStartPayload.DirectProcesses.
+type DirectProcessPayload struct {
+	PID  uint32 `json:"pid"`
+	Name string `json:"name"`
 }
 
 const defaultAdapterName = "Shadow SSH"
@@ -59,6 +74,15 @@ func (a *App) handleStartDataplane(ctx context.Context, command protocol.Command
 	if err != nil {
 		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
 	}
+	a.reportSkippedRules(payload.RoutingRules)
+	// The journal path comes from the client and is written with this
+	// process's rights, so it is checked before an adapter exists to clean up,
+	// and a linked data folder is followed to where it really is.
+	journalPath, err := winroute.ResolveJournalPath(payload.JournalPath)
+	if err != nil {
+		return protocol.CommandResult{Response: protocol.Error(command.ID, err)}
+	}
+	payload.JournalPath = journalPath
 
 	// Everything the adapter and the routing table were built from. A change
 	// to any of it cannot be applied by swapping the policy, because the
@@ -80,18 +104,18 @@ func (a *App) handleStartDataplane(ctx context.Context, command protocol.Command
 		// loopback proxy, or changed which servers or ports must stay excluded.
 		// Keeping the running dataplane would forward selected flows to a port
 		// nothing is listening on, or leave a stale host route behind.
+		//
+		// Its Close runs once, so the old runner is finished whatever it
+		// reports (see stopDataplane). One that came down leaving routing
+		// changes to the journal is logged, and the start below recovers them
+		// first.
 		runner := a.dataplane
-		a.dataplane = nil
 		a.dataplanePolicy = nil
 		a.dataplaneSignature = ""
-		teardownCtx, cancel := dataplaneTeardownContext(ctx)
-		defer cancel()
-		if err := runner.Close(teardownCtx); err != nil {
-			return protocol.CommandResult{
-				Response: protocol.Error(command.ID, fmt.Errorf("restart dataplane for a new transport endpoint: %w", err)),
-				Events:   []any{diagnostic("error", "TUN dataplane teardown before restart failed: "+err.Error())},
-			}
+		if err := a.closeDataplaneRunner(ctx, runner); err != nil {
+			a.logDiagnostic("warning", "TUN dataplane teardown before restart was incomplete: "+err.Error())
 		}
+		a.dataplane = nil
 	}
 
 	adapterName := strings.TrimSpace(payload.AdapterName)
@@ -106,6 +130,7 @@ func (a *App) handleStartDataplane(ctx context.Context, command protocol.Command
 		ProtectedAddresses: protectedAddresses,
 		EnforceIPv6:        payload.EnforceIPv6,
 		Log:                a.logDiagnostic,
+		OnFatal:            a.dataplaneFailed,
 	})
 	if err != nil {
 		return protocol.CommandResult{
@@ -142,19 +167,39 @@ func (a *App) handleStopDataplane(ctx context.Context, command protocol.Command)
 // teardown shells out to netsh once per route it installed, and a rollback cut
 // off half way is what leaves the next connect unable to bring the adapter back
 // up at all.
+//
+// A runner's Close runs its teardown once. It either succeeds or takes the
+// dataplane down and leaves what it could not undo to the journal, returning
+// dataplane.ErrLeftForRecovery: retrying could only fail the same way, and the
+// next start recovers the journal first. Either way the runner is finished, so
+// it is let go once Close returns, and the error is the caller's to report. A
+// later stop or disconnect then finds nothing to close, which is true; a
+// repeated Shutdown reports its incomplete teardown again (see Shutdown). The
+// signature is cleared at once, so no start request mistakes a runner that is
+// coming down for a dataplane that is still running.
 func (a *App) stopDataplane(ctx context.Context) error {
 	a.dataplaneMu.Lock()
 	runner := a.dataplane
-	a.dataplane = nil
 	a.dataplanePolicy = nil
 	a.dataplaneSignature = ""
 	a.dataplaneMu.Unlock()
 	if runner == nil {
 		return nil
 	}
+	err := a.closeDataplaneRunner(ctx, runner)
+	a.dataplaneMu.Lock()
+	defer a.dataplaneMu.Unlock()
+	if a.dataplane == runner {
+		a.dataplane = nil
+	}
+	return err
+}
+
+// closeDataplaneRunner closes runner on the teardown budget.
+func (a *App) closeDataplaneRunner(ctx context.Context, runner *dataplane.Runner) error {
 	teardownCtx, cancel := dataplaneTeardownContext(ctx)
 	defer cancel()
-	return runner.Close(teardownCtx)
+	return a.closeRunner(teardownCtx, runner)
 }
 
 // dataplaneTeardownTimeout bounds a whole dataplane teardown: a routing
@@ -219,6 +264,14 @@ func (p DataplaneStartPayload) compile() (*dataplane.Policy, netip.AddrPort, []n
 		}
 	}
 
+	directProcesses := make([]dataplane.ProcessIdentity, 0, len(p.DirectProcesses))
+	for _, process := range p.DirectProcesses {
+		if process.PID == 0 {
+			return nil, netip.AddrPort{}, nil, errors.New("directProcesses must name each process by a non-zero pid")
+		}
+		directProcesses = append(directProcesses, dataplane.ProcessIdentity{PID: process.PID, Name: process.Name})
+	}
+
 	policy := dataplane.NewPolicy(dataplane.Config{
 		Mode:               p.RoutingMode,
 		Rules:              p.RoutingRules,
@@ -226,6 +279,7 @@ func (p DataplaneStartPayload) compile() (*dataplane.Policy, netip.AddrPort, []n
 		DirectDomains:      p.RoutingDirectDomains,
 		ProtectedEndpoints: protectedEndpoints,
 		ProtectedPorts:     protectedPorts,
+		DirectProcesses:    directProcesses,
 		UDPSupported:       p.UDPSupported,
 	})
 	return policy, endpoint, protectedAddresses, nil

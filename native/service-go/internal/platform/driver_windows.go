@@ -37,8 +37,11 @@ func (windowsDriver) Capabilities() Capabilities {
 		// Whether datagrams can actually be carried depends on the transport,
 		// not on this process; the flag reports that the dataplane can forward
 		// them when the transport accepts them.
-		UDPForwarding:        dataplaneReady,
-		SSHCoreLinked:        false,
+		UDPForwarding: dataplaneReady,
+		SSHCoreLinked: false,
+		// The command exists in every Windows build; whether it can run
+		// (elevation) is answered when it is sent.
+		RouteRecovery:        true,
 		TUNUnavailableReason: unavailableReason,
 	}
 }

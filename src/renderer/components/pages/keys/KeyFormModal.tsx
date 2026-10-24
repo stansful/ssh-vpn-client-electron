@@ -3,6 +3,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { api } from "../../../api.js";
 import { useAppData } from "../../../hooks/useAppData.js";
 import { useLeaveGuard } from "../../../hooks/useNavigation.js";
+import { SECRET_CLIPBOARD_CLEAR_MS } from "../../../../shared/defaults.js";
 import { describeError, type DescribedError } from "../../../lib/errors.js";
 import {
   Badge,
@@ -407,7 +408,7 @@ function KeyForm({ request, open, onClose, onSaved }: { request: KeyFormRequest;
               <b>This key is protected with a passphrase.</b> Type it below, or signing in will fail.
             </StateLine>
           ) : null}
-          <span className="hint">RSA and Ed25519 keys sign in. ECDSA and DSA keys can be saved but can't sign in yet.</span>
+          <span className="hint">Ed25519, ECDSA and RSA keys sign in, passphrase-protected or not. DSA keys can be saved but can't sign in.</span>
         </div>
 
         <Field
@@ -420,7 +421,7 @@ function KeyForm({ request, open, onClose, onSaved }: { request: KeyFormRequest;
               </Badge>
             ) : undefined
           }
-          hint="Works with PEM and PKCS#8 keys. Passphrase-protected OpenSSH keys aren't supported yet."
+          hint="Needed for passphrase-protected keys: OpenSSH, PEM or PKCS#8."
           after={
             savedPassphrase ? (
               <StateLine tone="ok" icon={ShieldCheck} id={passStateId}>
@@ -487,7 +488,7 @@ function KeyForm({ request, open, onClose, onSaved }: { request: KeyFormRequest;
               </Callout>
             ) : null}
             <StateLine tone="warn" icon={TriangleAlert}>
-              <b>Your clipboard isn't cleared automatically.</b> Paste the key where you need it, then copy something else over it.
+              <b>The key leaves your clipboard after {SECRET_CLIPBOARD_CLEAR_MS / 1000} seconds,</b> and when Shadow quits. Paste it where you need it before then. Clipboard history (Win+V on Windows) or a clipboard manager can still keep a copy.
             </StateLine>
             <span className="sr-only" aria-live="polite">
               {copyLive}

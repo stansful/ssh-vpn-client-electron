@@ -33,6 +33,15 @@ describe("routing rule validation", () => {
     expect(validateIpOrCidr("2a00:1450::/129").ok).toBe(false);
   });
 
+  it("rejects CIDR prefixes with leading zeros, as Go's netip.ParsePrefix does", () => {
+    for (const value of ["10.0.0.0/08", "10.0.0.0/00", "1.1.1.1/032", "2001:db8::/032", "2001:db8::/0064"]) {
+      expect(validateIpOrCidr(value)).toEqual({ ok: false, message: "CIDR prefix must not have leading zeros." });
+    }
+    for (const value of ["0.0.0.0/0", "10.0.0.0/8", "10.0.0.0/10", "::/0", "2001:db8::/100"]) {
+      expect(validateIpOrCidr(value).ok).toBe(true);
+    }
+  });
+
   it("accepts process names and rejects paths", () => {
     expect(validateProcessName("chrome.exe").ok).toBe(true);
     expect(validateProcessName("Google Chrome").ok).toBe(true);

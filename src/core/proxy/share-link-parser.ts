@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ParsedProxyProfile, ProxyProtocol, ProxySecurity, ProxyTransport } from "../../shared/types.js";
 import { isHysteria2Scheme, parseHysteria2Link } from "./hysteria2-link.js";
+import { canonicalShareLinkHost, shareLinkHostToAscii, uriSecurityText, vmessSecurityText, vmessText } from "./share-link-fields.js";
 
 export const UNSUPPORTED_PROXY_SCHEME_MESSAGE = "Only vless://, vmess://, trojan://, and hysteria2:// links are supported.";
 
@@ -8,13 +9,14 @@ const MAX_LINK_LENGTH = 64 * 1024;
 const MAX_IMPORT_LINES = 10_000;
 const MAX_IMPORT_TEXT_LENGTH = 2 * 1024 * 1024;
 
+/** Panels write these as strings, numbers or booleans. */
 interface VmessPayload {
-  ps?: string;
-  add?: string;
-  port?: string | number;
-  net?: string;
-  tls?: string;
-  flow?: string;
+  ps?: unknown;
+  add?: unknown;
+  port?: unknown;
+  net?: unknown;
+  tls?: unknown;
+  flow?: unknown;
 }
 
 export interface ProxyImportParseResult {
@@ -113,7 +115,10 @@ function parseUriProtocol(rawUri: string, protocol: Exclude<ProxyProtocol, "vmes
     throw new Error(`Invalid ${protocol.toUpperCase()} URI.`);
   }
 
-  const host = normalizeHost(url.hostname);
+  // An internationalised name is stored as punycode, the form Xray can dial;
+  // the fingerprint keeps hashing the host as it always has (see
+  // canonicalizeUri), so re-importing an existing link still finds it.
+  const host = shareLinkHostToAscii(url.hostname);
   const port = Number(url.port);
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`${protocol.toUpperCase()} URI must contain host and valid port.`);
@@ -121,7 +126,7 @@ function parseUriProtocol(rawUri: string, protocol: Exclude<ProxyProtocol, "vmes
 
   const name = decodeName(url.hash, `${protocol}-${host}:${port}`);
   const transport = normalizeTransport(url.searchParams.get("type") ?? url.searchParams.get("net") ?? "tcp");
-  const security = normalizeSecurity(url.searchParams.get("security") ?? (url.searchParams.get("tls") === "1" ? "tls" : "none"));
+  const security = normalizeSecurity(uriSecurityText(protocol, url.searchParams));
   const flow = (url.searchParams.get("flow") ?? "").trim();
   const normalized = canonicalizeUri(url, protocol);
 
@@ -146,8 +151,13 @@ function parseVmess(rawUri: string): ParsedProxyProfile {
   } catch {
     throw new Error("Invalid VMess base64 JSON payload.");
   }
+  if (payload === null || typeof payload !== "object") {
+    throw new Error("VMess payload must contain add and valid port.");
+  }
 
-  const host = normalizeHost(String(payload.add ?? ""));
+  // The fingerprint hashes the address as written; Xray gets the punycode form.
+  const canonicalHost = canonicalShareLinkHost(String(payload.add ?? ""));
+  const host = shareLinkHostToAscii(canonicalHost);
   const port = Number(payload.port);
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("VMess payload must contain add and valid port.");
@@ -155,12 +165,12 @@ function parseVmess(rawUri: string): ParsedProxyProfile {
 
   const protocol = "vmess";
   const name = String(payload.ps ?? `vmess-${host}:${port}`).trim() || `vmess-${host}:${port}`;
-  const transport = normalizeTransport(payload.net ?? "tcp");
-  const security = normalizeSecurity(payload.tls || "none");
+  const transport = normalizeTransport(vmessText(payload.net) ?? "tcp");
+  const security = normalizeSecurity(vmessSecurityText(payload.tls));
   const flow = String(payload.flow ?? "").trim();
   const normalized = JSON.stringify(sortObject({
     ...payload,
-    add: host,
+    add: canonicalHost,
     port,
     net: transport,
     tls: security
@@ -186,15 +196,11 @@ function canonicalizeUri(url: URL, protocol: ProxyProtocol): string {
   return JSON.stringify({
     protocol,
     username: url.username,
-    host: normalizeHost(url.hostname),
+    host: canonicalShareLinkHost(url.hostname),
     port: Number(url.port),
     params,
     hash: decodeName(url.hash, "")
   });
-}
-
-function normalizeHost(value: string): string {
-  return value.trim().replace(/^\[/u, "").replace(/\]$/u, "").toLowerCase();
 }
 
 function decodeName(hash: string, fallback: string): string {

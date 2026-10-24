@@ -29,6 +29,8 @@ interface XrayInternals {
   status: RuntimeStatus;
   lastRequest: ProxyConnectRequest | undefined;
   applySystemRouting(request: ProxyConnectRequest, socksEndpoint: { host: string; port: number }): Promise<void>;
+  stopRouting(): Promise<void>;
+  holdRouting(): void;
 }
 
 describe("TUN routing", () => {
@@ -182,6 +184,13 @@ interface FakeDataplane extends DataplaneController {
   stopped: number;
   probes: number;
   disposals: number;
+  isActive: boolean;
+  /** What the next probes answer; changeable mid-test. */
+  availability: DataplaneAvailability;
+  /** Thrown by every following start; changeable mid-test. */
+  startError: Error | undefined;
+  /** Starts and stops in the order they happened, with the proxy applies a test records beside them. */
+  calls: string[];
 }
 
 function fakeDataplane({
@@ -197,23 +206,30 @@ function fakeDataplane({
     probes: 0,
     disposals: 0,
     isActive: false,
+    availability,
+    startError,
+    calls: [],
     probe: async () => {
       controller.probes += 1;
-      return availability;
+      return controller.availability;
     },
     start: async (request) => {
       controller.startAttempts += 1;
+      controller.calls.push("start");
       if (remainingFailures > 0) {
         remainingFailures -= 1;
         throw new Error("adapter is still being removed");
       }
-      if (startError) {
-        throw startError;
+      if (controller.startError) {
+        throw controller.startError;
       }
       controller.started.push(request);
+      controller.isActive = true;
     },
     stop: async () => {
       controller.stopped += 1;
+      controller.calls.push("stop");
+      controller.isActive = false;
     },
     dispose: async () => {
       controller.disposals += 1;
@@ -439,6 +455,88 @@ describe("TUN routing across a reconnect", () => {
       await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
       expect(enforcingDuringStart).toEqual([false, false, false]);
       expect(internals.localProcessEnforcement).toBe(false);
+    });
+  });
+
+  it("does not switch the listener to local enforcement under an adapter an overtaken update kept", async () => {
+    // The session drops while a routing update waits on the helper. The
+    // adapter stays up for the reconnect and keeps forwarding selected flows
+    // to the listener - from the helper's own socket, as bare addresses. An
+    // enforcer switched on there sent a process rule's flows direct instead
+    // of letting them wait for the tunnel.
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane();
+      const service = new LiveSshServiceBridge(initialStatus(), {
+        systemProxy: systemProxy(applies),
+        processConnectionsProvider: async () => [],
+        processDnsEntriesProvider: async () => [],
+        processAttribution: workingAttribution(),
+        dataplane,
+        protectedAddressResolver: async () => ["203.0.113.9"]
+      });
+      const internals = service as unknown as SshInternals & { localProcessEnforcement: boolean };
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 });
+      expect(dataplane.isActive).toBe(true);
+      expect(internals.localProcessEnforcement).toBe(false);
+
+      const probe = dataplane.probe;
+      dataplane.probe = async () => {
+        internals.status = { ...internals.status, state: "Reconnecting" };
+        return probe();
+      };
+      dataplane.calls.length = 0;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 });
+
+      expect(dataplane.isActive).toBe(true);
+      expect(dataplane.calls).toEqual([]);
+      expect(applies).toHaveLength(0);
+      expect(internals.localProcessEnforcement).toBe(false);
+      await service.dispose();
+    });
+  });
+
+  it("keeps enforcing locally when an update's TUN start is overtaken with no adapter up", async () => {
+    // On the enforced path the system proxy hands everything to the listener.
+    // The session dropped while a retried TUN start failed: the listener used
+    // to stop enforcing, park every flow for the tunnel and, after the
+    // reconnect, tunnel unselected apps and direct-list sites with them.
+    await withWin32(async () => {
+      const applies: SystemProxyApplyRequest[] = [];
+      const dataplane = fakeDataplane({ startError: new Error("wintun.dll is missing") });
+      const service = new LiveSshServiceBridge(initialStatus(), {
+        systemProxy: systemProxy(applies),
+        processConnectionsProvider: async () => [],
+        processDnsEntriesProvider: async () => [],
+        processAttribution: workingAttribution(),
+        dataplane,
+        protectedAddressResolver: async () => ["203.0.113.9"]
+      });
+      const internals = service as unknown as SshInternals & { localProcessEnforcement: boolean; localRoutingContext: unknown };
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 });
+      expect(internals.localProcessEnforcement).toBe(true);
+      const context = internals.localRoutingContext;
+      expect(context).toBeDefined();
+      const appliesBefore = applies.length;
+
+      dataplane.start = async () => {
+        dataplane.calls.push("start");
+        internals.status = { ...internals.status, state: "Reconnecting" };
+        throw new Error("Native helper start-dataplane request timed out.");
+      };
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 });
+
+      expect(internals.localProcessEnforcement).toBe(true);
+      expect(internals.localRoutingContext).toBe(context);
+      // Whoever overtook the update applies routing afresh.
+      expect(applies).toHaveLength(appliesBefore);
+      await service.dispose();
     });
   });
 
@@ -682,6 +780,310 @@ describe("Disconnecting a transport must not end the helpers", () => {
 
       await service.dispose();
       expect(dataplane.disposals).toBe(1);
+    });
+  });
+});
+
+describe("Falling back from a running adapter", () => {
+  // A routing update that cannot restart TUN used to apply the system proxy
+  // or local enforcement on top of the adapter still running underneath,
+  // with the old rules: two policies at once, and a stale adapter that the
+  // status still called active.
+  function createRecordingService(dataplane: FakeDataplane): { service: LiveSshServiceBridge; internals: SshInternals } {
+    const proxy = {
+      apply: vi.fn(async () => {
+        dataplane.calls.push("proxy-apply");
+        return { applied: true, message: "applied" };
+      }),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const service = new LiveSshServiceBridge(initialStatus(), {
+      systemProxy: proxy,
+      processConnectionsProvider: async () => [],
+      processDnsEntriesProvider: async () => [],
+      processAttribution: attribution(),
+      dataplane,
+      protectedAddressResolver: async () => ["203.0.113.9"]
+    });
+    return { service, internals: service as unknown as SshInternals };
+  }
+
+  async function connectedWithTun(dataplane: FakeDataplane): Promise<{ service: LiveSshServiceBridge; internals: SshInternals; request: ConnectRequest }> {
+    const { service, internals } = createRecordingService(dataplane);
+    internals.status = { ...internals.status, state: "Connected" };
+    const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+    internals.lastRequest = request;
+    await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+    expect(service.getStatus().tunActive).toBe(true);
+    dataplane.calls.length = 0;
+    return { service, internals, request };
+  }
+
+  it("takes the adapter down before the proxy path when a routing update cannot restart it", async () => {
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedWithTun(dataplane);
+
+      dataplane.startError = new Error("the new policy does not compile");
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+
+      expect(dataplane.calls).toEqual(["start", "start", "stop", "proxy-apply"]);
+      expect(dataplane.isActive).toBe(false);
+      expect(service.getStatus().tunActive).toBe(false);
+    });
+  });
+
+  it("takes the adapter down when the helper can no longer create one", async () => {
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedWithTun(dataplane);
+
+      dataplane.availability = { available: false, reason: "wintun.dll is missing" };
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+
+      expect(dataplane.calls).toEqual(["stop", "proxy-apply"]);
+      expect(service.getStatus().tunActive).toBe(false);
+    });
+  });
+
+  it("keeps a held adapter, and has the reconnect rebuild it, when the session drops while a routing update's start fails", async () => {
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedWithTun(dataplane);
+      const state = internals as unknown as { suspendTunnel(): void; systemRoutingApplied: boolean; routingChangedWhileDown: boolean };
+      state.systemRoutingApplied = true;
+      dataplane.startError = new Error("the new policy does not compile");
+      const start = dataplane.start;
+      let first = true;
+      dataplane.start = async (startRequest) => {
+        if (first) {
+          first = false;
+          // What a dropped session does while the start is in flight.
+          state.suspendTunnel();
+          internals.status = { ...internals.status, state: "Reconnecting" };
+        }
+        return start(startRequest);
+      };
+
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 });
+
+      // Selected flows keep waiting at the listener for the reconnect rather
+      // than going out directly, and the reconnect builds the adapter anew
+      // with the rules this update could not install.
+      expect(dataplane.calls).toEqual(["start", "start"]);
+      expect(dataplane.isActive).toBe(true);
+      expect(state.routingChangedWhileDown).toBe(true);
+      await service.dispose();
+    });
+  });
+
+  it("still sends a stop for a start that failed before the proxy path goes on", async () => {
+    // The start may have timed out here and still finished in the helper,
+    // which would leave an adapter nobody tracks capturing traffic.
+    await withWin32(async () => {
+      const dataplane = fakeDataplane({ startError: new Error("Native helper start-dataplane request timed out.") });
+      const { internals } = createRecordingService(dataplane);
+      internals.status = { ...internals.status, state: "Connected" };
+      const request = { ...sshConnectRequest(), tunDataplaneEnabled: true };
+      internals.lastRequest = request;
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 51_234 }, true);
+
+      expect(dataplane.calls).toEqual(["start", "start", "stop", "proxy-apply"]);
+      // Nothing more is owed once that stop went through.
+      await internals.stopRouting();
+      expect(dataplane.stopped).toBe(1);
+    });
+  });
+});
+
+describe("Falling back from a running Xray adapter", () => {
+  // The same gap on the Xray side, which also reaches it from a restart that
+  // takes held routing over while the held adapter is still up.
+  async function connectedXrayWithTun(
+    dataplane: FakeDataplane,
+    protectedAddresses: string[][] = []
+  ): Promise<{ service: XrayServiceBridge; internals: XrayInternals; request: ProxyConnectRequest }> {
+    const proxy = {
+      apply: vi.fn(async () => {
+        dataplane.calls.push("proxy-apply");
+        return { applied: true, message: "applied" };
+      }),
+      restore: vi.fn(async () => undefined)
+    } as unknown as WindowsSystemProxyManager;
+    const service = new XrayServiceBridge(initialStatus(), {
+      runtimeDirectory: "/tmp/shadow-ssh-xray-tun-fallback",
+      systemProxy: proxy,
+      processConnectionsProvider: async () => [],
+      processDnsEntriesProvider: async () => [],
+      processAttribution: attribution(),
+      dataplane,
+      protectedAddressResolver: async () => protectedAddresses.shift() ?? ["203.0.113.9"]
+    });
+    const internals = service as unknown as XrayInternals;
+    internals.status = { ...internals.status, state: "Connected" };
+    const request = { ...xrayConnectRequest(), tunDataplaneEnabled: true };
+    internals.lastRequest = request;
+    await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+    expect(service.getStatus().tunActive).toBe(true);
+    dataplane.calls.length = 0;
+    return { service, internals, request };
+  }
+
+  it("takes the adapter down before the proxy path when a routing update cannot restart it", async () => {
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedXrayWithTun(dataplane);
+
+      dataplane.startError = new Error("the new policy does not compile");
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+
+      expect(dataplane.calls).toEqual(["start", "start", "stop", "proxy-apply"]);
+      expect(dataplane.isActive).toBe(false);
+      expect(service.getStatus().tunActive).toBe(false);
+      await service.dispose();
+    });
+  });
+
+  it("keeps a running adapter on the addresses it was started with when a re-apply cannot resolve the server", async () => {
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      // The first apply resolves the server; the next one - a rule edit, or a
+      // restart under the hold - hits a resolver that fails for a moment.
+      const { service, internals, request } = await connectedXrayWithTun(dataplane, [["203.0.113.9"], []]);
+
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+
+      expect(dataplane.calls).toEqual(["start"]);
+      expect(dataplane.started.at(-1)?.protectedAddresses).toEqual(["203.0.113.9"]);
+      expect(service.getStatus().tunActive).toBe(true);
+      await service.dispose();
+    });
+  });
+
+  it("stays on the proxy path when the server does not resolve and no adapter is up", async () => {
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedXrayWithTun(dataplane, [["203.0.113.9"], []]);
+      // The adapter went down in between, so there is nothing to keep.
+      await internals.stopRouting();
+      dataplane.calls.length = 0;
+      internals.status = { ...internals.status, state: "Connected" };
+
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+
+      expect(dataplane.calls).toEqual(["proxy-apply"]);
+      expect(service.getStatus().tunActive).toBe(false);
+      await service.dispose();
+    });
+  });
+
+  it("leaves a held adapter alone when Xray stops while a routing update tries it", async () => {
+    // Xray dying mid-update holds routing as it is for the restart. The
+    // overtaken attempt used to go on to the proxy path regardless, putting a
+    // PAC that points at the dead Xray on top of the adapter still running.
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedXrayWithTun(dataplane);
+      const probe = dataplane.probe;
+      dataplane.probe = async () => {
+        internals.status = { ...internals.status, state: "Error" };
+        internals.holdRouting();
+        return probe();
+      };
+      // A domain rule, so no process-route learning step stands in the way.
+      const update = {
+        ...request,
+        routingRules: [{ id: "d1", type: "domain" as const, value: "example.org", enabled: true, createdAt: "", updatedAt: "" }]
+      };
+
+      await internals.applySystemRouting(update, { host: "127.0.0.1", port: 52_000 });
+
+      expect(dataplane.calls).toEqual([]);
+      expect(dataplane.isActive).toBe(true);
+      await service.dispose();
+    });
+  });
+
+  it("leaves a held adapter alone when Xray stops while a routing update's start then fails", async () => {
+    // The same overtaking, later: Xray exits while the start is in flight.
+    // Taking the adapter down here left nothing capturing the traffic the
+    // hold was keeping at Xray's ports, so selected traffic went direct.
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedXrayWithTun(dataplane);
+      dataplane.startError = new Error("the new policy does not compile");
+      const start = dataplane.start;
+      let first = true;
+      dataplane.start = async (startRequest) => {
+        if (first) {
+          first = false;
+          internals.status = { ...internals.status, state: "Error" };
+          internals.holdRouting();
+        }
+        return start(startRequest);
+      };
+      const update = {
+        ...request,
+        routingRules: [{ id: "d1", type: "domain" as const, value: "example.org", enabled: true, createdAt: "", updatedAt: "" }]
+      };
+
+      await internals.applySystemRouting(update, { host: "127.0.0.1", port: 52_000 });
+
+      expect(dataplane.calls).toEqual(["start", "start"]);
+      expect(dataplane.isActive).toBe(true);
+      await service.dispose();
+    });
+  });
+
+  it("stops waiting for a routing update's TUN start the moment a disconnect begins", async () => {
+    // Main queues the disconnect behind the update, so the bridge's own
+    // disconnect would only run once both start attempts had timed out.
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedXrayWithTun(dataplane);
+      const signals: Array<AbortSignal | undefined> = [];
+      dataplane.start = (_startRequest, signal) => {
+        dataplane.calls.push("start");
+        signals.push(signal);
+        return new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("Native helper start-dataplane request was abandoned.")), { once: true });
+        });
+      };
+      const update = {
+        ...request,
+        routingRules: [{ id: "d1", type: "domain" as const, value: "example.org", enabled: true, createdAt: "", updatedAt: "" }]
+      };
+
+      const updating = internals.applySystemRouting(update, { host: "127.0.0.1", port: 52_000 });
+      await vi.waitFor(() => expect(signals).toHaveLength(1));
+      service.beginDisconnect();
+      await updating;
+
+      expect(signals[0]?.aborted).toBe(true);
+      // No second attempt, and no proxy path on top of an adapter the
+      // teardown is about to take down.
+      expect(dataplane.calls).toEqual(["start"]);
+      expect(service.getStatus().state).toBe("Disconnecting");
+      await service.dispose();
+    });
+  });
+
+  it("still sends a stop for a start that failed before the proxy path goes on", async () => {
+    await withWin32(async () => {
+      const dataplane = fakeDataplane();
+      const { service, internals, request } = await connectedXrayWithTun(dataplane);
+      await internals.stopRouting();
+      expect(dataplane.stopped).toBe(1);
+      dataplane.calls.length = 0;
+
+      dataplane.startError = new Error("Native helper start-dataplane request timed out.");
+      internals.status = { ...internals.status, state: "Connected" };
+      await internals.applySystemRouting(request, { host: "127.0.0.1", port: 52_000 });
+
+      expect(dataplane.calls).toEqual(["start", "start", "stop", "proxy-apply"]);
+      await service.dispose();
+      // Nothing more is owed once that stop went through.
+      expect(dataplane.stopped).toBe(2);
     });
   });
 });

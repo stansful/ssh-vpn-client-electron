@@ -1,6 +1,8 @@
 # Builds all 8 distributables on every push to master whose package.json version
 # has no release yet and publishes them as release "<version>" (plain semver tag
 # on the built commit), which the in-app updater reads via /releases/latest.
+# Typecheck, lint, Vitest and the Go checks run on every push and must pass
+# before anything is built.
 name: Release
 
 on:
@@ -67,8 +69,71 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
 
+  # Every push, released or not: the checks a release must pass, so nothing is
+  # built from a commit whose tests, lint or Go helper are broken. Runs beside
+  # the gate; build waits for both.
+  quality:
+    # The image the build uses and the suite is developed on.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The lock's own version is not checked by npm ci, and 2.6.0 and 2.6.1
+      # were released with a stale one.
+      - name: Check version consistency
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const lock = require("./package-lock.json");
+            const found = [lock.version, lock.packages?.[""]?.version];
+            if (found.some((version) => version !== pkg.version)) {
+              console.log(`::error file=package-lock.json::package-lock.json says ${found.join(" / ")}, package.json says ${pkg.version}. Run npm install --package-lock-only.`);
+              process.exit(1);
+            }
+          '
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.11.1
+          cache: npm
+
+      # Same Go as the build: the release helpers are compiled with 1.25.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - run: npm ci --no-audit --no-fund
+
+      - run: npm run typecheck
+
+      - run: npm run lint
+
+      # Includes the package/lock version test and the Xray checksum gate.
+      - run: npm test
+
+      - name: Go tests
+        working-directory: native/service-go
+        run: go test ./...
+
+      # Most of the helper is Windows-only code that go test on macOS never
+      # compiles. go build leaves out the _test.go files, so vet type-checks
+      # the Windows tests as well.
+      - name: Windows helper builds
+        working-directory: native/service-go
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/shadow-ssh-service
+          GOOS=windows GOARCH=arm64 go build -o /dev/null ./cmd/shadow-ssh-service
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=windows GOARCH=arm64 go vet ./...
+
   build:
-    needs: check
+    needs: [check, quality]
     if: needs.check.outputs.should_release == 'true'
     # DMG and hdiutil exist only on macOS; electron-builder cross-builds the
     # Windows and Linux packages here without wine.
@@ -111,6 +176,16 @@ jobs:
       - run: |
           npm run wintun:download
           npm run wintun:ensure
+
+      # The helper loads only a wintun.dll whose SHA-256 is pinned in
+      # internal/tun/verify.go. The quality job has no DLLs to compare them
+      # with, so its go test skips this check; a wrong pin would ship a helper
+      # that refuses its own DLL. The grep fails the step on a skip as well.
+      - name: Check the pinned wintun.dll digests
+        working-directory: native/service-go
+        run: |
+          go test -count=1 -v -run '^TestPinnedWintunDigestsMatchTheFetchedDLLs$' ./internal/tun | tee "$RUNNER_TEMP/wintun-digests.log"
+          grep -q -- '--- PASS: TestPinnedWintunDigestsMatchTheFetchedDLLs' "$RUNNER_TEMP/wintun-digests.log"
 
       - name: Prepare packaging tools
         run: |
@@ -192,7 +267,7 @@ jobs:
   # scripts or downloaded build tools, and a failed upload can be re-run
   # without rebuilding.
   publish:
-    needs: [check, build]
+    needs: [check, quality, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

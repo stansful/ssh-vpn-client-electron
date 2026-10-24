@@ -13,6 +13,7 @@ import {
   serversUsingKey,
   shortKeyId
 } from "../src/renderer/components/pages/keys/key-model.js";
+import { openSshEncryptionWarning } from "../src/renderer/components/pages/keys/key-text.js";
 import type { SshConfig, SshKeyMetadata } from "../src/shared/types.js";
 
 const at = "2026-10-06T10:00:00.000Z";
@@ -81,11 +82,23 @@ describe("key presentation", () => {
     expect(keyInUseDescription(3)).toMatch(/^3 servers still sign in/u);
   });
 
-  it("names keys that save but can't sign in yet", () => {
+  it("names keys that save but can't sign in", () => {
     expect(keySupportIssue(key())).toBeUndefined();
-    expect(keySupportIssue(key({ keyType: "ecdsa" }))).toMatch(/ECDSA/u);
+    expect(keySupportIssue(key({ keyType: "ecdsa" }))).toBeUndefined();
     expect(keySupportIssue(key({ keyType: "dsa" }))).toMatch(/DSA/u);
-    expect(keySupportIssue(key({ encryptedOpenSsh: true }))).toMatch(/Passphrase-protected OpenSSH/u);
+    expect(keySupportIssue(key({ encryptedOpenSsh: true }))).toMatch(/Passphrase-protected OpenSSH key with no saved passphrase/u);
+    expect(keySupportIssue(key({ encryptedOpenSsh: true, privateKeyPassphraseSecretId: "pass" }))).toBeUndefined();
+    // A security-key (FIDO) key reads as ECDSA or Ed25519 but cannot sign in.
+    expect(keySupportIssue(key({ keyType: "ecdsa", securityKey: true }))).toMatch(/^Security-key \(FIDO\) keys can’t sign in/u);
+    // Its passphrase saved, a key the core cannot decrypt still cannot - and
+    // the list says what the key form said when it was pasted.
+    expect(
+      keySupportIssue(key({ encryptedOpenSsh: true, privateKeyPassphraseSecretId: "pass", unsupportedOpenSshCipher: "chacha20-poly1305@openssh.com" }))
+    ).toBe(openSshEncryptionWarning({ unsupportedOpenSshCipher: "chacha20-poly1305@openssh.com" }));
+    expect(keySupportIssue(key({ encryptedOpenSsh: true, privateKeyPassphraseSecretId: "pass", excessiveBcryptRounds: 200 }))).toMatch(
+      /200 bcrypt rounds; Shadow opens keys with up to 128/u
+    );
+    expect(keySupportIssue(key({ encryptedOpenSsh: true, excessiveBcryptRounds: 200 }))).toMatch(/200 bcrypt rounds/u);
   });
 
   it("builds the picker line with type, passphrase, Key ID and users", () => {

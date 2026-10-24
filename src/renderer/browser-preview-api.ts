@@ -90,6 +90,7 @@ class BrowserPreview {
   private logArchives = 2;
   private timers = new Set<ReturnType<typeof setTimeout>>();
   private shellOpen = false;
+  private terminalTail: Promise<unknown> = Promise.resolve();
   private checksRunning = 0;
   /** Seeded public profiles get their real fingerprints (WebCrypto is async), so a refresh updates them. */
   private readonly ready: Promise<void>;
@@ -848,7 +849,9 @@ class BrowserPreview {
       },
       deleteUnpinnedProxyProfiles: async () => {
         this.assertWritable();
-        if (this.activeTransport === "xray") {
+        // As main does: only a session on a profile being removed ends.
+        const active = this.store.proxyProfiles.find((profile) => profile.id === this.xrayRuntime.activeConfigId);
+        if (this.activeTransport === "xray" && active && !active.isPinned) {
           await this.stopTransport("xray");
         }
         const remaining = this.store.proxyProfiles.filter((profile) => profile.isPinned);
@@ -929,6 +932,10 @@ class BrowserPreview {
       },
       getLogFileInfo: async () => this.logFileInfo(),
       clearLogFile: async () => {
+        const failure = this.clearLogErrorForPreview();
+        if (failure) {
+          throw new Error(failure);
+        }
         this.fileLog = "";
         this.logArchives = 0;
         return "";
@@ -947,32 +954,38 @@ class BrowserPreview {
         await this.runCheck(endpoint ?? this.store.settings.checkEndpoint, true);
         return this.snapshot();
       },
-      openTerminal: async () => {
-        if (this.activeTransport !== "ssh" || this.sshRuntime.state !== "Connected") {
-          throw new Error("Terminal is available only while connected.");
-        }
-        await delay(300);
-        this.shellOpen = true;
-        this.appendTerminal("system", "SSH shell channel opened.\n");
-        this.appendTerminal("stdout", "root@fra-01:~# ");
-        return this.snapshot();
-      },
-      closeTerminal: async () => {
-        if (this.shellOpen) {
-          this.shellOpen = false;
-          this.appendTerminal("system", "\nShell channel closed.\n");
-        }
-        return this.snapshot();
-      },
-      terminalInput: async (input: string) => {
-        if (!this.shellOpen) {
-          throw new Error("Terminal input ignored because SSH is not connected.");
-        }
-        const command = input.replace(/\r?\n$/u, "");
-        this.appendTerminal("stdout", `${command}\n`);
-        await delay(150);
-        this.appendTerminal("stdout", `${fakeShellOutput(command)}root@fra-01:~# `);
-      },
+      openTerminal: () =>
+        this.queueTerminal(async () => {
+          if (this.activeTransport !== "ssh" || this.sshRuntime.state !== "Connected") {
+            throw new Error("Terminal is available only while connected.");
+          }
+          // Like the main process, a second open while the shell is up changes nothing.
+          if (!this.shellOpen) {
+            await delay(300);
+            this.shellOpen = true;
+            this.appendTerminal("system", "SSH shell channel opened.\n");
+            this.appendTerminal("stdout", "root@fra-01:~# ");
+          }
+          return this.snapshot();
+        }),
+      closeTerminal: () =>
+        this.queueTerminal(async () => {
+          if (this.shellOpen) {
+            this.shellOpen = false;
+            this.appendTerminal("system", "\nShell channel closed.\n");
+          }
+          return this.snapshot();
+        }),
+      terminalInput: (input: string) =>
+        this.queueTerminal(async () => {
+          if (!this.shellOpen) {
+            throw new Error("Terminal input ignored because SSH is not connected.");
+          }
+          const command = input.replace(/\r?\n$/u, "");
+          this.appendTerminal("stdout", `${command}\n`);
+          await delay(150);
+          this.appendTerminal("stdout", `${fakeShellOutput(command)}root@fra-01:~# `);
+        }),
       checkForUpdates: async () => {
         await delay(900);
         const update = { ...this.updateInfo!, checkedAt: new Date().toISOString() };
@@ -1056,6 +1069,19 @@ class BrowserPreview {
     if (this.storageHealth.state === "unreadable") {
       throw new Error("Saved data couldn't be read, so changes are blocked. Recover it on the startup screen first.");
     }
+  }
+
+  /** `?clearLogError=1` makes clearing main.log fail (a file locked on Windows), for the error path of Clear activity. */
+  private clearLogErrorForPreview(): string | undefined {
+    const params = new URLSearchParams(typeof window !== "undefined" ? window.location.search : "");
+    return params.get("clearLogError") ? "main.log couldn’t be cleared because another program is using it. Close it and try again." : undefined;
+  }
+
+  /** Shell requests run one at a time, in the order they were sent, as in the main process. */
+  private queueTerminal<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.terminalTail.then(() => task());
+    this.terminalTail = result.catch(() => undefined);
+    return result;
   }
 
   /** `?applyError=1` makes routing saves report an apply failure, for the "Saved · not applied" state. */

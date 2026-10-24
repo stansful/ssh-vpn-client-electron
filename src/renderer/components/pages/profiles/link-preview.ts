@@ -9,6 +9,13 @@ import {
   isHysteria2Scheme,
   parseHysteria2Link
 } from "../../../../core/proxy/hysteria2-link.js";
+import {
+  canonicalShareLinkHost,
+  shareLinkHostToAscii,
+  uriSecurityText,
+  vmessSecurityText,
+  vmessText
+} from "../../../../core/proxy/share-link-fields.js";
 import type { ProxyProtocol, ProxySecurity, ProxyTransport } from "../../../../shared/types.js";
 
 // Browser-safe mirror of src/core/proxy/share-link-parser.ts (that module needs
@@ -79,12 +86,12 @@ export type LinkPreviewResult =
   | { status: "error"; message: string };
 
 interface VmessPayload {
-  ps?: string;
-  add?: string;
-  port?: string | number;
-  net?: string;
-  tls?: string;
-  flow?: string;
+  ps?: unknown;
+  add?: unknown;
+  port?: unknown;
+  net?: unknown;
+  tls?: unknown;
+  flow?: unknown;
 }
 
 /** Reads one share link the way the main process will. Never throws. */
@@ -315,7 +322,7 @@ function parseUriProtocol(rawUri: string, protocol: Exclude<ProxyProtocol, "vmes
   } catch {
     throw new Error(`Invalid ${protocol.toUpperCase()} URI.`);
   }
-  const host = normalizeHost(url.hostname);
+  const host = shareLinkHostToAscii(url.hostname);
   const port = Number(url.port);
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`${protocol.toUpperCase()} URI must contain host and valid port.`);
@@ -330,11 +337,11 @@ function parseUriProtocol(rawUri: string, protocol: Exclude<ProxyProtocol, "vmes
     host,
     port,
     transport: normalizeTransport(params.get("type") ?? params.get("net") ?? "tcp"),
-    security: normalizeSecurity(params.get("security") ?? (params.get("tls") === "1" ? "tls" : "none")),
+    security: normalizeSecurity(uriSecurityText(protocol, params)),
     canonical: JSON.stringify({
       protocol,
       username: url.username,
-      host,
+      host: canonicalShareLinkHost(url.hostname),
       port,
       params: canonicalParams,
       hash: decodeName(url.hash, "")
@@ -351,19 +358,20 @@ function parseVmess(rawUri: string): LinkPreview {
     throw new Error("Invalid VMess base64 JSON payload.");
   }
   if (payload === null || typeof payload !== "object") {
-    // JSON.parse("1") etc.: the core then fails reading `add`.
+    // JSON.parse("1") or "null": the core refuses it with the same text.
     throw new Error("VMess payload must contain add and valid port.");
   }
-  const host = normalizeHost(String(payload.add ?? ""));
+  const canonicalHost = canonicalShareLinkHost(String(payload.add ?? ""));
+  const host = shareLinkHostToAscii(canonicalHost);
   const port = Number(payload.port);
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("VMess payload must contain add and valid port.");
   }
-  const transport = normalizeTransport(payload.net ?? "tcp");
-  const security = normalizeSecurity(payload.tls || "none");
+  const transport = normalizeTransport(vmessText(payload.net) ?? "tcp");
+  const security = normalizeSecurity(vmessSecurityText(payload.tls));
   const name = String(payload.ps ?? `vmess-${host}:${port}`).trim() || `vmess-${host}:${port}`;
   const sorted = Object.fromEntries(
-    Object.entries({ ...payload, add: host, port, net: transport, tls: security }).sort(([left], [right]) => left.localeCompare(right))
+    Object.entries({ ...payload, add: canonicalHost, port, net: transport, tls: security }).sort(([left], [right]) => left.localeCompare(right))
   );
   return { name, protocol: "vmess", host, port, transport, security, canonical: `vmess:${JSON.stringify(sorted)}` };
 }
@@ -382,10 +390,6 @@ function decodeBase64Utf8(value: string): string {
   const binary = atob(data.padEnd(Math.ceil(data.length / 4) * 4, "="));
   const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
   return new TextDecoder("utf-8").decode(bytes);
-}
-
-function normalizeHost(value: string): string {
-  return value.trim().replace(/^\[/u, "").replace(/\]$/u, "").toLowerCase();
 }
 
 function decodeName(hash: string, fallback: string): string {

@@ -1,9 +1,10 @@
 import { execFile, type ChildProcessByStdio, type ExecFileException } from "node:child_process";
 import { stat } from "node:fs/promises";
 import net from "node:net";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 
-export type XrayProcess = ChildProcessByStdio<null, Readable, Readable>;
+/** Xray with its config piped into stdin and both outputs read. */
+export type XrayProcess = ChildProcessByStdio<Writable, Readable, Readable>;
 export interface LocalTcpEndpoint {
   host: string;
   port: number;
@@ -20,6 +21,7 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
 const DEFAULT_RETRY_INTERVAL_MS = 50;
 const DEFAULT_CONNECT_TIMEOUT_MS = 250;
 const MAX_PORT_RESERVATION_ATTEMPTS = 32;
+const LOOPBACK_HOST = "127.0.0.1";
 const PROCESS_TERMINATE_GRACE_MS = 1500;
 const PROCESS_TERMINATE_DEADLINE_MS = 3000;
 /** `xray version` answers at once; the slack is for a first run under an antivirus scan. */
@@ -145,24 +147,65 @@ export async function reserveLocalTcpPort(): Promise<{ host: string; port: numbe
   return { host: "127.0.0.1", port: address.port };
 }
 
+export interface ReserveLocalTcpPortsOptions {
+  /**
+   * A port to try first for each slot, in slot order: the ports the previous
+   * Xray listened on. A slot whose port is busy, avoided, out of range or
+   * already given to an earlier slot gets an ephemeral port instead, and the
+   * other slots keep theirs.
+   */
+  preferredPorts?: readonly (number | undefined)[];
+  /** Ports no slot may take, preferred or ephemeral. */
+  avoidPorts?: readonly (number | undefined)[];
+  /** Injection seam for tests; defaults to {@link isLocalTcpPortAvailable}. */
+  isPortAvailable?: (port: number) => Promise<boolean>;
+}
+
+/**
+ * Reserves `count` distinct loopback ports. Ephemeral ports are asked for
+ * until there are enough distinct ones, giving up after a bounded number of
+ * attempts.
+ */
 export async function reserveDistinctLocalTcpPorts(
   count: number,
-  reserve: () => Promise<LocalTcpEndpoint> = reserveLocalTcpPort
+  reserve: () => Promise<LocalTcpEndpoint> = reserveLocalTcpPort,
+  options: ReserveLocalTcpPortsOptions = {}
 ): Promise<LocalTcpEndpoint[]> {
   if (!Number.isInteger(count) || count <= 0) {
     throw new Error("Local TCP port reservation count must be positive.");
   }
-  const endpoints: LocalTcpEndpoint[] = [];
-  for (let attempt = 0; endpoints.length < count && attempt < MAX_PORT_RESERVATION_ATTEMPTS; attempt += 1) {
+  const avoided = new Set((options.avoidPorts ?? []).filter(isTcpPort));
+  const isPortAvailable = options.isPortAvailable ?? isLocalTcpPortAvailable;
+  const slots: Array<LocalTcpEndpoint | undefined> = [];
+  for (let index = 0; index < count; index += 1) {
+    const port = options.preferredPorts?.[index];
+    const usable = isTcpPort(port) && !avoided.has(port) && !slots.some((slot) => slot?.port === port);
+    slots.push(usable && await isPortAvailable(port) ? { host: LOOPBACK_HOST, port } : undefined);
+  }
+  for (let attempt = 0; slots.includes(undefined) && attempt < MAX_PORT_RESERVATION_ATTEMPTS; attempt += 1) {
     const endpoint = await reserve();
-    if (!endpoints.some((candidate) => candidate.host === endpoint.host && candidate.port === endpoint.port)) {
-      endpoints.push(endpoint);
+    const taken = avoided.has(endpoint.port) ||
+      slots.some((slot) => slot !== undefined && slot.host === endpoint.host && slot.port === endpoint.port);
+    if (!taken) {
+      slots[slots.indexOf(undefined)] = endpoint;
     }
   }
+  const endpoints = slots.filter((slot): slot is LocalTcpEndpoint => slot !== undefined);
   if (endpoints.length !== count) {
     throw new Error(`Unable to reserve ${count} distinct local TCP ports for Xray.`);
   }
   return endpoints;
+}
+
+/** Whether a listener could bind `port` on loopback right now. Never rejects. */
+export function isLocalTcpPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.listen({ port, host: LOOPBACK_HOST, exclusive: true }, () => {
+      server.close(() => resolve(true));
+    });
+  });
 }
 
 export async function waitForProcessStartup(
@@ -361,6 +404,10 @@ function ranToExit(error: ExecFileException | null): boolean {
 
 function startupExitError(code: number | null, signal: NodeJS.Signals | null): Error {
   return new Error(`Xray runtime exited during startup${code === null ? "" : ` with code ${code}`}${signal ? ` signal ${signal}` : ""}.`);
+}
+
+function isTcpPort(port: number | undefined): port is number {
+  return Number.isInteger(port) && Number(port) > 0 && Number(port) <= 65535;
 }
 
 function positiveNumber(value: number | undefined, fallback: number): number {

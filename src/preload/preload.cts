@@ -1,5 +1,13 @@
+/**
+ * The renderer's only way into the main process. The window runs sandboxed,
+ * so this file must stay a self-contained CommonJS script: a sandboxed
+ * preload can require "electron" and nothing of the app's own. That is why
+ * the channel names are written out here instead of imported; the type below
+ * makes the compiler reject any difference from IPC_CHANNELS in
+ * src/shared/ipc.ts, and tests/preload-bridge.test.ts checks it again.
+ */
 import { contextBridge, ipcRenderer } from "electron";
-import { IPC_CHANNELS, type RendererEvent, type ShadowSshApi } from "../shared/ipc.js";
+import type { IPC_CHANNELS as SharedIpcChannels, RendererEvent, ShadowSshApi } from "../shared/ipc.js";
 import type {
   AppSettings,
   ImportProxyProfilesInput,
@@ -9,6 +17,57 @@ import type {
   UpsertSshConfigInput,
   UpsertSshKeyInput
 } from "../shared/types.js";
+
+const IPC_CHANNELS: typeof SharedIpcChannels = {
+  loadSnapshot: "shadow-ssh:load-snapshot",
+  upsertConfig: "shadow-ssh:upsert-config",
+  deleteConfig: "shadow-ssh:delete-config",
+  selectConfig: "shadow-ssh:select-config",
+  upsertKey: "shadow-ssh:upsert-key",
+  copyPrivateKey: "shadow-ssh:copy-private-key",
+  deleteKey: "shadow-ssh:delete-key",
+  upsertProxyProfile: "shadow-ssh:upsert-proxy-profile",
+  importProxyProfiles: "shadow-ssh:import-proxy-profiles",
+  refreshProxyProfiles: "shadow-ssh:refresh-proxy-profiles",
+  selectProxyProfile: "shadow-ssh:select-proxy-profile",
+  toggleProxyProfilePin: "shadow-ssh:toggle-proxy-profile-pin",
+  renameProxyProfile: "shadow-ssh:rename-proxy-profile",
+  copyProxyProfileLink: "shadow-ssh:copy-proxy-profile-link",
+  deleteProxyProfile: "shadow-ssh:delete-proxy-profile",
+  deleteUnpinnedProxyProfiles: "shadow-ssh:delete-unpinned-proxy-profiles",
+  updateSettings: "shadow-ssh:update-settings",
+  updateRoutingMode: "shadow-ssh:update-routing-mode",
+  updateRoutingRules: "shadow-ssh:update-routing-rules",
+  updateRoutingProxyListEnabled: "shadow-ssh:update-routing-proxy-list-enabled",
+  refreshRoutingProxyList: "shadow-ssh:refresh-routing-proxy-list",
+  updateRoutingDirectListEnabled: "shadow-ssh:update-routing-direct-list-enabled",
+  refreshRoutingDirectList: "shadow-ssh:refresh-routing-direct-list",
+  clearDiagnostics: "shadow-ssh:clear-diagnostics",
+  readLogFile: "shadow-ssh:read-log-file",
+  getLogFileInfo: "shadow-ssh:get-log-file-info",
+  clearLogFile: "shadow-ssh:clear-log-file",
+  listProcesses: "shadow-ssh:list-processes",
+  connect: "shadow-ssh:connect",
+  connectProxy: "shadow-ssh:connect-proxy",
+  disconnect: "shadow-ssh:disconnect",
+  checkTunnel: "shadow-ssh:check-tunnel",
+  openTerminal: "shadow-ssh:open-terminal",
+  closeTerminal: "shadow-ssh:close-terminal",
+  terminalInput: "shadow-ssh:terminal-input",
+  checkForUpdates: "shadow-ssh:check-for-updates",
+  downloadUpdate: "shadow-ssh:download-update",
+  revealDownloadedUpdate: "shadow-ssh:reveal-downloaded-update",
+  copyText: "shadow-ssh:copy-text",
+  readClipboardText: "shadow-ssh:read-clipboard-text",
+  openExternal: "shadow-ssh:open-external",
+  dismissConnectionError: "shadow-ssh:dismiss-connection-error",
+  dismissAttention: "shadow-ssh:dismiss-attention",
+  openLogFolder: "shadow-ssh:open-log-folder",
+  openDataFolder: "shadow-ssh:open-data-folder",
+  recoverStorage: "shadow-ssh:recover-storage",
+  quitApp: "shadow-ssh:quit-app",
+  serviceEvent: "shadow-ssh:service-event"
+};
 
 const api: ShadowSshApi = {
   loadSnapshot: () => ipcRenderer.invoke(IPC_CHANNELS.loadSnapshot),

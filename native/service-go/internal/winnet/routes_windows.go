@@ -94,8 +94,15 @@ func Routes() ([]Route, error) {
 		}
 		rows := unsafe.Slice(&table.table[0], table.numEntries)
 		for index := range rows {
-			if prefix, ok := rows[index].destinationPrefix.netip(); ok {
-				routes = append(routes, Route{Destination: prefix, InterfaceLUID: rows[index].interfaceLUID})
+			row := &rows[index]
+			if prefix, ok := row.destinationPrefix.netip(); ok {
+				nextHop, _ := row.nextHop.addr()
+				routes = append(routes, Route{
+					Destination:    prefix,
+					InterfaceLUID:  row.interfaceLUID,
+					InterfaceIndex: row.interfaceIndex,
+					NextHop:        nextHop,
+				})
 			}
 		}
 		_, _, _ = syscall.SyscallN(procFreeMibTable.Addr(), uintptr(unsafe.Pointer(table)))
@@ -104,17 +111,23 @@ func Routes() ([]Route, error) {
 }
 
 func (p *ipAddressPrefix) netip() (netip.Prefix, bool) {
-	var addr netip.Addr
-	switch p.prefix.family {
-	case windows.AF_INET:
-		// sockaddr_in: port, then the address.
-		addr = netip.AddrFrom4([4]byte(p.prefix.data[2:6]))
-	case windows.AF_INET6:
-		// sockaddr_in6: port, flow info, then the address.
-		addr = netip.AddrFrom16([16]byte(p.prefix.data[6:22]))
-	default:
+	addr, ok := p.prefix.addr()
+	if !ok {
 		return netip.Prefix{}, false
 	}
 	prefix := netip.PrefixFrom(addr, int(p.prefixLength))
 	return prefix, prefix.IsValid()
+}
+
+func (s *rawSockaddrInet) addr() (netip.Addr, bool) {
+	switch s.family {
+	case windows.AF_INET:
+		// sockaddr_in: port, then the address.
+		return netip.AddrFrom4([4]byte(s.data[2:6])), true
+	case windows.AF_INET6:
+		// sockaddr_in6: port, flow info, then the address.
+		return netip.AddrFrom16([16]byte(s.data[6:22])), true
+	default:
+		return netip.Addr{}, false
+	}
 }

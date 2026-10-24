@@ -10,9 +10,15 @@ import { Badge, Button, Callout, Mono } from "../../ui/index.js";
 import { DomainListsCard } from "./DomainListsCard.js";
 import { ModeCard } from "./ModeCard.js";
 import { RoutingDialogs } from "./RoutingDialogs.js";
+import { followRoutingTabIntent, type FrameScheduler } from "./routing-model.js";
 import { RulesCard } from "./RulesCard.js";
 import type { SaveStatus } from "./useRoutingAutosave.js";
 import { useRoutingController, type RoutingController } from "./useRoutingController.js";
+
+const ANIMATION_FRAMES: FrameScheduler = {
+  request: (callback) => window.requestAnimationFrame(callback),
+  cancel: (frame) => window.cancelAnimationFrame(frame)
+};
 
 const SAVE_BADGE: Record<SaveStatus, { tone: "ok" | "busy" | "danger" | "warn"; text: string }> = {
   saved: { tone: "ok", text: "Saved" },
@@ -32,14 +38,19 @@ export function RoutingPage({ intent }: PageProps): JSX.Element {
     if (intent?.type !== "routing-tab") {
       return undefined;
     }
-    setTab(intent.tab);
-    clearIntent();
-    // Land on the rules card (the page itself just scrolled to the top).
-    const frame = window.requestAnimationFrame(() => {
-      const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-      rulesCard.current?.scrollIntoView({ block: "start", behavior: reduce ? "auto" : "smooth" });
-    });
-    return () => window.cancelAnimationFrame(frame);
+    // Land on the rules card; the intent clears after the scroll, like Settings does.
+    return followRoutingTabIntent(
+      intent.tab,
+      {
+        setTab,
+        clearIntent,
+        scroll: () => {
+          const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+          rulesCard.current?.scrollIntoView({ block: "start", behavior: reduce ? "auto" : "smooth" });
+        }
+      },
+      ANIMATION_FRAMES
+    );
   }, [clearIntent, intent, setTab]);
 
   return (

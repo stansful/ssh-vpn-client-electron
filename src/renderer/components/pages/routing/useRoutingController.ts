@@ -34,11 +34,13 @@ import {
   cutsLastTargetWithPending,
   isLiveSession,
   listName,
+  splitNeedsGuard,
   steersSystemTraffic,
   wouldCutLastTarget,
   type ConnectionBadge,
   type ListBusy,
   type ListKind,
+  type PendingRoutingChanges,
   type RoutingTargets
 } from "./routing-model.js";
 import { useRoutingAutosave, type RoutingAutosave, type SaveOutcome } from "./useRoutingAutosave.js";
@@ -261,13 +263,18 @@ export function useRoutingController(): RoutingController {
 
   /* ---------- Guards ---------- */
 
+  const pendingChanges = useCallback((): PendingRoutingChanges => ({
+    deletingRuleIds: pendingDeletes.current,
+    proxyListTurningOff: listsTurningOff.current.has("proxy")
+  }), []);
+
   const cutsLastTarget = useCallback((nextRules: readonly RoutingRule[], nextProxy?: RoutingProxyList): boolean => cutsLastTargetWithPending(
     modeRef.current,
     liveRef.current,
     { rules: rulesRef.current, proxyList: proxyRef.current },
     { rules: nextRules, proxyList: nextProxy },
-    { deletingRuleIds: pendingDeletes.current, proxyListTurningOff: listsTurningOff.current.has("proxy") }
-  ), []);
+    pendingChanges()
+  ), [pendingChanges]);
 
   /** Ends the session on purpose before a change that would leave Split tunnel empty. */
   const disconnectOnPurpose = useCallback(async (): Promise<boolean> => {
@@ -407,12 +414,13 @@ export function useRoutingController(): RoutingController {
     if (next === modeRef.current) {
       return;
     }
-    if (next === "selected-rules" && countTargets(rulesRef.current, proxyRef.current).total === 0) {
+    // Counts pending deletes and a list turning off as done, like the last-target guard.
+    if (next === "selected-rules" && splitNeedsGuard(rulesRef.current, proxyRef.current, pendingChanges())) {
       setDialog({ kind: "mode-guard" });
       return;
     }
     void commitMode(next);
-  }, [commitMode]);
+  }, [commitMode, pendingChanges]);
 
   const guardSwitchAnyway = useCallback((): void => {
     setDialog(undefined);

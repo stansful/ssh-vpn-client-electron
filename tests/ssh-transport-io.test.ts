@@ -142,6 +142,32 @@ describe("SSH packet stream reader/writer", () => {
     transport.destroy();
   });
 
+  it("parses a packet that arrived with the server identification exactly once", async () => {
+    const socket = new ControlledDuplex();
+    const transport = SshSocketTransport.fromSocket(socket as never);
+    const payloads: Buffer[] = [];
+    transport.onEvent((event) => {
+      if (event.type === "payload") {
+        payloads.push(event.payload);
+      }
+    });
+    const exchange = transport.exchangeIdentification("test-client", 1000);
+    // OpenSSH's banner and KEXINIT often share one read.
+    const plainWriter = new SshPlainPacketStreamWriter();
+    socket.push(Buffer.concat([Buffer.from("SSH-2.0-test-server\r\n"), plainWriter.write(Buffer.from([20, 1, 2, 3]))]));
+    await exchange;
+    await nextTurn();
+    expect(payloads).toEqual([]);
+
+    // The first send starts the packet reader on what is already buffered.
+    await transport.send(Buffer.from([20, 9]));
+    socket.push(plainWriter.write(Buffer.from([21])));
+    await nextTurn();
+
+    expect(payloads).toEqual([Buffer.from([20, 1, 2, 3]), Buffer.from([21])]);
+    transport.destroy();
+  });
+
   it("keeps send pending until socket backpressure drains and bounds queued payloads", async () => {
     const socket = new ControlledDuplex(true);
     const transport = SshSocketTransport.fromSocket(socket as never, {

@@ -21,6 +21,9 @@ func InterfaceAlias(uint64) (string, error) { return "", ErrUnsupportedPlatform 
 // InterfaceIndex is unavailable off Windows.
 func InterfaceIndex(uint64) (uint32, error) { return 0, ErrUnsupportedPlatform }
 
+// InterfaceLUID is unavailable off Windows.
+func InterfaceLUID(uint32) (uint64, error) { return 0, ErrUnsupportedPlatform }
+
 // BestInterfaceIndex is unavailable off Windows.
 func BestInterfaceIndex(netip.Addr) (uint32, error) { return 0, ErrUnsupportedPlatform }
 

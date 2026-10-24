@@ -29,6 +29,7 @@ var (
 	iphlpapi                        = windows.NewLazySystemDLL("iphlpapi.dll")
 	procGetBestRoute                = iphlpapi.NewProc("GetBestRoute")
 	procConvertInterfaceLuidToIndex = iphlpapi.NewProc("ConvertInterfaceLuidToIndex")
+	procConvertInterfaceIndexToLuid = iphlpapi.NewProc("ConvertInterfaceIndexToLuid")
 	procConvertInterfaceLuidToAlias = iphlpapi.NewProc("ConvertInterfaceLuidToAlias")
 )
 
@@ -130,9 +131,30 @@ func InterfaceIndex(luid uint64) (uint32, error) {
 	var index uint32
 	result, _, _ := procConvertInterfaceLuidToIndex.Call(uintptr(unsafe.Pointer(&luid)), uintptr(unsafe.Pointer(&index)))
 	if result != 0 {
-		return 0, fmt.Errorf("ConvertInterfaceLuidToIndex: %w", syscall.Errno(result))
+		return 0, fmt.Errorf("ConvertInterfaceLuidToIndex: %w", interfaceLookupError(syscall.Errno(result)))
 	}
 	return index, nil
+}
+
+// InterfaceLUID converts an interface index to the LUID that identifies the
+// interface for as long as it exists. Indices are reused; LUIDs are not handed
+// to another interface while this one is present.
+func InterfaceLUID(index uint32) (uint64, error) {
+	var luid uint64
+	result, _, _ := procConvertInterfaceIndexToLuid.Call(uintptr(index), uintptr(unsafe.Pointer(&luid)))
+	if result != 0 {
+		return 0, fmt.Errorf("ConvertInterfaceIndexToLuid(%d): %w", index, interfaceLookupError(syscall.Errno(result)))
+	}
+	return luid, nil
+}
+
+// interfaceLookupError tells "there is no such interface" apart from a lookup
+// that failed: the first means whatever was configured on it is gone with it.
+func interfaceLookupError(errno syscall.Errno) error {
+	if errno == windows.ERROR_FILE_NOT_FOUND || errno == windows.ERROR_NOT_FOUND {
+		return fmt.Errorf("%w: %w", ErrInterfaceNotFound, errno)
+	}
+	return errno
 }
 
 // InterfaceAlias converts an adapter LUID to the friendly name shown in

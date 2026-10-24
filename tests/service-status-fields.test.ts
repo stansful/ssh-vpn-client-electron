@@ -8,12 +8,14 @@ import { MemoryDirectTcpIpChannel } from "../src/core/network/memory-direct-chan
 import type { DirectTcpIpChannel } from "../src/core/network/local-tcp-proxy.js";
 import type { WindowsSystemProxyManager } from "../src/core/network/windows-system-proxy.js";
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../src/core/ssh/live-client.js";
+import { loadPrivateKey } from "../src/core/ssh/private-key.js";
 import type { DataplaneController } from "../src/service/native-dataplane.js";
 import { InProcessServiceBridge } from "../src/service/in-process-service.js";
 import { formatServiceTarget, LiveSshServiceBridge } from "../src/service/live-ssh-service.js";
 import { XrayServiceBridge } from "../src/service/xray-service.js";
 import type { ServiceEvent } from "../src/shared/ipc.js";
 import type { ConnectRequest, ProxyConnectRequest, RuntimeStatus } from "../src/shared/types.js";
+import { SSH_KEY_FIXTURES } from "./ssh-key-fixtures.js";
 
 const HOST_KEY = "SHA256:Qm3fV9kLr2T8xWb4NcJ7yPd1sHg6ZaE0uQoKiM5vRtY";
 
@@ -95,6 +97,40 @@ describe("live SSH status fields", () => {
     expect(typeof result.latencyMs).toBe("number");
     expect(result.note).toBeUndefined();
     await service.dispose();
+  });
+});
+
+describe("live SSH key-load failures in Activity", () => {
+  it("keeps the reason a key could not be loaded readable instead of masking it as a secret", async () => {
+    const loadMessage = (privateKey: string, passphrase?: string): string => {
+      try {
+        loadPrivateKey(privateKey, passphrase);
+      } catch (error) {
+        return (error as Error).message;
+      }
+      throw new Error("the key loaded");
+    };
+    for (const reason of [
+      loadMessage(SSH_KEY_FIXTURES.ed25519Aes256Cbc.privateKey, "wrong horse"),
+      loadMessage(SSH_KEY_FIXTURES.ed25519Aes256Cbc.privateKey)
+    ]) {
+      const message = `SSH authentication failed: ${reason}`;
+      vi.spyOn(SshLiveClient, "connect").mockRejectedValue(new SshAuthenticationError(message, []));
+      mockProxy();
+      const { service } = createSshService();
+      const diagnostics: string[] = [];
+      service.onEvent((event: ServiceEvent) => {
+        if (event.type === "diagnostics-appended") {
+          diagnostics.push(event.entry.message);
+        }
+      });
+      await service.connect(sshRequest("Frankfurt-01", "frankfurt.example.com"));
+
+      expect(diagnostics).toContain(message);
+      expect(diagnostics.join("\n")).not.toContain("<redacted>");
+      await service.dispose();
+      vi.restoreAllMocks();
+    }
   });
 });
 

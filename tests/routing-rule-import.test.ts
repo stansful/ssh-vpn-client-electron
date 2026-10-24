@@ -48,6 +48,19 @@ describe("parseRuleImport", () => {
     expect(preview.skipped).toEqual({ unsupported: 3, unsupportedTypes: ["url", "regex"], invalid: 1, duplicates: 1, malformed: 2, total: 7 });
   });
 
+  it("rewrites a leading-zero prefix an earlier version exported instead of dropping the rule", () => {
+    // 2.6.1 saved "91.108.4.0/022" as typed; storage and IPC rewrite it, and
+    // so does an import of that version's backup.
+    const preview = parse([
+      { type: "ip", value: "91.108.4.0/022" },
+      { type: "ip", value: "2001:DB8::/032" },
+      { type: "ip", value: "10.0.0.0/08" },
+      { type: "ip", value: "10.0.0.0/8" }
+    ]);
+    expect(preview.rules.map((rule) => rule.value)).toEqual(["91.108.4.0/22", "2001:db8::/32", "10.0.0.0/8"]);
+    expect(preview.skipped).toMatchObject({ invalid: 0, duplicates: 1, total: 1 });
+  });
+
   it("gives repeated ids a fresh one", () => {
     const preview = parse([
       { id: "same", type: "domain", value: "a.com" },

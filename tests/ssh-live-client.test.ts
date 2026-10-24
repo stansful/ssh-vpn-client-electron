@@ -16,7 +16,8 @@ import {
   SSH_MSG_CHANNEL_DATA,
   SSH_MSG_CHANNEL_EXTENDED_DATA,
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
-  SSH_MSG_CHANNEL_SUCCESS
+  SSH_MSG_CHANNEL_SUCCESS,
+  SSH_MSG_CHANNEL_WINDOW_ADJUST
 } from "../src/core/ssh/connection-messages.js";
 import { SSH_MSG_CHANNEL_OPEN, SSH_MSG_CHANNEL_REQUEST } from "../src/core/ssh/channel-messages.js";
 import {
@@ -72,6 +73,66 @@ describe("SSH live client rekey coordination", () => {
     clientKex.resolve();
     await Promise.all([rekey, clientQueuedWrite]);
     expect(transport.payloads).toEqual([Buffer.from([94, 1]), Buffer.from([94, 2])]);
+  });
+
+  it("keeps dispatching channel data during a client rekey and holds every reply until it ends", async () => {
+    const transport = new FakeTransport();
+    const client = createTestClient(transport);
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    transport.onSend = (payload) => {
+      if (payload[0] === SSH_MSG_CHANNEL_OPEN) {
+        transport.emitPayload(
+          new SshBinaryWriter().byte(SSH_MSG_CHANNEL_OPEN_CONFIRMATION).uint32(0).uint32(9).uint32(1024 * 1024).uint32(64 * 1024).toBuffer()
+        );
+      }
+    };
+    const channel = await client.openDirectTcpIpChannel({ host: "example.com", port: 443 }, { address: "127.0.0.1", port: 50000 });
+    let receivedBytes = 0;
+    channel.onData((data) => {
+      receivedBytes += data.length;
+      void channel.acknowledgeData?.(data.length);
+    });
+    await nextTurn();
+
+    const finishRekey = deferred<void>();
+    internals.performKex = () => finishRekey.promise;
+    const rekey = client.rekey();
+    // Data the server sent before it saw our KEXINIT: more packets than the
+    // old rekey queue held (2048), and enough bytes to owe a window adjust.
+    const chunk = Buffer.alloc(4096, 7);
+    for (let index = 0; index < 3000; index += 1) {
+      transport.emitPayload(new SshBinaryWriter().byte(SSH_MSG_CHANNEL_DATA).uint32(0).string(chunk).toBuffer());
+    }
+    const serverKexInit = Buffer.from([20, 1, 2, 3]);
+    transport.emitPayload(serverKexInit);
+    await nextTurn();
+
+    expect(receivedBytes).toBe(3000 * chunk.length);
+    expect(transport.destroyed).toBe(false);
+    expect(windowAdjusts(transport)).toHaveLength(0);
+    // Key-exchange messages still wait in the queue for the key exchange.
+    await expect(internals.waitForPayload((payload) => payload[0] === 20, 10)).resolves.toEqual(serverKexInit);
+
+    finishRekey.resolve();
+    await rekey;
+    await nextTurn();
+    expect(windowAdjusts(transport)).toHaveLength(1);
+  });
+
+  it("bounds what may queue for a rekey to key-exchange messages", () => {
+    const client = createTestClient(new FakeTransport());
+    const internals = client as unknown as LiveClientInternals;
+    internals.runtimeDispatchEnabled = true;
+    forceAuthenticated(internals.session);
+    internals.performKex = () => new Promise<void>(() => undefined);
+    void client.rekey();
+
+    for (let index = 0; index < 64; index += 1) {
+      internals.handleRuntimePayload(Buffer.from([31]));
+    }
+    expect(() => internals.handleRuntimePayload(Buffer.from([31]))).toThrow("queued payload limit exceeded");
   });
 
   it("bounds the unauthenticated payload queue", () => {
@@ -775,6 +836,10 @@ describe("SSH live client liveness", () => {
 
 function keepalives(transport: FakeTransport): Buffer[] {
   return transport.payloads.filter((payload) => payload[0] === SSH_MSG_GLOBAL_REQUEST);
+}
+
+function windowAdjusts(transport: FakeTransport): Buffer[] {
+  return transport.payloads.filter((payload) => payload[0] === SSH_MSG_CHANNEL_WINDOW_ADJUST);
 }
 
 interface LiveClientInternals {

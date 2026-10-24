@@ -1,9 +1,13 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   assessRendererIpcTrust,
+  isRendererPermissionAllowed,
+  isRendererPermissionCheckAllowed,
   RendererNavigationPolicy,
   isTrustedRendererUrl
 } from "../src/main/app/renderer-security.js";
+import { productionContentSecurityPolicy } from "../vite.config.js";
 
 describe("renderer navigation security", () => {
   it("allows the selected renderer URL and harmless hash changes", () => {
@@ -153,5 +157,101 @@ describe("renderer navigation security", () => {
         platform: "win32"
       })
     ).toEqual({ trusted: false, reason: "frame-owner-mismatch" });
+  });
+});
+
+describe("renderer web permissions", () => {
+  const trustedUrl = "file:///opt/shadow/resources/app.asar/dist/renderer/index.html";
+  const allowed = (permission: string, overrides: Partial<Parameters<typeof isRendererPermissionAllowed>[0]> = {}): boolean =>
+    isRendererPermissionAllowed({ permission, fromApplicationWindow: true, requestingUrl: trustedUrl, trustedUrl, ...overrides });
+
+  it("lets the app's own window save an exported rules file", () => {
+    expect(allowed("fileSystem")).toBe(true);
+    expect(allowed("fileSystem", { requestingUrl: `${trustedUrl}#routing` })).toBe(true);
+  });
+
+  it("denies everything the renderer does not use", () => {
+    for (const permission of [
+      "media",
+      "geolocation",
+      "notifications",
+      "clipboard-read",
+      "clipboard-sanitized-write",
+      "display-capture",
+      "fullscreen",
+      "openExternal",
+      "pointerLock",
+      "keyboardLock",
+      "midiSysex",
+      "hid",
+      "serial",
+      "usb",
+      "unknown"
+    ]) {
+      expect(allowed(permission), permission).toBe(false);
+    }
+  });
+
+  it("lets Electron confirm the save picker's grant, which it checks with no window and only the origin", () => {
+    // The exact shape Electron uses for a File System Access grant's status:
+    // no WebContents, the origin as a URL, no requesting URL. Refusing it made
+    // the write after the picker fail, with the chosen file already emptied.
+    const check = (overrides: Partial<Parameters<typeof isRendererPermissionCheckAllowed>[0]> = {}): boolean =>
+      isRendererPermissionCheckAllowed({
+        permission: "fileSystem",
+        hasWebContents: false,
+        fromApplicationWindow: false,
+        requestingOrigin: "file:///",
+        requestingUrl: "",
+        filePath: "/Users/me/Documents/shadow-rules.json",
+        trustedUrl,
+        ...overrides
+      });
+    expect(check()).toBe(true);
+    // An unpackaged run serves the renderer from the dev server.
+    expect(check({ requestingOrigin: "http://localhost:5173/", trustedUrl: "http://localhost:5173/" })).toBe(true);
+
+    expect(check({ requestingOrigin: "https://example.com/" })).toBe(false);
+    expect(check({ requestingOrigin: "http://localhost:5174/", trustedUrl: "http://localhost:5173/" })).toBe(false);
+    expect(check({ filePath: undefined })).toBe(false);
+    expect(check({ permission: "media" })).toBe(false);
+    // With a WebContents the window is required, as for a request.
+    expect(check({ hasWebContents: true, requestingUrl: trustedUrl })).toBe(false);
+    expect(check({ hasWebContents: true, fromApplicationWindow: true, requestingUrl: trustedUrl })).toBe(true);
+  });
+
+  it("denies even file access to anything but the trusted window and page", () => {
+    expect(allowed("fileSystem", { fromApplicationWindow: false })).toBe(false);
+    expect(allowed("fileSystem", { requestingUrl: "https://example.com/" })).toBe(false);
+    expect(allowed("fileSystem", { requestingUrl: "file:///opt/shadow/resources/app.asar/dist/renderer/other.html" })).toBe(false);
+    expect(allowed("fileSystem", { requestingUrl: "" })).toBe(false);
+  });
+});
+
+describe("renderer content security policy", () => {
+  const source = readFileSync("index.html", "utf8");
+
+  it("forbids base and form targets and plugins in every build", () => {
+    expect(source).toContain("base-uri 'none'");
+    expect(source).toContain("form-action 'none'");
+    expect(source).toContain("object-src 'none'");
+  });
+
+  it("ships without the dev-server origins", () => {
+    expect(source).toContain("ws://127.0.0.1:5173");
+    const built = productionContentSecurityPolicy(source);
+    expect(built).not.toContain("127.0.0.1:5173");
+    expect(built).toContain("connect-src 'self';");
+    expect(built).toContain("script-src 'self';");
+    expect(built).toContain("base-uri 'none'");
+  });
+
+  it("fails the build rather than ship a policy it could not clean", () => {
+    expect(() => productionContentSecurityPolicy("<html><head></head></html>")).toThrow(/Content-Security-Policy/u);
+    expect(() =>
+      productionContentSecurityPolicy(
+        '<meta http-equiv="Content-Security-Policy" content="connect-src \'self\' http://127.0.0.1:5173/hmr" />'
+      )
+    ).toThrow(/dev server/u);
   });
 });

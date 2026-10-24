@@ -34,6 +34,7 @@ vi.mock("node:net", () => ({
 }));
 
 const {
+  isLocalTcpPortAvailable,
   parseXrayVersion,
   reserveDistinctLocalTcpPorts,
   terminateProcess,
@@ -58,6 +59,114 @@ describe("Xray process startup utilities", () => {
       { host: "127.0.0.1", port: 30001 }
     ]);
     expect(reserve).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the ports Xray had last time while they are free", async () => {
+    const reserve = vi.fn();
+    const isPortAvailable = vi.fn(async () => true);
+
+    await expect(reserveDistinctLocalTcpPorts(2, reserve, {
+      preferredPorts: [40000, 40001],
+      isPortAvailable
+    })).resolves.toEqual([
+      { host: "127.0.0.1", port: 40000 },
+      { host: "127.0.0.1", port: 40001 }
+    ]);
+    expect(reserve).not.toHaveBeenCalled();
+  });
+
+  it("replaces only a busy preferred port, and keeps each port in its own slot", async () => {
+    const reserve = vi.fn().mockResolvedValue({ host: "127.0.0.1", port: 30000 });
+    const isPortAvailable = vi.fn(async (port: number) => port !== 40000);
+
+    // SOCKS stays SOCKS: the HTTP port must not slide into the first slot.
+    await expect(reserveDistinctLocalTcpPorts(2, reserve, {
+      preferredPorts: [40000, 40001],
+      isPortAvailable
+    })).resolves.toEqual([
+      { host: "127.0.0.1", port: 30000 },
+      { host: "127.0.0.1", port: 40001 }
+    ]);
+    expect(reserve).toHaveBeenCalledTimes(1);
+  });
+
+  it("never hands out an avoided port, preferred or ephemeral", async () => {
+    const reserve = vi.fn()
+      .mockResolvedValueOnce({ host: "127.0.0.1", port: 50817 })
+      .mockResolvedValueOnce({ host: "127.0.0.1", port: 40001 })
+      .mockResolvedValueOnce({ host: "127.0.0.1", port: 30000 });
+    const isPortAvailable = vi.fn(async () => true);
+
+    await expect(reserveDistinctLocalTcpPorts(2, reserve, {
+      preferredPorts: [50817, 40001],
+      avoidPorts: [50817, undefined],
+      isPortAvailable
+    })).resolves.toEqual([
+      { host: "127.0.0.1", port: 30000 },
+      { host: "127.0.0.1", port: 40001 }
+    ]);
+    expect(isPortAvailable).not.toHaveBeenCalledWith(50817);
+  });
+
+  it("gives a repeated or out-of-range preferred port an ephemeral one instead", async () => {
+    const reserve = vi.fn()
+      .mockResolvedValueOnce({ host: "127.0.0.1", port: 30000 })
+      .mockResolvedValueOnce({ host: "127.0.0.1", port: 30001 })
+      .mockResolvedValueOnce({ host: "127.0.0.1", port: 30002 });
+    const isPortAvailable = vi.fn(async () => true);
+
+    await expect(reserveDistinctLocalTcpPorts(2, reserve, {
+      preferredPorts: [40000, 40000],
+      isPortAvailable
+    })).resolves.toEqual([
+      { host: "127.0.0.1", port: 40000 },
+      { host: "127.0.0.1", port: 30000 }
+    ]);
+    await expect(reserveDistinctLocalTcpPorts(2, reserve, {
+      preferredPorts: [0, 70_000],
+      isPortAvailable
+    })).resolves.toEqual([
+      { host: "127.0.0.1", port: 30001 },
+      { host: "127.0.0.1", port: 30002 }
+    ]);
+    expect(isPortAvailable).toHaveBeenCalledTimes(1);
+  });
+
+  it("still gives up after a bounded number of attempts", async () => {
+    const reserve = vi.fn(async () => ({ host: "127.0.0.1", port: 50817 }));
+
+    await expect(reserveDistinctLocalTcpPorts(2, reserve, { avoidPorts: [50817] }))
+      .rejects.toThrow("Unable to reserve 2 distinct local TCP ports for Xray.");
+    expect(reserve).toHaveBeenCalledTimes(32);
+  });
+
+  it("checks a port by binding it on loopback, and reports a failed bind as busy", async () => {
+    const listen = vi.fn();
+    network.createServer.mockImplementation(() => {
+      const handlers = new Map<string, (error: Error) => void>();
+      const server = {
+        once: (event: string, handler: (error: Error) => void) => {
+          handlers.set(event, handler);
+          return server;
+        },
+        listen: (options: { port: number }, onListening: () => void) => {
+          listen(options);
+          if (options.port === 40000) {
+            handlers.get("error")?.(new Error("listen EADDRINUSE"));
+          } else {
+            onListening();
+          }
+          return server;
+        },
+        close: (onClosed: () => void) => onClosed()
+      };
+      return server;
+    });
+
+    await expect(isLocalTcpPortAvailable(40001)).resolves.toBe(true);
+    await expect(isLocalTcpPortAvailable(40000)).resolves.toBe(false);
+    expect(listen).toHaveBeenCalledWith({ port: 40001, host: "127.0.0.1", exclusive: true });
+    network.createServer.mockReset();
   });
 
   it("resolves only after every requested listener accepts connections", async () => {

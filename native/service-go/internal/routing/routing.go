@@ -58,7 +58,9 @@ type Matcher struct {
 	domains   []compiledDomainRule
 	ips       []compiledIPRule
 	processes []compiledProcessRule
-	invalid   int
+	// invalid are the enabled rules that could not be compiled. Each is left
+	// out on its own; the rest of the revision still applies.
+	invalid []Rule
 }
 
 type compiledDomainRule struct {
@@ -88,7 +90,7 @@ func NewMatcher(mode Mode, rules []Rule) Matcher {
 		switch rule.Type {
 		case RuleDomain:
 			if !validDomainPattern(normalized) {
-				matcher.invalid++
+				matcher.invalid = append(matcher.invalid, rule)
 				continue
 			}
 			matcher.domains = append(matcher.domains, compiledDomainRule{
@@ -99,21 +101,29 @@ func NewMatcher(mode Mode, rules []Rule) Matcher {
 		case RuleIP:
 			prefix, ok := parseIPPrefix(normalized)
 			if !ok {
-				matcher.invalid++
+				matcher.invalid = append(matcher.invalid, rule)
 				continue
 			}
 			matcher.ips = append(matcher.ips, compiledIPRule{id: rule.ID, prefix: prefix})
 		case RuleProcessName:
 			if !validProcessName(normalized) {
-				matcher.invalid++
+				matcher.invalid = append(matcher.invalid, rule)
 				continue
 			}
 			matcher.processes = append(matcher.processes, compiledProcessRule{id: rule.ID, name: normalized})
 		default:
-			matcher.invalid++
+			matcher.invalid = append(matcher.invalid, rule)
 		}
 	}
 	return matcher
+}
+
+// InvalidRules returns the enabled rules this matcher left out because they
+// could not be compiled: a malformed domain, address or process name, or a
+// rule type this build does not know. One such rule never disables the
+// others; whether what remains is enough to route by is the caller's call.
+func (m Matcher) InvalidRules() []Rule {
+	return append([]Rule(nil), m.invalid...)
 }
 
 func validDomainPattern(value string) bool {
@@ -213,7 +223,7 @@ func (m Matcher) Summary() Summary {
 		DomainRules:  len(m.domains),
 		IPRules:      len(m.ips),
 		ProcessRules: len(m.processes),
-		InvalidRules: m.invalid,
+		InvalidRules: len(m.invalid),
 	}
 }
 

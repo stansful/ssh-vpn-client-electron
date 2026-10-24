@@ -6,8 +6,8 @@ import { summarizeRouting } from "./connect-target.js";
 
 /** Routing at a glance: the mode, what goes through, and the way to Routing. */
 export function RoutingCard(): JSX.Element {
-  const { store, navigate } = useAppData();
-  const summary = useMemo(() => summarizeRouting(store), [store]);
+  const { store, navigate, environment } = useAppData();
+  const summary = useMemo(() => summarizeRouting(store, environment.platform), [store, environment.platform]);
 
   return (
     <Card rise={2} aria-label="Routing">

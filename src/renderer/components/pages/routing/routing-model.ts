@@ -157,6 +157,32 @@ export function tabCopy(tab: RoutingTab, platform: DesktopPlatform): TabCopy {
   };
 }
 
+/** `requestAnimationFrame` and its cancel, passed in so the intent handling is testable. */
+export interface FrameScheduler {
+  request: (callback: () => void) => number;
+  cancel: (frame: number) => void;
+}
+
+/**
+ * Acts on a "routing-tab" intent: the tab switches now, the scroll to the
+ * rules card waits a frame (the page itself just scrolled to the top), and
+ * the intent is cleared only after it. Clearing it first re-renders the page,
+ * and the effect cleanup cancels the frame before the scroll runs.
+ * Returns that cleanup.
+ */
+export function followRoutingTabIntent(
+  tab: RoutingTab,
+  steps: { setTab: (tab: RoutingTab) => void; scroll: () => void; clearIntent: () => void },
+  frames: FrameScheduler
+): () => void {
+  steps.setTab(tab);
+  const frame = frames.request(() => {
+    steps.scroll();
+    steps.clearIntent();
+  });
+  return () => frames.cancel(frame);
+}
+
 /* ---------- Targets ---------- */
 
 export interface RoutingTargets {
@@ -210,6 +236,14 @@ export interface PendingRoutingChanges {
   proxyListTurningOff: boolean;
 }
 
+function settledRules(rules: readonly RoutingRule[], pending: PendingRoutingChanges): RoutingRule[] {
+  return rules.filter((rule) => !pending.deletingRuleIds.has(rule.id));
+}
+
+function settledProxyList(proxyList: RoutingProxyList, pending: PendingRoutingChanges): RoutingProxyList {
+  return pending.proxyListTurningOff ? { ...proxyList, enabled: false } : proxyList;
+}
+
 /**
  * `wouldCutLastTarget` with the pending changes counted as done, so two quick
  * changes can't each pass the guard and together leave nothing to route.
@@ -221,14 +255,23 @@ export function cutsLastTargetWithPending(
   next: { rules: readonly RoutingRule[]; proxyList?: RoutingProxyList },
   pending: PendingRoutingChanges
 ): boolean {
-  const settled = (rules: readonly RoutingRule[]): RoutingRule[] => rules.filter((rule) => !pending.deletingRuleIds.has(rule.id));
-  const proxyList = pending.proxyListTurningOff ? { ...current.proxyList, enabled: false } : current.proxyList;
+  const proxyList = settledProxyList(current.proxyList, pending);
   return wouldCutLastTarget(
     mode,
     live,
-    countTargets(settled(current.rules), proxyList),
-    countTargets(settled(next.rules), next.proxyList ?? proxyList)
+    countTargets(settledRules(current.rules, pending), proxyList),
+    countTargets(settledRules(next.rules, pending), next.proxyList ?? proxyList)
   );
+}
+
+/**
+ * Switching to Split tunnel needs the "nothing to send yet" dialog first: the
+ * targets it would have, with pending deletes and a list turning off counted
+ * as done, add up to none. Otherwise a live session would be switched without
+ * the dialog and main would end it.
+ */
+export function splitNeedsGuard(rules: readonly RoutingRule[], proxyList: RoutingProxyList, pending: PendingRoutingChanges): boolean {
+  return countTargets(settledRules(rules, pending), settledProxyList(proxyList, pending)).total === 0;
 }
 
 export interface SummaryCopy {
@@ -314,8 +357,10 @@ function validateDomainDraft(raw: string): DraftResult {
   if (!value) {
     return { error: "Enter a domain, like youtube.com." };
   }
-  if (value.length > 253) {
-    return { error: "Domain is too long. Use 253 characters or fewer." };
+  // Before the path and port checks: an IPv6 address ends in ":<digits>" and a range has a slash.
+  const [address = "", ...prefix] = value.replace(/^\[(.+)\]$/u, "$1").split("/");
+  if (prefix.length <= 1 && (isValidIpv4(address) || isValidIpv6(address))) {
+    return { error: prefix.length === 0 ? "That’s an IP address. Add it on the IPs tab." : "That’s an IP range. Add it on the IPs tab." };
   }
   if (value.includes("://") || value.includes("/")) {
     return { error: "Enter just the domain, without https:// or a path." };
@@ -323,15 +368,16 @@ function validateDomainDraft(raw: string): DraftResult {
   if (/:\d*$/u.test(value)) {
     return { error: "Enter just the domain, without a port." };
   }
-  if (isValidIpv4(value) || isValidIpv6(value)) {
-    return { error: "That’s an IP address. Add it on the IPs tab." };
-  }
   if (value.startsWith(".")) {
     return { error: "Leave out the leading dot: youtube.com already covers its subdomains." };
   }
   // A trailing dot is the fully qualified form of the same name.
   value = value.replace(/\.$/u, "");
   const body = value.startsWith("*.") ? value.slice(2) : value;
+  // The limit applies to the name itself, as in the shared validator and the Go dataplane.
+  if (body.length > 253) {
+    return { error: "Domain is too long. Use 253 characters or fewer." };
+  }
   if (body.includes("*")) {
     return { error: "A * works only at the start, as in *.youtube.com." };
   }
@@ -370,6 +416,9 @@ function validateIpDraft(raw: string): DraftResult {
     const prefix = parts[1] ?? "";
     if (!/^\d+$/u.test(prefix)) {
       return { error: "CIDR prefix must be a number." };
+    }
+    if (prefix.length > 1 && prefix.startsWith("0")) {
+      return { error: `Write the CIDR prefix without leading zeros, like /${Number(prefix)}.` };
     }
     const max = v4 ? 32 : 128;
     if (Number(prefix) > max) {

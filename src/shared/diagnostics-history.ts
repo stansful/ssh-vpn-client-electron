@@ -16,7 +16,7 @@ const byteLengthCache = new WeakMap<readonly DiagnosticsEntry[], number>();
  * come from a transport, but the user looks for them under Routing.
  */
 const ROUTING_DIAGNOSTIC_PATTERN =
-  /^(TUN |Routing |Selected[ -](rules|routing|process-name) |Process-name |Per-process enforcement |Local routing proxy |Further local routing |Proxy-all TCP routing |Windows proxy |Reconnect through the protected address |The tunnel has been down for )/u;
+  /^(TUN |Routing |Selected[ -](rules|routing|process-name) |Process-name |Per-process enforcement |Local routing proxy |Further local routing |Proxy-all TCP routing |Windows proxy |Reconnect through the protected address |The tunnel has been down for |Another program took Xray's local port )/u;
 
 /** Bounds untrusted/native diagnostic fields before logging, IPC and retention. */
 export function normalizeDiagnosticEntry(

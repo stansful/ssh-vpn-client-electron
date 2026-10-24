@@ -58,10 +58,49 @@ describe("build assets", () => {
     expect(plan.stdout).toContain(`shadow-ssh-${packageJson.version}-linux-package-amd64.deb`);
   });
 
-  it("uses Electron's required .mjs extension for the ESM preload bridge", () => {
-    expect(existsSync("src/preload/preload.mts")).toBe(true);
+  // The app may run elevated (TUN), so a packaged build must not be turned
+  // into a Node interpreter or debugger by environment variables or flags.
+  it("turns off the Electron fuses that would let the packaged app run as Node or a debugger", () => {
+    expect(packageJson.build.electronFuses).toEqual({
+      runAsNode: false,
+      enableNodeOptionsEnvironmentVariable: false,
+      enableNodeCliInspectArguments: false,
+      onlyLoadAppFromAsar: true,
+      enableEmbeddedAsarIntegrityValidation: true,
+      // The afterPack hook re-signs only Electron Framework (tests/mac-fuses.test.ts).
+      resetAdHocDarwinSignature: false
+    });
+    // onlyLoadAppFromAsar needs the app packed into app.asar.
+    expect("asar" in packageJson.build).toBe(false);
+  });
+
+  it("runs tests, lint and the Go checks before a release is built", () => {
+    const workflow = readFileSync(".github/workflows/release.yml", "utf8");
+    const quality = workflow.slice(workflow.indexOf("\n  quality:"), workflow.indexOf("\n  build:"));
+
+    for (const step of [
+      "npm run typecheck",
+      "npm run lint",
+      "npm test",
+      "go test ./...",
+      "GOOS=windows GOARCH=amd64 go build",
+      "GOOS=windows GOARCH=arm64 go build",
+      // go build skips _test.go files; vet also type-checks the Windows tests.
+      "GOOS=windows GOARCH=amd64 go vet ./...",
+      "GOOS=windows GOARCH=arm64 go vet ./..."
+    ]) {
+      expect(quality).toContain(step);
+    }
+    expect(quality).not.toContain("-race");
+    expect(workflow).toContain("needs: [check, quality]\n    if: needs.check.outputs.should_release == 'true'");
+    expect(workflow).toContain("needs: [check, quality, build]");
+  });
+
+  it("builds the preload bridge as the CommonJS script a sandboxed window needs", () => {
+    expect(existsSync("src/preload/preload.cts")).toBe(true);
+    expect(existsSync("src/preload/preload.mts")).toBe(false);
     expect(existsSync("src/preload/preload.ts")).toBe(false);
-    expect(readFileSync("src/main/main.ts", "utf8")).toContain('"preload.mjs"');
+    expect(readFileSync("src/main/main.ts", "utf8")).toContain('"preload.cjs"');
   });
 
   it("has Windows and Linux package icons", () => {

@@ -52,6 +52,25 @@ func TestMatcherRejectsMalformedSelectedTargets(t *testing.T) {
 	}
 }
 
+func TestMatcherSkipsAnInvalidRuleAndKeepsTheRest(t *testing.T) {
+	// A leading-zero prefix is refused by netip. It must cost that one rule,
+	// not the revision: the valid rules beside it still select.
+	matcher := NewMatcher(ModeSelectedRules, []Rule{
+		{ID: "zero", Type: RuleIP, Value: "10.0.0.0/08", Enabled: true},
+		{ID: "net", Type: RuleIP, Value: "203.0.113.0/24", Enabled: true},
+		{ID: "off", Type: RuleIP, Value: "also bad", Enabled: false},
+	})
+	assertDecision(t, matcher.Decide(Descriptor{DestinationIP: "203.0.113.9"}), true, "ip", "net")
+	assertDecision(t, matcher.Decide(Descriptor{DestinationIP: "10.1.2.3"}), false, "no-match", "")
+	invalid := matcher.InvalidRules()
+	if len(invalid) != 1 || invalid[0].ID != "zero" {
+		t.Fatalf("expected only the enabled malformed rule to be reported, got %+v", invalid)
+	}
+	if summary := matcher.Summary(); summary.EnabledRules != 1 || summary.InvalidRules != 1 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+}
+
 func TestValidProxyDomainAcceptsSuffixesAndRejectsMalformedValues(t *testing.T) {
 	for _, value := range []string{".ru", "example.com", "*.example.com"} {
 		if !ValidProxyDomain(value) {

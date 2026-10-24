@@ -15,6 +15,7 @@ import {
   MAX_SERVICE_MESSAGE_ID_LENGTH,
   requestTimeoutMs,
   SERVICE_CONNECT_TIMEOUT_MS,
+  SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS,
   SERVICE_DEFAULT_REQUEST_TIMEOUT_MS,
   SERVICE_LONG_REQUEST_TIMEOUT_MS,
   SERVICE_PROTOCOL_VERSION,
@@ -176,6 +177,39 @@ describe("local IPC protocol", () => {
     expect(requestTimeoutMs("get-capabilities")).toBe(SERVICE_CONNECT_TIMEOUT_MS);
     expect(requestTimeoutMs("connect")).toBe(SERVICE_LONG_REQUEST_TIMEOUT_MS);
     expect(requestTimeoutMs("disconnect")).toBe(SERVICE_DEFAULT_REQUEST_TIMEOUT_MS);
+  });
+
+  it("outlasts the helper's own dataplane budgets", () => {
+    // The helper allows 20 s per netsh call, two minutes for a rollback and
+    // three for a teardown. Giving up sooner abandons a start that then
+    // succeeds unseen, or a stop that is still undoing routes.
+    for (const command of ["start-dataplane", "stop-dataplane", "recover-routes"] as const) {
+      expect(requestTimeoutMs(command)).toBe(SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS);
+    }
+    expect(SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS).toBeGreaterThan(3 * 60_000);
+  });
+
+  it("knows the recover-routes command and the routeRecovery capability is optional", () => {
+    const encoded = encodeWireMessage({ id: "r1", type: "recover-routes", payload: { journalPath: "C:\\Data\\tun-routing-journal.json" } });
+    expect(decodeWireMessage(encoded.trim())).toMatchObject({ type: "recover-routes", payload: { journalPath: "C:\\Data\\tun-routing-journal.json" } });
+    const capabilities = {
+      target: { platform: "windows", arch: "x64", serviceExecutableName: "s.exe", serviceRelativePath: "s.exe", supportsPrivilegedService: true },
+      ipc: "stdio",
+      namedPipeAcl: false,
+      unixSocketMode: false,
+      serviceControlManager: false,
+      wfpInterception: true,
+      tunDevice: true,
+      routeManipulation: true,
+      processConnectionAttribution: true,
+      dnsVisibility: false,
+      ipv6RouteEnforcement: true,
+      udpForwarding: true,
+      sshCoreLinked: false
+    };
+    // Helpers built before the command leave the field out and stay compatible.
+    expect(isNativeServiceHandshake({ protocolVersion: 1, capabilities })).toBe(true);
+    expect(isNativeServiceHandshake({ protocolVersion: 1, capabilities: { ...capabilities, routeRecovery: true } })).toBe(true);
   });
 
   it("waits for stream backpressure before resolving", async () => {

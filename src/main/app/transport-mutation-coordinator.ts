@@ -1,5 +1,12 @@
 export interface TransportIntentOptions {
   expectedGeneration?: number;
+  /**
+   * Runs at once, outside the queue, when the intent is accepted: the part of
+   * it that must not wait behind the work ahead - telling a session that is
+   * being ended to stop waiting on a dial or a TUN start that work is stuck
+   * in. The operation itself still runs in turn.
+   */
+  preempt?: () => void;
 }
 
 /**
@@ -44,6 +51,11 @@ export class TransportMutationCoordinator {
     }
 
     const generation = ++this.currentGeneration;
+    try {
+      options.preempt?.();
+    } catch {
+      // Only a shortcut: the queued operation still does the work.
+    }
     return this.enqueue(async () => {
       if (!this.isCurrent(generation)) {
         return false;

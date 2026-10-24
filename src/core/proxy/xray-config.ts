@@ -1,4 +1,12 @@
-import type { ProxyProtocol, ProxySecurity, ProxyTransport } from "../../shared/types.js";
+import type { ProxyProtocol, ProxySecurity, ProxyTransport, RoutingRule } from "../../shared/types.js";
+import { normalizeRuleValue, validateRoutingRuleValue } from "../../shared/validation.js";
+import {
+  formatCidrRange,
+  isLocalDestinationHost,
+  LOCAL_DESTINATION_CIDRS,
+  overlapsLocalDestinationRange,
+  parseCidrRange
+} from "../routing/ip-address.js";
 import {
   HYSTERIA2_DEFAULT_HOP_INTERVAL,
   isHysteria2Scheme,
@@ -6,6 +14,7 @@ import {
   parseHysteriaBandwidth,
   type Hysteria2Congestion
 } from "./hysteria2-link.js";
+import { shareLinkHostToAscii, uriSecurityText, vmessSecurityText, vmessText } from "./share-link-fields.js";
 
 export interface XrayConfigInput extends XrayOutboundOptions {
   rawUri: string;
@@ -13,6 +22,31 @@ export interface XrayConfigInput extends XrayOutboundOptions {
   socksPort: number;
   httpHost?: string;
   httpPort?: number;
+  /**
+   * Keeps the local network out of the tunnel for what reaches the HTTP
+   * inbound - the one the Windows proxy points at, whose bypass list cannot
+   * name a private address - unless a user rule names it (`localRuleOverrides`).
+   * Only that inbound: the TUN adapter and the routing listener come in
+   * through the SOCKS one having applied the routing order already, and an
+   * app pointed at Xray by hand - all there is on macOS and Linux - asked
+   * for the tunnel.
+   */
+  localNetworkDirect?: boolean;
+  /** The user's rules for the local network, which win over its direct rule; see {@link xrayLocalRuleOverrides}. */
+  localRuleOverrides?: XrayLocalRuleOverrides;
+}
+
+/**
+ * The enabled user rules that name part of the local network, in Xray's
+ * syntax. Xray's routing keeps that network direct, but an explicit rule wins
+ * over it on every path (step 2 of the shared order, ahead of the local
+ * network), so these go to the tunnel first.
+ */
+export interface XrayLocalRuleOverrides {
+  /** IP rules that overlap a local range, as `network/prefix`. */
+  ip: string[];
+  /** Domain rules for `.local` names: `domain:` for a plain rule, a suffix `regexp:` for `*.`. */
+  domain: string[];
 }
 
 export interface XrayOutboundOptions {
@@ -24,29 +58,136 @@ export interface XrayOutboundOptions {
   xrayVersion?: string;
 }
 
+/** Panels write these as strings, numbers or booleans; every field is read through `vmessText`. */
 interface VmessPayload {
-  id?: string;
-  aid?: string | number;
-  scy?: string;
-  add?: string;
-  port?: string | number;
-  net?: string;
-  type?: string;
-  host?: string;
-  path?: string;
-  tls?: string;
-  sni?: string;
-  alpn?: string;
-  ps?: string;
-  mode?: string;
-  seed?: string;
-  headerType?: string;
+  id?: unknown;
+  aid?: unknown;
+  scy?: unknown;
+  add?: unknown;
+  port?: unknown;
+  net?: unknown;
+  type?: unknown;
+  host?: unknown;
+  path?: unknown;
+  tls?: unknown;
+  sni?: unknown;
+  alpn?: unknown;
+  fp?: unknown;
+  ps?: unknown;
+  mode?: unknown;
+  seed?: unknown;
+  headerType?: unknown;
+}
+
+/**
+ * Local and private destinations the Windows proxy hands to the HTTP inbound
+ * leave through a plain direct outbound, so LAN and intranet traffic (proxy-all
+ * on the static proxy, whose bypass list names no address range) is not
+ * carried to the remote server. The list is written out rather than taken
+ * from geoip, whose data files are not packaged. With the default AsIs
+ * strategy the IP rule matches literal addresses only, which is the rule
+ * every other routing path applies. The SOCKS inbound has no such rule: what
+ * the TUN adapter or the routing listener sends there was chosen by the
+ * routing order already - a private address a domain rule picked arrives as
+ * a bare address, and must stay in the tunnel - and an app pointed at it by
+ * hand asked for the tunnel.
+ *
+ * The user's own rules for that network come first (see
+ * {@link xrayLocalRuleOverrides}): what reaches Xray in split routing was
+ * already chosen upstream by the PAC, which lets an explicit rule win over
+ * the local network, and must not be sent direct here. Xray reads this only
+ * at start, so the service restarts it when that set of rules changes.
+ *
+ * An IP rule also selects a single-label or `.local` name by the address it
+ * resolves to, as the PAC and the SSH listener judge it. Xray then resolves
+ * such names, and only them (IPOnDemand, see buildRoutingRules): every other
+ * name is sent to the tunnel by a name rule ahead of any IP rule, so its
+ * lookup never goes to the local resolver.
+ */
+const PROXY_OUTBOUND_TAG = "proxy";
+const DIRECT_OUTBOUND_TAG = "direct";
+const HTTP_INBOUND_TAG = "http-in";
+/**
+ * Every name that is neither single-label nor under `.local`: its last label
+ * is anything but "local". RE2 has no lookahead, so the label is spelled out
+ * as "not five letters long, or different from `local` at some letter".
+ */
+const NOT_LOCAL_NAME_PATTERN =
+  "regexp:(?i)\\.(?:[^.]{1,4}|[^.]{6,}|[^l.][^.]{4}|l[^o.][^.]{3}|lo[^c.][^.]{2}|loc[^a.][^.]|loca[^l.])$";
+const LOCAL_DESTINATION_ROUTING_RULES = [
+  { type: "field", ip: [...LOCAL_DESTINATION_CIDRS], outboundTag: DIRECT_OUTBOUND_TAG },
+  // Names without a dot (localhost, intranet hosts) and mDNS .local names.
+  { type: "field", domain: ["regexp:^[^.]+$", "domain:local"], outboundTag: DIRECT_OUTBOUND_TAG }
+];
+
+/**
+ * The enabled, valid user rules that Xray's direct rule for the local network
+ * would otherwise override: IP rules overlapping a local range - `10.0.0.0/8`,
+ * or `0.0.0.0/0` - and domain rules for `.local` names. A domain rule always
+ * has a dot, so no single-label or `localhost` rule exists to carry over.
+ * Sorted and deduplicated, so equal rule sets give equal answers.
+ */
+export function xrayLocalRuleOverrides(rules: readonly RoutingRule[]): XrayLocalRuleOverrides {
+  const ip = new Set<string>();
+  const domain = new Set<string>();
+  for (const rule of rules) {
+    if (!rule.enabled || !validateRoutingRuleValue(rule.type, rule.value).ok) {
+      continue;
+    }
+    const value = normalizeRuleValue(rule.type, rule.value);
+    if (rule.type === "ip") {
+      const range = parseCidrRange(value);
+      if (range && overlapsLocalDestinationRange(value)) {
+        ip.add(formatCidrRange(range));
+      }
+    } else if (rule.type === "domain") {
+      const wildcard = value.startsWith("*.");
+      const name = wildcard ? value.slice(2) : value;
+      if (isLocalDestinationHost(name)) {
+        // Labels are letters, digits and hyphens, so the dots are all that needs escaping.
+        domain.add(wildcard ? `regexp:\\.${name.replaceAll(".", "\\.")}$` : `domain:${name}`);
+      }
+    }
+  }
+  return { ip: [...ip].sort(), domain: [...domain].sort() };
+}
+
+/**
+ * The HTTP inbound's rules. With IP rules for the local network, Xray
+ * resolves the names those rules may select (domainStrategy IPOnDemand, which
+ * looks a name up only when it reaches an IP rule), and the order keeps every
+ * other name from reaching one: the user's domain rules for local names come
+ * first, then every name that is not single-label or `.local` goes to the
+ * tunnel by name, as it does without these rules. Only then come the IP
+ * rules, for addresses and for the local names left.
+ */
+function buildRoutingRules(input: XrayConfigInput): Array<Record<string, unknown>> {
+  if (!input.localNetworkDirect || !input.httpHost || !input.httpPort) {
+    return [];
+  }
+  const overrides = input.localRuleOverrides;
+  return [
+    ...(overrides && overrides.domain.length > 0 ? [{ type: "field", domain: overrides.domain, outboundTag: PROXY_OUTBOUND_TAG }] : []),
+    ...(resolvesLocalNames(input)
+      ? [
+          { type: "field", domain: [NOT_LOCAL_NAME_PATTERN], outboundTag: PROXY_OUTBOUND_TAG },
+          { type: "field", ip: overrides?.ip, outboundTag: PROXY_OUTBOUND_TAG }
+        ]
+      : []),
+    ...LOCAL_DESTINATION_ROUTING_RULES
+  ].map((rule) => ({ ...rule, inboundTag: [HTTP_INBOUND_TAG] }));
+}
+
+/** Whether the HTTP inbound has IP rules for the local network, so Xray resolves local names (see buildRoutingRules). */
+function resolvesLocalNames(input: XrayConfigInput): boolean {
+  return Boolean(input.localNetworkDirect && input.httpHost && input.httpPort && input.localRuleOverrides && input.localRuleOverrides.ip.length > 0);
 }
 
 export function buildXrayConfig(input: XrayConfigInput): string {
   const outbound = buildOutbound(input.rawUri, { xrayVersion: input.xrayVersion });
-  // SOCKS/HTTP already supplies the destination and this client has a single
-  // outbound. Omitting Xray sniffing avoids redundant HTTP/TLS/QUIC DPI work.
+  // SOCKS/HTTP already supplies the destination, so Xray sniffing is omitted:
+  // it would only add HTTP/TLS/QUIC DPI work. The tunnel outbound stays first,
+  // which makes it the default for everything the routing rules do not match.
   return JSON.stringify({
     log: { loglevel: "warning" },
     inbounds: [
@@ -67,7 +208,7 @@ export function buildXrayConfig(input: XrayConfigInput): string {
       ...(input.httpHost && input.httpPort
         ? [
             {
-              tag: "http-in",
+              tag: HTTP_INBOUND_TAG,
               protocol: "http",
               listen: input.httpHost,
               port: input.httpPort,
@@ -76,7 +217,11 @@ export function buildXrayConfig(input: XrayConfigInput): string {
           ]
         : [])
     ],
-    outbounds: [outbound]
+    outbounds: [outbound, { tag: DIRECT_OUTBOUND_TAG, protocol: "freedom" }],
+    routing: {
+      domainStrategy: resolvesLocalNames(input) ? "IPOnDemand" : "AsIs",
+      rules: buildRoutingRules(input)
+    }
   });
 }
 
@@ -121,7 +266,7 @@ function buildHysteria2Outbound(rawUri: string, options: XrayOutboundOptions): R
 
   return {
     protocol: "hysteria",
-    tag: "proxy",
+    tag: PROXY_OUTBOUND_TAG,
     settings: { version: 2, address: link.host, port: link.port },
     streamSettings: stripUndefined({
       network: "hysteria",
@@ -129,7 +274,7 @@ function buildHysteria2Outbound(rawUri: string, options: XrayOutboundOptions): R
       hysteriaSettings: { version: 2, auth: link.auth },
       tlsSettings: stripUndefined({
         // Required: without it Xray's QUIC dialer sends the SNI "hysteria".
-        serverName: link.sni,
+        serverName: asciiServerName(link.sni),
         alpn: ["h3"],
         pinnedPeerCertSha256: link.pinnedCertSha256.length > 0 ? link.pinnedCertSha256.join(",") : undefined,
         verifyPeerCertByName: link.verifyPeerCertByName,
@@ -180,9 +325,12 @@ function isXrayAtLeast(xrayVersion: string | undefined, minimum: [number, number
 
 function buildUriOutbound(rawUri: string, protocol: Exclude<ProxyProtocol, "vmess" | "hysteria2">, options: XrayOutboundOptions): Record<string, unknown> {
   const url = new URL(rawUri);
-  const host = normalizeHost(url.hostname);
+  const host = shareLinkHostToAscii(url.hostname);
+  if (!host) {
+    throw new Error(`${protocol.toUpperCase()} URI must contain host and valid port.`);
+  }
   const port = Number(url.port);
-  const security = normalizeSecurity(url.searchParams.get("security") ?? (url.searchParams.get("tls") === "1" ? "tls" : "none"));
+  const security = normalizeSecurity(uriSecurityText(protocol, url.searchParams));
   const transport = normalizeTransport(url.searchParams.get("type") ?? url.searchParams.get("net") ?? "tcp");
   assertSupported(security, transport);
 
@@ -206,7 +354,7 @@ function buildUriOutbound(rawUri: string, protocol: Exclude<ProxyProtocol, "vmes
 
   return stripUndefined({
     protocol,
-    tag: "proxy",
+    tag: PROXY_OUTBOUND_TAG,
     settings: {
       vnext: protocol === "vless" ? [server] : undefined,
       servers: protocol === "trojan" ? [server] : undefined
@@ -216,16 +364,21 @@ function buildUriOutbound(rawUri: string, protocol: Exclude<ProxyProtocol, "vmes
 }
 
 function buildVmessOutbound(rawUri: string, options: XrayOutboundOptions): Record<string, unknown> {
-  const payload = JSON.parse(Buffer.from(normalizeBase64(rawUri.replace(/^vmess:\/\//iu, "").trim()), "base64").toString("utf8")) as VmessPayload;
-  const host = normalizeHost(String(payload.add ?? ""));
+  const parsed = JSON.parse(Buffer.from(normalizeBase64(rawUri.replace(/^vmess:\/\//iu, "").trim()), "base64").toString("utf8")) as unknown;
+  const payload: VmessPayload = isRecord(parsed) ? parsed : {};
+  const host = shareLinkHostToAscii(vmessText(payload.add) ?? "");
+  if (!host) {
+    throw new Error("VMess payload must contain add and valid port.");
+  }
   const port = Number(payload.port);
-  const security = normalizeSecurity(payload.tls || "none");
-  const transport = normalizeTransport(payload.net ?? "tcp");
+  const security = normalizeSecurity(vmessSecurityText(payload.tls));
+  const transport = normalizeTransport(vmessText(payload.net) ?? "tcp");
   assertSupported(security, transport);
+  const path = vmessText(payload.path);
 
   return stripUndefined({
     protocol: "vmess",
-    tag: "proxy",
+    tag: PROXY_OUTBOUND_TAG,
     settings: {
       vnext: [
         {
@@ -233,9 +386,9 @@ function buildVmessOutbound(rawUri: string, options: XrayOutboundOptions): Recor
           port,
           users: [
             {
-              id: payload.id,
+              id: vmessText(payload.id),
               alterId: Number(payload.aid ?? 0),
-              security: payload.scy ?? "auto"
+              security: vmessText(payload.scy) ?? "auto"
             }
           ]
         }
@@ -245,14 +398,15 @@ function buildVmessOutbound(rawUri: string, options: XrayOutboundOptions): Recor
       security,
       transport,
       serverHost: host,
-      host: payload.host,
-      path: payload.path,
-      type: payload.headerType ?? payload.type,
-      sni: payload.sni,
-      alpn: payload.alpn,
-      mode: payload.mode,
+      host: vmessText(payload.host),
+      path,
+      type: vmessText(payload.headerType) ?? vmessText(payload.type),
+      sni: vmessText(payload.sni),
+      alpn: vmessText(payload.alpn),
+      fingerprint: vmessText(payload.fp),
+      mode: vmessText(payload.mode),
       // v2rayN keeps an mKCP seed in "path".
-      seed: payload.seed ?? (transport === "mkcp" ? payload.path : undefined),
+      seed: vmessText(payload.seed) ?? (transport === "mkcp" ? path : undefined),
       xrayVersion: options.xrayVersion
     })
   });
@@ -275,8 +429,10 @@ function buildStreamSettings(
     type: url.searchParams.get("headerType") ?? url.searchParams.get("header") ?? undefined,
     serviceName: url.searchParams.get("serviceName") ?? undefined,
     sni: url.searchParams.get("sni") ?? url.searchParams.get("servername") ?? undefined,
+    alpn: url.searchParams.get("alpn") ?? undefined,
     publicKey: url.searchParams.get("pbk") ?? undefined,
     shortId: url.searchParams.get("sid") ?? undefined,
+    spiderX: url.searchParams.get("spx") ?? undefined,
     fingerprint: url.searchParams.get("fp") ?? undefined,
     mode: url.searchParams.get("mode") ?? undefined,
     seed: url.searchParams.get("seed") ?? undefined,
@@ -288,6 +444,27 @@ function buildStreamSettings(
     upMbps: url.searchParams.get("upMbps") ?? url.searchParams.get("up") ?? undefined,
     downMbps: url.searchParams.get("downMbps") ?? url.searchParams.get("down") ?? undefined
   });
+}
+
+/**
+ * The TLS server name as Xray must send it. A link may carry an
+ * internationalised `sni` (`sni=пример.рф`) as written; Go's TLS sends and
+ * verifies it as given, so it would match neither the certificate, which
+ * names the punycode form, nor the server's SNI routing. Punycode, as the
+ * dial address already is (shareLinkHostToAscii); an ASCII name is passed
+ * on as it is, and one that is not a usable host name too, for Xray to judge.
+ * The ws, httpupgrade and xhttp `host` need no such care: Go's HTTP stack
+ * converts the Host header itself.
+ */
+function asciiServerName(value: string | undefined): string | undefined {
+  const name = value?.trim();
+  if (!name) {
+    return undefined;
+  }
+  if (!/[\u{80}-\u{10ffff}]/u.test(name)) {
+    return name;
+  }
+  return shareLinkHostToAscii(name) ?? name;
 }
 
 function buildStreamSettingsFromParts(parts: {
@@ -304,6 +481,9 @@ function buildStreamSettingsFromParts(parts: {
   alpn?: string;
   publicKey?: string;
   shortId?: string;
+  /** REALITY `spx`: the path the client's spider starts from. */
+  spiderX?: string;
+  /** The uTLS ClientHello to imitate (`fp`), for TLS as well as REALITY. */
   fingerprint?: string;
   mode?: string;
   seed?: string;
@@ -325,21 +505,35 @@ function buildStreamSettingsFromParts(parts: {
       })
     : {};
   const mkcpMasks = parts.transport === "mkcp" ? buildMkcpMasks(parts) : [];
+  const fingerprint = parts.fingerprint?.trim() || undefined;
+  // v2rayN writes the gRPC mode as `mode` in links and as `type` in VMess JSON.
+  const grpcMultiMode = [parts.mode, parts.type].some((value) => value?.trim().toLowerCase() === "multi");
   return stripUndefined({
     network: xrayNetwork(parts.transport),
     security: parts.security === "none" ? undefined : parts.security,
     tlsSettings: parts.security === "tls"
       ? stripUndefined({
           // Xray's QUIC dialer sends the SNI "hysteria" unless one is set.
-          serverName: parts.sni?.trim() || (hysteria ? parts.serverHost : undefined),
-          alpn: parseCsv(parts.alpn)
+          serverName: asciiServerName(parts.sni) || (hysteria ? parts.serverHost : undefined),
+          alpn: parseCsv(parts.alpn),
+          // Without it Xray sends Go's own ClientHello, which DPI singles out.
+          // uTLS shapes a TCP handshake only, so QUIC transports go without.
+          fingerprint: hysteria || parts.transport === "mkcp" ? undefined : xrayTlsFingerprint(fingerprint)
         })
       : undefined,
     realitySettings: parts.security === "reality"
-      ? stripUndefined({ serverName: parts.sni, publicKey: parts.publicKey, shortId: parts.shortId, fingerprint: parts.fingerprint })
+      ? stripUndefined({
+          serverName: asciiServerName(parts.sni),
+          publicKey: parts.publicKey,
+          shortId: parts.shortId,
+          spiderX: parts.spiderX || undefined,
+          fingerprint
+        })
       : undefined,
     wsSettings: parts.transport === "ws" ? stripUndefined({ path: parts.path, headers: parts.host ? { Host: parts.host } : undefined }) : undefined,
-    grpcSettings: parts.transport === "grpc" ? stripUndefined({ serviceName: parts.serviceName ?? parts.path }) : undefined,
+    grpcSettings: parts.transport === "grpc"
+      ? stripUndefined({ serviceName: parts.serviceName ?? parts.path, multiMode: grpcMultiMode || undefined })
+      : undefined,
     tcpSettings: parts.transport === "tcp" && parts.type ? { header: { type: parts.type } } : undefined,
     xhttpSettings: parts.transport === "xhttp" ? stripUndefined({ host: parts.host, path: parts.path, mode: parts.mode }) : undefined,
     httpupgradeSettings: parts.transport === "httpupgrade" ? stripUndefined({ host: parts.host, path: parts.path }) : undefined,
@@ -476,10 +670,6 @@ function assertSupported(security: ProxySecurity, transport: ProxyTransport): vo
   }
 }
 
-function normalizeHost(value: string): string {
-  return value.trim().replace(/^\[/u, "").replace(/\]$/u, "").toLowerCase();
-}
-
 function normalizeTransport(value: string): ProxyTransport {
   const normalized = value.trim().toLowerCase();
   if (normalized === "raw") {
@@ -500,6 +690,91 @@ function normalizeTransport(value: string): ProxyTransport {
   return "unknown";
 }
 
+/**
+ * Every `fingerprint` the bundled Xray (26.3.27) accepts, compared without
+ * case: its presets, and the uTLS ids it maps by name. Anything else - a
+ * made-up `hello…` name, `hellocustom`, an id from a newer uTLS such as
+ * `hellochrome_133`, or `randomizedalpn` without its `hello` - makes it refuse
+ * the whole config. Checked against the binary with `xray run -test`.
+ */
+const XRAY_TLS_FINGERPRINTS = new Set([
+  "chrome",
+  "firefox",
+  "safari",
+  "ios",
+  "android",
+  "edge",
+  "360",
+  "qq",
+  "random",
+  "randomized",
+  "randomizednoalpn",
+  "unsafe",
+  "hellogolang",
+  "hellorandomized",
+  "hellorandomizedalpn",
+  "hellorandomizednoalpn",
+  "hellofirefox_auto",
+  "hellofirefox_55",
+  "hellofirefox_56",
+  "hellofirefox_63",
+  "hellofirefox_65",
+  "hellofirefox_99",
+  "hellofirefox_102",
+  "hellofirefox_105",
+  "hellofirefox_120",
+  "hellochrome_auto",
+  "hellochrome_58",
+  "hellochrome_62",
+  "hellochrome_70",
+  "hellochrome_72",
+  "hellochrome_83",
+  "hellochrome_87",
+  "hellochrome_96",
+  "hellochrome_100",
+  "hellochrome_102",
+  "hellochrome_106_shuffle",
+  "hellochrome_120",
+  "hellochrome_131",
+  "hellochrome_100_psk",
+  "hellochrome_112_psk_shuf",
+  "hellochrome_114_padding_psk_shuf",
+  "hellochrome_115_pq",
+  "hellochrome_115_pq_psk",
+  "hellochrome_120_pq",
+  "helloios_auto",
+  "helloios_11_1",
+  "helloios_12_1",
+  "helloios_13",
+  "helloios_14",
+  "helloandroid_11_okhttp",
+  "helloedge_auto",
+  "helloedge_85",
+  "helloedge_106",
+  "hellosafari_auto",
+  "hellosafari_16_0",
+  "hello360_auto",
+  "hello360_7_5",
+  "hello360_11_0",
+  "helloqq_auto",
+  "helloqq_11_1"
+]);
+
+/**
+ * A link's `fp` for TLS, when Xray knows it. Links made for other clients
+ * carry values Xray refuses - mihomo's "none", Go's "golang" - and with one of
+ * them Xray rejects the whole config, so a profile that connected while `fp`
+ * was ignored on TLS would stop at Connect. Such a value is left out, as it
+ * always was; REALITY, which needs a fingerprint, keeps the link's.
+ */
+function xrayTlsFingerprint(value: string | undefined): string | undefined {
+  const name = value?.trim().toLowerCase();
+  if (!name) {
+    return undefined;
+  }
+  return XRAY_TLS_FINGERPRINTS.has(name) ? value?.trim() : undefined;
+}
+
 function xrayNetwork(transport: ProxyTransport): string | undefined {
   if (transport === "tcp") {
     return undefined;
@@ -510,9 +785,10 @@ function xrayNetwork(transport: ProxyTransport): string | undefined {
   return transport;
 }
 
+/** The share-link parser's reading, so a link it saved as "none" also runs as none. */
 function normalizeSecurity(value: string): ProxySecurity {
   const normalized = value.trim().toLowerCase();
-  if (!normalized || normalized === "none") {
+  if (!normalized || normalized === "0" || normalized === "false" || normalized === "none") {
     return "none";
   }
   if (normalized === "tls" || normalized === "reality") {

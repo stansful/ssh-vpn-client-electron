@@ -13,6 +13,8 @@ export interface ParsedCidrRange {
 
 const IPV4_BITS = 32;
 const IPV6_BITS = 128;
+// Declared before anything that parses at module load (the local ranges below).
+const IPV6_GROUPS = 8;
 
 export function parseIpAddress(input: string): ParsedIpAddress | undefined {
   const value = input.trim();
@@ -38,6 +40,131 @@ export function canonicalizeIpAddress(input: string): string | undefined {
       .join(".");
   }
   return formatIpv6(parsed.value);
+}
+
+/**
+ * Parses an IP literal (brackets allowed) and reads an IPv4-mapped IPv6
+ * address (`::ffff:a.b.c.d`, in either spelling) as the IPv4 address it
+ * carries. A client that hands the proxy a mapped address means the IPv4 host,
+ * so IPv4 rules and ranges have to match it.
+ */
+export function parseIpAddressUnmapped(input: string): ParsedIpAddress | undefined {
+  const value = input.trim().replace(/^\[(.*)\]$/u, "$1").toLowerCase();
+  // An IPv6 literal may end in dotted IPv4 notation (`::ffff:1.2.3.4`).
+  // Rewrite that tail as two hex groups so the whole address parses once.
+  const dottedTail = value.includes(":") ? /^(.*:)([^:]*\.[^:]*)$/u.exec(value) : null;
+  const parsed = dottedTail
+    ? parseDottedTailIpv6(dottedTail[1], dottedTail[2])
+    : parseIpAddress(value);
+  if (parsed?.version === 6 && parsed.value >> 32n === 0xffffn) {
+    return { version: 4, value: parsed.value & 0xffff_ffffn };
+  }
+  return parsed;
+}
+
+function parseDottedTailIpv6(head: string, tail: string): ParsedIpAddress | undefined {
+  const ipv4 = parseIpv4(tail);
+  if (!ipv4) {
+    return undefined;
+  }
+  return parseIpv6(`${head}${(ipv4.value >> 16n).toString(16)}:${(ipv4.value & 0xffffn).toString(16)}`);
+}
+
+function formatIpv4(value: bigint): string {
+  return [24, 16, 8, 0].map((shift) => Number((value >> BigInt(shift)) & 0xffn)).join(".");
+}
+
+/** An IPv4-mapped IPv6 literal as dotted IPv4; any other host unchanged. */
+export function unmapIpv4MappedAddress(host: string): string {
+  const parsed = parseIpAddressUnmapped(host);
+  if (parsed?.version !== 4 || !host.includes(":")) {
+    return host;
+  }
+  return formatIpv4(parsed.value);
+}
+
+/**
+ * Destinations that stay out of the tunnel unless a user rule names them, on
+ * every routing path: the local machine, private and link-local networks,
+ * carrier-grade NAT (which overlay networks such as Tailscale use) and "this
+ * network". The PAC, Xray's routing, the TUN policy and the local listener
+ * all apply this one list, right after the user's own domain and IP rules, so
+ * on Windows LAN traffic stays direct whichever path carries it while a rule
+ * such as `10.0.0.0/8` still reaches the network behind the server. The
+ * Windows proxy override names none of it - WinINet can only write a wildcard
+ * that public names match too - and leaves it to the listener or Xray behind
+ * it. Where nothing steers the system's traffic - macOS, Linux - an app sends
+ * the local proxy only what it wants tunnelled, and none of this applies.
+ */
+export const LOCAL_DESTINATION_CIDRS: readonly string[] = [
+  "0.0.0.0/8",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10"
+];
+
+const LOCAL_DESTINATION_RANGES = LOCAL_DESTINATION_CIDRS.map((cidr) => {
+  const range = parseCidrRange(cidr);
+  if (!range) {
+    throw new Error(`Invalid built-in local destination range ${cidr}.`);
+  }
+  return range;
+});
+
+/** True for an IP literal on {@link LOCAL_DESTINATION_CIDRS}, IPv4-mapped forms included. */
+export function isLocalDestinationIp(input: string): boolean {
+  const ip = parseIpAddressUnmapped(input);
+  return ip !== undefined && LOCAL_DESTINATION_RANGES.some((range) => ipMatchesCidr(ip, range));
+}
+
+/**
+ * True for a destination that stays direct when no user rule selects it: a
+ * local or private IP literal, `localhost`, a single-label name (an intranet
+ * host resolved by the local network) or a `.local` (mDNS) name. Names are
+ * judged as written; nothing is resolved.
+ */
+export function isLocalDestinationHost(host: string): boolean {
+  const value = host.trim().replace(/^\[(.*)\]$/u, "$1").toLowerCase().replace(/\.$/u, "");
+  if (!value) {
+    return false;
+  }
+  if (parseIpAddressUnmapped(value)) {
+    return isLocalDestinationIp(value);
+  }
+  return !value.includes(".") || value === "localhost" || value.endsWith(".local");
+}
+
+/**
+ * True for an IP rule that covers at least one address on
+ * {@link LOCAL_DESTINATION_CIDRS} - `10.8.0.0/16`, or a wider `0.0.0.0/0` -
+ * and so selects part of the local network ahead of the step that keeps it
+ * direct. Xray's routing, which has that step built in, needs to know them.
+ */
+export function overlapsLocalDestinationRange(input: string): boolean {
+  const range = parseCidrRange(input);
+  if (!range) {
+    return false;
+  }
+  const bits = range.version === 4 ? IPV4_BITS : IPV6_BITS;
+  return LOCAL_DESTINATION_RANGES.some((local) => {
+    if (local.version !== range.version) {
+      return false;
+    }
+    const mask = prefixToMask(bits, Math.min(local.prefixLength, range.prefixLength));
+    return (local.network & mask) === (range.network & mask);
+  });
+}
+
+/** A parsed range as `network/prefix`, host bits cleared, IPv6 in its shortest form. */
+export function formatCidrRange(range: ParsedCidrRange): string {
+  const network = range.version === 4 ? formatIpv4(range.network) : formatIpv6(range.network);
+  return `${network}/${range.prefixLength}`;
 }
 
 export function ipAddressKey(input: string): string | undefined {
@@ -193,5 +320,3 @@ function prefixToMask(bits: number, prefixLength: number): bigint {
   }
   return ((1n << BigInt(prefixLength)) - 1n) << BigInt(bits - prefixLength);
 }
-
-const IPV6_GROUPS = 8;

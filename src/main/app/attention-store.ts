@@ -122,12 +122,17 @@ export function attentionFromDiagnostic(
     return tunUnavailableAttention(resolveContext());
   }
   if (/^TUN dataplane stopped unexpectedly/u.test(message)) {
+    // Both transports apply routing again by themselves - at once while the
+    // connection is up, and when it is back if it was down.
+    const whenBack = /\bRouting is applied again when (the session|Xray) is back\b/u.test(message);
     return {
       kind: "tun-unavailable",
       level: "error",
       source: "routing",
       title: "TUN adapter stopped",
-      message: "The TUN adapter stopped during the session, so apps that ignore the Windows proxy setting may now connect directly. Reconnect to bring it back."
+      message: whenBack
+        ? "The TUN adapter stopped while the connection was down, so apps connect directly until it is back. Shadow applies routing again then: the adapter restarts, or the Windows proxy setting takes over. Activity has the details."
+        : "The TUN adapter stopped during the session, so for a moment apps could connect directly. Shadow applied routing again right away: the adapter restarts, or the Windows proxy setting takes over. Activity has the details."
     };
   }
   if (/^TUN (routing teardown failed|dataplane did not stop cleanly)/u.test(message)) {
@@ -156,6 +161,15 @@ export function attentionFromDiagnostic(
       source: "routing",
       title: "Traffic went direct while the tunnel was down",
       message: `${resolveContext().targetName ?? "The tunnel"} was down for ${seconds} s, so your traffic went back to the direct network until the session returned.`
+    };
+  }
+  if (/^Another program took Xray's local port while Xray was down\b.*returning the machine to direct routing/u.test(message)) {
+    return {
+      kind: "other",
+      level: "warning",
+      source: "routing",
+      title: "Traffic went direct while the tunnel was down",
+      message: `Another program took the local port of ${resolveContext().targetName ?? "the tunnel"} while Xray restarted, so your traffic went back to the direct network until the session returned.`
     };
   }
   return undefined;

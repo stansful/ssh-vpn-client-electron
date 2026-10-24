@@ -24,12 +24,20 @@ import (
 // Operation is one reversible change, expressed as the argv that applies it
 // and the argv that undoes it. Keeping both together is what makes the journal
 // possible: a crashed process leaves behind a list of undo commands that any
-// later run can execute without understanding what they were for.
+// later run can execute without understanding what they were for - provided
+// each is one of the forms this file renders (command.go checks that).
 type Operation struct {
 	// Description is what appears in diagnostics.
 	Description string   `json:"description"`
 	Apply       []string `json:"-"`
 	Undo        []string `json:"undo"`
+	// InterfaceLUID identifies the interface the commands name by index, as
+	// it was when the operation was journalled. Windows reuses indices; a LUID
+	// stays with one interface for as long as it exists. Zero when it could not
+	// be read. Filled in by the manager, not by the plan.
+	InterfaceLUID uint64 `json:"interfaceLuid,omitempty"`
+	// Attempts counts the recoveries that could not finish this entry.
+	Attempts int `json:"attempts,omitempty"`
 }
 
 // Plan describes the routing state the dataplane needs.

@@ -32,6 +32,30 @@ export interface SshConfig {
   /** @deprecated Private-key passphrases belong to SSH keys. Kept for migration from older stores. */
   privateKeyPassphraseSecretId?: string;
   expectedServerFingerprint: string;
+  /**
+   * Trust on first use: the host key fingerprint the server proved on the
+   * first authenticated connection, saved by main when no fingerprint was
+   * pinned. Later connections must find the same key. A pinned
+   * `expectedServerFingerprint` overrides it; changing the host or port, or
+   * setting or clearing the pin, forgets it.
+   */
+  trustedHostKeyFingerprint?: string;
+  /**
+   * The type of that key as OpenSSH names it: "ssh-ed25519" or "ssh-rsa".
+   * A key of this type that does not match is another key, not the server
+   * showing its other key type first, so it stops the connection at once.
+   */
+  trustedHostKeyType?: string;
+  /** When `trustedHostKeyFingerprint` was saved (ISO 8601). */
+  trustedHostKeyAt?: string;
+  /**
+   * The type of the pinned `expectedServerFingerprint`'s key, as OpenSSH
+   * names it, saved by main the first time a session verifies the pin (or
+   * taken from the trusted key when the user pins that). As with
+   * `trustedHostKeyType`, a key of this type that does not match is final.
+   * Setting, changing or clearing the pin forgets it.
+   */
+  pinnedHostKeyType?: string;
   keepaliveIntervalSec: number;
   note: string;
   createdAt: string;
@@ -64,8 +88,22 @@ export interface SshKeyMetadata {
   /** Detected from the key text when it is saved (or lazily for older stores). */
   keyType?: SshKeyType;
   keyFormat?: SshKeyFormat;
-  /** True for passphrase-protected OpenSSH keys, which the SSH core cannot load yet. */
+  /** True for passphrase-protected OpenSSH keys, which sign in only with their passphrase saved. */
   encryptedOpenSsh?: boolean;
+  /**
+   * True for security-key (FIDO, `sk-…`) keys, which sign only with their
+   * hardware key and cannot sign in here. Recorded as false for other OpenSSH
+   * keys once checked; absent where the key was never checked.
+   */
+  securityKey?: boolean;
+  /**
+   * For a passphrase-protected OpenSSH key the SSH core cannot open whatever
+   * the passphrase: the cipher it is encrypted with, when not one of the AES
+   * ones, or its bcrypt rounds, when more than the core allows. Checked with
+   * `securityKey`, and present only when it is the reason.
+   */
+  unsupportedOpenSshCipher?: string;
+  excessiveBcryptRounds?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -332,6 +370,8 @@ export interface RuntimeStatus {
   localProxy?: LocalProxyEndpoint;
   /** OpenSSH-style SHA256 fingerprint of the server host key verified in this session (SSH only). */
   observedHostKeyFingerprint?: string;
+  /** Type of that key as OpenSSH names it: "ssh-ed25519" or "ssh-rsa" (SSH only). */
+  observedHostKeyType?: string;
   /** Whether the TUN adapter actually carries traffic for this session (Windows only). */
   tunActive?: boolean;
 }

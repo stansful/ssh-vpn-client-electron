@@ -28,6 +28,29 @@ describe("SSH key metadata detection", () => {
     expect(detectSshKeyMetadata(encrypted, "the passphrase does not help").encryptedOpenSsh).toBe(true);
   });
 
+  // Saved with its passphrase, such a key still cannot sign in; the key
+  // list says so from what was recorded here.
+  it("records how an encrypted OpenSSH key is encrypted when the core cannot open it", () => {
+    const ed25519 = publicBlob("ssh-ed25519", randomBytes(32));
+    expect(detectSshKeyMetadata(openSshKey(ed25519, { cipher: "chacha20-poly1305@openssh.com", kdf: "bcrypt" }))).toEqual({
+      keyType: "ed25519",
+      keyFormat: "openssh",
+      encryptedOpenSsh: true,
+      unsupportedOpenSshCipher: "chacha20-poly1305@openssh.com"
+    });
+    expect(detectSshKeyMetadata(openSshKey(ed25519, { cipher: "aes256-ctr", kdf: "bcrypt", rounds: 200 }))).toEqual({
+      keyType: "ed25519",
+      keyFormat: "openssh",
+      encryptedOpenSsh: true,
+      excessiveBcryptRounds: 200
+    });
+    expect(detectSshKeyMetadata(openSshKey(ed25519, { cipher: "aes256-ctr", kdf: "bcrypt", rounds: 128 }))).toEqual({
+      keyType: "ed25519",
+      keyFormat: "openssh",
+      encryptedOpenSsh: true
+    });
+  });
+
   it("falls back to the private block when the public section is empty", () => {
     const privateBlock = new SshBinaryWriter().uint32(7).uint32(7).string("ssh-rsa").toBuffer();
 
@@ -125,10 +148,10 @@ function ecdsaPublicBlob(): Buffer {
 
 function openSshKey(
   publicKey: Buffer,
-  options: { cipher?: string; kdf?: string; privateBlock?: Buffer } = {}
+  options: { cipher?: string; kdf?: string; rounds?: number; privateBlock?: Buffer } = {}
 ): string {
   const kdfOptions = options.kdf && options.kdf !== "none"
-    ? new SshBinaryWriter().string(randomBytes(16)).uint32(16).toBuffer()
+    ? new SshBinaryWriter().string(randomBytes(16)).uint32(options.rounds ?? 16).toBuffer()
     : Buffer.alloc(0);
   const envelope = Buffer.concat([
     Buffer.from("openssh-key-v1\0", "utf8"),

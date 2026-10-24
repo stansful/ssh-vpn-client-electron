@@ -112,7 +112,7 @@ export function ConnectHero({ view, onShowTransport }: ConnectHeroProps): JSX.El
 
   const targets = useMemo(() => resolveTarget(snapshot, view), [snapshot, view]);
   const target: ConnectTarget | undefined = targets.target;
-  const routing = useMemo(() => summarizeRouting(store), [store]);
+  const routing = useMemo(() => summarizeRouting(store, environment.platform), [store, environment.platform]);
   const otherName = activeTransport !== view ? sessionTargetName(snapshot) : undefined;
   const redirects = redirectsSystemTraffic(environment.platform);
 

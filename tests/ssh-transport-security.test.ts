@@ -10,7 +10,7 @@ import {
 } from "../src/core/ssh/host-key.js";
 import { deriveDirectionalTransportKeys, deriveKey, deriveTransportKeys, transportKeyLengthsFor } from "../src/core/ssh/key-derivation.js";
 import { bufferToBigInt } from "../src/core/ssh/kex-group14.js";
-import { SshPacketProtector } from "../src/core/ssh/packet-codec.js";
+import { SshEncryptedPacketStreamReader, SshEncryptedPacketStreamWriter } from "../src/core/ssh/packet-stream.js";
 import {
   SshPrivateKeyLoadError,
   assertSshPrivateKeyText,
@@ -50,23 +50,17 @@ describe("SSH transport key derivation and packet protection", () => {
 
   it("encrypts, authenticates, and decrypts packets", () => {
     const keys = deriveTransportKeys(987654321n, Buffer.alloc(32, 3), Buffer.alloc(32, 4), transportKeyLengthsFor("aes256-ctr", "hmac-sha2-256"));
-    const sender = new SshPacketProtector({
-      cipherName: "aes256-ctr",
+    const config = {
+      cipherName: "aes256-ctr" as const,
       encryptionKey: keys.encryptionKeyClientToServer,
       initialIv: keys.initialIvClientToServer,
-      macName: "hmac-sha2-256",
+      macName: "hmac-sha2-256" as const,
       macKey: keys.integrityKeyClientToServer
-    });
-    const receiver = new SshPacketProtector({
-      cipherName: "aes256-ctr",
-      encryptionKey: keys.encryptionKeyClientToServer,
-      initialIv: keys.initialIvClientToServer,
-      macName: "hmac-sha2-256",
-      macKey: keys.integrityKeyClientToServer
-    });
+    };
+    const sender = new SshEncryptedPacketStreamWriter(config);
+    const receiver = new SshEncryptedPacketStreamReader(config);
 
-    const protectedPacket = sender.protect(Buffer.from("payload"));
-    expect(receiver.unprotect(protectedPacket)).toEqual(Buffer.from("payload"));
+    expect(receiver.push(sender.write(Buffer.from("payload")))).toEqual([Buffer.from("payload")]);
     expect(sender.getSequenceNumber()).toBe(1);
     expect(receiver.getSequenceNumber()).toBe(1);
   });
@@ -80,12 +74,11 @@ describe("SSH transport key derivation and packet protection", () => {
       macName: "hmac-sha2-256" as const,
       macKey: keys.integrityKeyClientToServer
     };
-    const sender = new SshPacketProtector(config);
-    const receiver = new SshPacketProtector(config);
-    const packet = sender.protect(Buffer.from("payload"));
+    const packet = new SshEncryptedPacketStreamWriter(config).writeProtected(Buffer.from("payload"));
     packet.mac[0] ^= 0xff;
 
-    expect(() => receiver.unprotect(packet)).toThrow("MAC verification failed");
+    expect(() => new SshEncryptedPacketStreamReader(config).push(Buffer.concat([packet.encryptedPacket, packet.mac])))
+      .toThrow("MAC verification failed");
   });
 });
 
@@ -180,10 +173,10 @@ describe("SSH host-key verification and private-key signing", () => {
     }
   });
 
-  it("reports unsupported encrypted OpenSSH private keys explicitly", () => {
+  it("reports OpenSSH keys encrypted with an unsupported cipher explicitly", () => {
     const encryptedOpenSsh = encodeOpenSshEnvelope(
       new SshBinaryWriter()
-        .string("aes256-ctr")
+        .string("chacha20-poly1305@openssh.com")
         .string("bcrypt")
         .string(new SshBinaryWriter().string(Buffer.alloc(16, 1)).uint32(16).toBuffer())
         .uint32(1)
@@ -192,14 +185,14 @@ describe("SSH host-key verification and private-key signing", () => {
         .toBuffer()
     );
 
-    expect(() => loadPrivateKey(encryptedOpenSsh, "secret")).toThrow(/Encrypted OpenSSH private keys are not supported yet/);
+    expect(() => loadPrivateKey(encryptedOpenSsh, "secret")).toThrow(/Encrypted OpenSSH private keys are not supported/);
 
     try {
       loadPrivateKey(encryptedOpenSsh, "secret");
     } catch (error) {
       expect(error).toBeInstanceOf(SshPrivateKeyLoadError);
       const diagnostics = (error as SshPrivateKeyLoadError).diagnostics.join("; ");
-      expect(diagnostics).toContain("openSshCipher=aes256-ctr");
+      expect(diagnostics).toContain("openSshCipher=chacha20-poly1305@openssh.com");
       expect(diagnostics).toContain("openSshKdf=bcrypt");
       expect(diagnostics).toContain("passphraseProvided=true");
     }

@@ -35,9 +35,16 @@ export function describeSshFailure(message: string, context: SshFailureContext):
     [/no auth method available/iu, () => `${name} offered no sign-in method Shadow can use. Check the server's SSH settings, then try again.`],
     [/SSH password is unavailable|no password is saved/iu, () => `No password is saved for ${name}. Add it in the server settings, then try again.`],
     [/SSH private key is unavailable/iu, () => `No key is attached to ${name}. Pick a key in the server settings, then try again.`],
-    [/Encrypted OpenSSH private keys are not supported/iu, () => `The key for ${name} is a passphrase-protected OpenSSH key, which Shadow can't load yet. Use an unencrypted key or convert it to PKCS8 or PEM.`],
+    [/Encrypted OpenSSH private keys are not supported/iu, () => `The key for ${name} is encrypted in a way Shadow can't open. Re-encrypt it with ssh-keygen -p -Z aes256-ctr, then paste it again in SSH keys.`],
+    [/protected with a passphrase, and none was provided/iu, () => `The key for ${name} is protected with a passphrase that isn't saved. Edit the key in SSH keys and type its passphrase.`],
+    [/Unable to load SSH private key because the passphrase is wrong/iu, () => `The saved passphrase for the key of ${name} is wrong. Edit the key in SSH keys and type it again.`],
+    [/security-key \(FIDO\) key/iu, () => `The key for ${name} is a security-key (FIDO) key, which Shadow can't sign in with. Use an Ed25519, ECDSA or RSA key.`],
     [/Unable to load SSH private key/iu, () => `The key for ${name} couldn't be read. Check the key format and its passphrase, then try again.`],
-    [/Unsupported public key type/iu, () => `The key for ${name} uses a type Shadow doesn't support yet. Use an Ed25519 or RSA key.`],
+    [/Unsupported public key type/iu, () => `The key for ${name} uses a type Shadow doesn't support. Use an Ed25519, ECDSA or RSA key.`],
+    // Nothing is pinned when the expected key is the one Shadow trusted by
+    // itself, so the advice is where to put a new key, not to update a pin.
+    [/does not match the key Shadow trusted on its first connection/iu, () => `${name} presented a different host key than the one Shadow trusted on the first connection. If the server's key was changed on purpose, paste the new fingerprint into the server's Fingerprint field; otherwise don't connect.`],
+    [/does not match the key .* presented earlier in this session/iu, () => `${name} presented a different host key than earlier in this session. If the server's key was changed on purpose, paste the new fingerprint into the server's Fingerprint field; otherwise don't connect.`],
     [/fingerprint mismatch|host key changed during rekey|host key (?:does not|doesn't) match/iu, () => `${name} presented a host key that doesn't match the pinned one. If the server was reinstalled, update the pinned key; otherwise don't connect.`],
     [/host key signature verification failed/iu, () => `${name} sent an invalid host key signature, so Shadow stopped. Check the server before connecting again.`],
     [/Unsupported SSH host key algorithm|No compatible SSH server host key algorithm/iu, () => `${name} uses a host key type Shadow can't verify, so it won't connect.`],

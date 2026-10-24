@@ -12,6 +12,13 @@ export interface DirectEgressChannelOptions {
 
 const DEFAULT_DIRECT_CONNECT_TIMEOUT_MS = 12_000;
 const DEFAULT_DIRECT_WRITE_TIMEOUT_MS = 120_000;
+/**
+ * How far reads from the socket may run ahead of what the consumer has
+ * acknowledged before the socket is paused. Well below the proxy's 16 MiB
+ * per-connection queue, so a slow local reader slows the far end down through
+ * TCP flow control instead of having its connection dropped.
+ */
+export const DEFAULT_SOCKET_CHANNEL_READ_WINDOW_BYTES = 1024 * 1024;
 
 /**
  * A {@link DirectTcpIpChannel} that leaves the machine directly instead of
@@ -51,8 +58,12 @@ export async function openDirectEgressChannel(
  * Wraps an already-established socket as a channel. Used both for direct egress
  * and for a connection handed over by an upstream SOCKS5 proxy.
  */
-export function createSocketBackedChannel(socket: net.Socket, socketWriteTimeoutMs: number): DirectTcpIpChannel {
-  return new SocketBackedChannel(socket, socketWriteTimeoutMs);
+export function createSocketBackedChannel(
+  socket: net.Socket,
+  socketWriteTimeoutMs: number,
+  readWindowBytes = DEFAULT_SOCKET_CHANNEL_READ_WINDOW_BYTES
+): DirectTcpIpChannel {
+  return new SocketBackedChannel(socket, socketWriteTimeoutMs, readWindowBytes);
 }
 
 export { DEFAULT_DIRECT_WRITE_TIMEOUT_MS, waitForConnect };
@@ -61,15 +72,29 @@ class SocketBackedChannel implements DirectTcpIpChannel {
   private readonly events = new EventEmitter();
   private writeQueue: Promise<void> = Promise.resolve();
   private closed = false;
+  private unacknowledgedBytes = 0;
+  private pausedForBackpressure = false;
 
   constructor(
     private readonly socket: net.Socket,
-    private readonly socketWriteTimeoutMs: number
+    private readonly socketWriteTimeoutMs: number,
+    private readonly readWindowBytes = DEFAULT_SOCKET_CHANNEL_READ_WINDOW_BYTES
   ) {
     // Listeners are attached once and re-emitted through an EventEmitter so the
     // proxy can subscribe and unsubscribe with the same semantics as an SSH
     // channel, without ever leaving the socket without an "error" listener.
-    this.socket.on("data", (data: Buffer) => this.events.emit("data", data));
+    this.socket.on("data", (data: Buffer) => {
+      // Mirrors the SSH channel window: the consumer acknowledges each chunk
+      // once it has been written onward, and reading stops while too much is
+      // outstanding. Without this a stalled local reader made the proxy queue
+      // everything the far end sent until its queue limit cut the connection.
+      this.unacknowledgedBytes += data.length;
+      if (!this.pausedForBackpressure && this.unacknowledgedBytes >= this.readWindowBytes) {
+        this.pausedForBackpressure = true;
+        this.socket.pause();
+      }
+      this.events.emit("data", data);
+    });
     this.socket.on("end", () => this.events.emit("end"));
     this.socket.on("close", () => {
       this.closed = true;
@@ -90,6 +115,18 @@ class SocketBackedChannel implements DirectTcpIpChannel {
     });
     this.writeQueue = write.catch(() => undefined);
     return write;
+  }
+
+  async acknowledgeData(bytes: number): Promise<void> {
+    this.unacknowledgedBytes = Math.max(0, this.unacknowledgedBytes - bytes);
+    // Resume at half the window rather than just under it, so a busy stream
+    // is not paused and resumed for every chunk.
+    if (this.pausedForBackpressure && this.unacknowledgedBytes <= this.readWindowBytes / 2) {
+      this.pausedForBackpressure = false;
+      if (!this.socket.destroyed) {
+        this.socket.resume();
+      }
+    }
   }
 
   async end(): Promise<void> {

@@ -26,6 +26,7 @@ const (
 	socksCmdConnect     = 0x01
 	socksCmdAssociate   = 0x03
 	socksAddrIPv4       = 0x01
+	socksAddrDomain     = 0x03
 	socksAddrIPv6       = 0x04
 	socksReplySucceeded = 0x00
 
@@ -68,12 +69,26 @@ func (c *Socks5Client) dial(ctx context.Context, network string, address string)
 }
 
 // DialTCP opens a tunnelled TCP connection to destination.
-func (c *Socks5Client) DialTCP(ctx context.Context, destination netip.AddrPort) (net.Conn, error) {
+//
+// With a name, the proxy is asked for the name and destination's port
+// instead, and the far end resolves it. The address came from the local
+// resolver, and a poisoned answer for a blocked site would otherwise be
+// followed faithfully through the tunnel; the system-proxy paths hand the
+// server the name in the same way. The name must be what the flow itself
+// carried as its own server's - its TLS server name or the Host of an
+// origin-form HTTP request, never the target of a request to an HTTP proxy -
+// and never a name learned for the address, which may belong to another site
+// on the same CDN address; which names qualify is Policy.DialsByName's call.
+func (c *Socks5Client) DialTCP(ctx context.Context, destination netip.AddrPort, name string) (net.Conn, error) {
+	target, ok := encodeSocksDomain(name, destination.Port())
+	if !ok {
+		target = encodeSocksAddress(destination)
+	}
 	conn, err := c.dial(ctx, "tcp", c.Endpoint.String())
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy: %w", err)
 	}
-	if _, err := c.handshake(ctx, conn, socksCmdConnect, destination); err != nil {
+	if _, err := c.handshake(ctx, conn, socksCmdConnect, target); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -90,7 +105,7 @@ func (c *Socks5Client) AssociateUDP(ctx context.Context) (*Socks5UDPSession, err
 	// RFC 1928: a client that does not know its own source address in advance
 	// sends all zeroes, and the proxy must accept datagrams from any source it
 	// has already authenticated.
-	bound, err := c.handshake(ctx, control, socksCmdAssociate, netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
+	bound, err := c.handshake(ctx, control, socksCmdAssociate, encodeSocksAddress(netip.AddrPortFrom(netip.IPv4Unspecified(), 0)))
 	if err != nil {
 		control.Close()
 		return nil, err
@@ -127,7 +142,10 @@ func (c *Socks5Client) AssociateUDP(ctx context.Context) (*Socks5UDPSession, err
 	return session, nil
 }
 
-func (c *Socks5Client) handshake(ctx context.Context, conn net.Conn, command byte, destination netip.AddrPort) (netip.AddrPort, error) {
+// handshake sends command for target, an address already in its SOCKS
+// encoding (see encodeSocksAddress and encodeSocksDomain), and returns the
+// bound address the proxy replied with.
+func (c *Socks5Client) handshake(ctx context.Context, conn net.Conn, command byte, target []byte) (netip.AddrPort, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(socksHandshakeTimeout)
@@ -150,7 +168,7 @@ func (c *Socks5Client) handshake(ctx context.Context, conn net.Conn, command byt
 		return netip.AddrPort{}, fmt.Errorf("proxy rejected no-auth (version %#x, method %#x)", greeting[0], greeting[1])
 	}
 
-	request := append([]byte{socksVersion, command, 0x00}, encodeSocksAddress(destination)...)
+	request := append([]byte{socksVersion, command, 0x00}, target...)
 	if _, err := conn.Write(request); err != nil {
 		return netip.AddrPort{}, fmt.Errorf("send request: %w", err)
 	}
@@ -180,6 +198,20 @@ func encodeSocksAddress(address netip.AddrPort) []byte {
 	return binary.BigEndian.AppendUint16(encoded, address.Port())
 }
 
+// encodeSocksDomain renders a host name as a SOCKS5 domain address. It
+// refuses an empty name, one longer than the one-byte length allows, and an
+// address literal, which is sent as an address instead.
+func encodeSocksDomain(name string, port uint16) ([]byte, bool) {
+	if name == "" || len(name) > 255 {
+		return nil, false
+	}
+	if _, err := netip.ParseAddr(name); err == nil {
+		return nil, false
+	}
+	encoded := append([]byte{socksAddrDomain, byte(len(name))}, name...)
+	return binary.BigEndian.AppendUint16(encoded, port), true
+}
+
 func readSocksAddress(reader io.Reader, addressType byte) (netip.AddrPort, error) {
 	var raw []byte
 	switch addressType {
@@ -187,7 +219,7 @@ func readSocksAddress(reader io.Reader, addressType byte) (netip.AddrPort, error
 		raw = make([]byte, 4+2)
 	case socksAddrIPv6:
 		raw = make([]byte, 16+2)
-	case 0x03:
+	case socksAddrDomain:
 		var length [1]byte
 		if _, err := io.ReadFull(reader, length[:]); err != nil {
 			return netip.AddrPort{}, err

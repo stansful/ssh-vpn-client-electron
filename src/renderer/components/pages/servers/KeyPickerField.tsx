@@ -99,7 +99,7 @@ export function KeyPickerField({ keys, configs, value, onChange, onAddKey, passw
         </StateLine>
       ) : issue ? (
         <StateLine tone="warn" icon={TriangleAlert} id={stateId}>
-          <b>{issue}</b> Pick an RSA or Ed25519 key, or replace this one in SSH keys.
+          <b>{issue}</b> Pick another key, or fix this one in SSH keys.
         </StateLine>
       ) : null}
       {passwordStillSaved ? <Hint>Your saved password stays stored. Switch back to Password to use it again.</Hint> : null}

@@ -22,7 +22,16 @@ import (
 // it only for selected processes would need the answer before the flow that
 // reveals the process. The cost is that DNS is visible to the local resolver
 // exactly as it was before the tunnel came up; the routing of the connection
-// that follows is not.
+// that follows is not. Nor is the local answer what a tunnelled connection
+// reaches when it names a site the rules select by name: a TCP flow whose
+// first bytes were read (Policy.NameWorthReading - on any port where a name
+// could change the route, and on a web port whenever the flow is tunnelled)
+// and name the server it is connected to - its TLS server name, or the Host
+// of an origin-form HTTP request - is dialled through the tunnel by that name
+// (Policy.DialsByName, namesConnectedServer), so a poisoned answer for a
+// blocked site is not followed there. A flow whose name was not read, a
+// request to an HTTP proxy, and datagrams still go to the address the
+// application was given.
 
 const (
 	// dnsMaxMessageBytes bounds a single parsed message. 64 KiB is the largest
@@ -117,6 +126,59 @@ func parseDNSAnswers(message []byte) []dnsRecord {
 		offset = data + length
 	}
 	return records
+}
+
+// dnsExchange is what ties an answer to its query: the ID, and the question
+// a response echoes back.
+type dnsExchange struct {
+	id       uint16
+	response bool
+	rcode    byte
+	// questions is the message's question count; the first question, when
+	// there is one, is name, qtype and qclass, the name lower-cased.
+	questions uint16
+	name      string
+	qtype     uint16
+	qclass    uint16
+}
+
+// parseDNSExchange reads the header and first question of a DNS message.
+func parseDNSExchange(message []byte) (dnsExchange, bool) {
+	if len(message) < 12 || len(message) > dnsMaxMessageBytes {
+		return dnsExchange{}, false
+	}
+	exchange := dnsExchange{
+		id:        binary.BigEndian.Uint16(message[0:2]),
+		response:  message[2]&0x80 != 0,
+		rcode:     message[3] & 0x0f,
+		questions: binary.BigEndian.Uint16(message[4:6]),
+	}
+	if exchange.questions == 0 {
+		return exchange, true
+	}
+	next, name, err := skipName(message, 12)
+	if err != nil || next+4 > len(message) {
+		return dnsExchange{}, false
+	}
+	exchange.name = name
+	exchange.qtype = binary.BigEndian.Uint16(message[next : next+2])
+	exchange.qclass = binary.BigEndian.Uint16(message[next+2 : next+4])
+	return exchange, true
+}
+
+// answers reports whether this message is the response to query: the same
+// ID and the same question. Names compare without case, because resolvers may
+// echo a randomised-case question in either form. An error response that left
+// the question out - a server that could not parse it may - is matched on
+// its ID alone; it carries no records to learn from.
+func (e dnsExchange) answers(query dnsExchange) bool {
+	if !e.response || query.response || e.id != query.id {
+		return false
+	}
+	if e.questions == 0 && e.rcode != 0 {
+		return true
+	}
+	return e.questions == query.questions && e.name == query.name && e.qtype == query.qtype && e.qclass == query.qclass
 }
 
 func distinctNames(first string, second string) []string {
@@ -249,10 +311,12 @@ const domainCacheMaxNames = 8
 // Names accumulate per address rather than replace each other: one CDN
 // address serves many sites, and a rule naming any of them must keep matching
 // a flow to that address after another site on it was resolved. Selection
-// only ever grows with more names, so remembering more can never unselect a
-// flow that a single name would have selected; the trade is that a flow with
-// no name of its own to a shared address is tunnelled when any remembered
-// name is selected, which is the safe direction.
+// only ever grows with more names, and releasing a flow - the direct list -
+// needs every name, so remembering more can never unselect a flow that a
+// single name would have selected; nor can a remembered local-only name,
+// which counts only when the flow named it itself (see Flow.Domains). The
+// trade is that a flow with no name of its own to a shared address is
+// tunnelled when any remembered name is selected, which is the safe direction.
 func (c *DomainCache) Record(records []dnsRecord) {
 	if len(records) == 0 {
 		return

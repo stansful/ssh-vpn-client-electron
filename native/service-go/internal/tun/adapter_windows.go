@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -37,24 +39,24 @@ var (
 	wintunMu     sync.Mutex
 	wintunLoaded bool
 
-	wintun                   *syscall.LazyDLL
-	procCreateAdapter        *syscall.LazyProc
-	procCloseAdapter         *syscall.LazyProc
-	procGetAdapterLUID       *syscall.LazyProc
-	procStartSession         *syscall.LazyProc
-	procEndSession           *syscall.LazyProc
-	procGetReadWaitEvent     *syscall.LazyProc
-	procReceivePacket        *syscall.LazyProc
-	procReleaseReceivePacket *syscall.LazyProc
-	procAllocateSendPacket   *syscall.LazyProc
-	procSendPacket           *syscall.LazyProc
+	wintun                   *windows.DLL
+	procCreateAdapter        *windows.Proc
+	procCloseAdapter         *windows.Proc
+	procGetAdapterLUID       *windows.Proc
+	procStartSession         *windows.Proc
+	procEndSession           *windows.Proc
+	procGetReadWaitEvent     *windows.Proc
+	procReceivePacket        *windows.Proc
+	procReleaseReceivePacket *windows.Proc
+	procAllocateSendPacket   *windows.Proc
+	procSendPacket           *windows.Proc
 
 	kernel32          = syscall.NewLazyDLL("kernel32.dll")
 	procWaitForSingle = kernel32.NewProc("WaitForSingleObject")
 )
 
 // loadWintun resolves wintun.dll once. The DLL ships next to the service
-// binary, so the default search path finds it without a manifest entry.
+// binary; the other folders searchPaths lists are where a user can add it.
 func loadWintun() error {
 	wintunMu.Lock()
 	defer wintunMu.Unlock()
@@ -64,47 +66,73 @@ func loadWintun() error {
 
 	// Every candidate is an absolute path rather than a bare name: it keeps the
 	// error able to list exactly where it looked, and avoids the default DLL
-	// search order picking up a wintun.dll from somewhere unrelated.
+	// search order picking up a wintun.dll from somewhere unrelated. Each one is
+	// verified before it is loaded (see verify.go); one that fails is skipped
+	// and said so, not loaded.
 	candidates := searchPaths()
-	var loaded *syscall.LazyDLL
+	var loaded *windows.DLL
+	var problems []string
+	anyPresent := false
 	for _, candidate := range candidates {
-		dll := syscall.NewLazyDLL(candidate)
-		if err := dll.Load(); err == nil {
+		dll, err := loadVerifiedWintun(candidate)
+		if err == nil {
 			loaded = dll
 			break
 		}
+		if !errors.Is(err, errWintunMissing) {
+			anyPresent = true
+		}
+		problems = append(problems, candidate+": "+err.Error())
 	}
 	if loaded == nil {
-		return fmt.Errorf("%s was not found in any of: %s", wintunDLL, strings.Join(candidates, ", "))
+		if !anyPresent {
+			return fmt.Errorf("%s was not found in any of: %s", wintunDLL, strings.Join(candidates, ", "))
+		}
+		return fmt.Errorf("no usable %s: %s", wintunDLL, strings.Join(problems, "; "))
+	}
+
+	var findErr error
+	find := func(name string) *windows.Proc {
+		proc, err := loaded.FindProc(name)
+		if err != nil && findErr == nil {
+			findErr = fmt.Errorf("resolve %s: %w", name, err)
+		}
+		return proc
+	}
+	createAdapter := find("WintunCreateAdapter")
+	closeAdapter := find("WintunCloseAdapter")
+	getAdapterLUID := find("WintunGetAdapterLUID")
+	startSession := find("WintunStartSession")
+	endSession := find("WintunEndSession")
+	getReadWaitEvent := find("WintunGetReadWaitEvent")
+	receivePacket := find("WintunReceivePacket")
+	releaseReceivePacket := find("WintunReleaseReceivePacket")
+	allocateSendPacket := find("WintunAllocateSendPacket")
+	sendPacket := find("WintunSendPacket")
+	if findErr != nil {
+		_ = loaded.Release()
+		return findErr
 	}
 	wintun = loaded
-	procCreateAdapter = wintun.NewProc("WintunCreateAdapter")
-	procCloseAdapter = wintun.NewProc("WintunCloseAdapter")
-	procGetAdapterLUID = wintun.NewProc("WintunGetAdapterLUID")
-	procStartSession = wintun.NewProc("WintunStartSession")
-	procEndSession = wintun.NewProc("WintunEndSession")
-	procGetReadWaitEvent = wintun.NewProc("WintunGetReadWaitEvent")
-	procReceivePacket = wintun.NewProc("WintunReceivePacket")
-	procReleaseReceivePacket = wintun.NewProc("WintunReleaseReceivePacket")
-	procAllocateSendPacket = wintun.NewProc("WintunAllocateSendPacket")
-	procSendPacket = wintun.NewProc("WintunSendPacket")
-	for _, proc := range []*syscall.LazyProc{
-		procCreateAdapter, procCloseAdapter, procGetAdapterLUID,
-		procStartSession, procEndSession, procGetReadWaitEvent,
-		procReceivePacket, procReleaseReceivePacket,
-		procAllocateSendPacket, procSendPacket,
-	} {
-		if err := proc.Find(); err != nil {
-			return fmt.Errorf("resolve %s: %w", proc.Name, err)
-		}
-	}
+	procCreateAdapter = createAdapter
+	procCloseAdapter = closeAdapter
+	procGetAdapterLUID = getAdapterLUID
+	procStartSession = startSession
+	procEndSession = endSession
+	procGetReadWaitEvent = getReadWaitEvent
+	procReceivePacket = receivePacket
+	procReleaseReceivePacket = releaseReceivePacket
+	procAllocateSendPacket = allocateSendPacket
+	procSendPacket = sendPacket
 	wintunLoaded = true
 	return nil
 }
 
 // available loads wintun.dll and resolves its entry points without creating an
 // adapter, which is the part that needs administrator rights. A missing DLL and
-// a missing privilege are different problems and are reported separately.
+// a missing privilege are different problems and are reported separately. It
+// runs at every capability handshake, so it loads nothing that loadWintun has
+// not verified.
 func available() error {
 	return loadWintun()
 }
@@ -244,7 +272,7 @@ func (a *windowsAdapter) receiveOnce() ([]byte, error, bool) {
 		if int(size) > len(a.packet) {
 			size = uint32(len(a.packet))
 		}
-		copied := copy(a.packet, unsafe.Slice((*byte)(unsafe.Pointer(packet)), size))
+		copied := copy(a.packet, ringBytes(packet, int(size)))
 		// Released immediately: the ring reclaims memory only on release, and
 		// holding one across the next call would let Close free it while the
 		// caller still had a slice into it.
@@ -283,9 +311,18 @@ func (a *windowsAdapter) SendPacket(packet []byte) error {
 	if buffer == 0 {
 		return fmt.Errorf("allocate send packet: %w", callErr)
 	}
-	copy(unsafe.Slice((*byte)(unsafe.Pointer(buffer)), len(packet)), packet)
+	copy(ringBytes(buffer, len(packet)), packet)
 	procSendPacket.Call(a.session, buffer)
 	return nil
+}
+
+// ringBytes views n bytes of the driver's ring memory at address, which a
+// wintun call returned as an integer. The memory is not Go's and never moves,
+// so the integer is the only reference there is; reading it back through a
+// *uintptr says so to go vet, which otherwise takes it for a Go pointer that
+// was laundered through an integer.
+func ringBytes(address uintptr, n int) []byte {
+	return unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&address))), n)
 }
 
 // Close ends the session and removes the adapter. It blocks until any call

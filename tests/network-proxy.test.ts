@@ -1,9 +1,11 @@
 import { EventEmitter } from "node:events";
-import type { Socket } from "node:net";
+import net, { type Socket } from "node:net";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
+import { createSocketBackedChannel, openDirectEgressChannel } from "../src/core/network/direct-tcp-channel.js";
 import { MemoryDirectTcpIpChannel } from "../src/core/network/memory-direct-channel.js";
-import { LocalTcpProxy, type DirectTcpIpChannel } from "../src/core/network/local-tcp-proxy.js";
+import type { RoutingRule } from "../src/shared/types.js";
+import type { DirectTcpIpChannel } from "../src/core/network/local-tcp-proxy.js";
 import {
   Socks5Proxy,
   formatProxyTunnelError,
@@ -13,6 +15,7 @@ import {
   type Socks5ProxyOptions
 } from "../src/core/network/socks5-proxy.js";
 import { buildProxyPac } from "../src/core/network/windows-system-proxy.js";
+import { buildSelectedRulesWithProcessIps } from "../src/service/process-route-learning.js";
 import { normalizeProxyDomain, parseDomainProxyList } from "../src/core/routing/domain-proxy-list.js";
 import {
   DEFAULT_PROXY_CONNECTION_QUEUE_BYTES,
@@ -550,6 +553,102 @@ describe("SOCKS5 proxy", () => {
     expect(forwarded).not.toContain("Cookie: secret");
   });
 
+  // Many origins - a default Node HTTP server among them - read a client FIN
+  // as an abort and answer with nothing. The forwarded request already says
+  // `Connection: close`, so the origin ends the exchange itself.
+  it("does not half-close the upstream once a forwarded HTTP request is complete", async () => {
+    const channel = new MemoryDirectTcpIpChannel();
+    const end = vi.fn(async () => undefined);
+    const halfClosable = Object.assign(channel, { end });
+    const proxy = new Socks5Proxy({ listenPort: 0, connectChannel: async () => halfClosable });
+    const socket = new FlowingFakeSocket() as unknown as Socket;
+    const handling = (proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(socket);
+    const fake = socket as unknown as FlowingFakeSocket;
+
+    fake.pushInput(Buffer.from("GET http://origin.example/page HTTP/1.1\r\nHost: origin.example\r\n\r\n", "latin1"));
+    await handling;
+    fake.pushInput(Buffer.from("POST http://origin.example/upload HTTP/1.1\r\nHost: origin.example\r\nContent-Length: 2\r\n\r\nok", "latin1"));
+    await waitForParser();
+
+    expect(Buffer.concat(channel.written).toString("latin1")).toBe(
+      "GET /page HTTP/1.1\r\nHost: origin.example\r\nConnection: close\r\n\r\n"
+    );
+    expect(end).not.toHaveBeenCalled();
+
+    // The response still reaches the client, and the origin's own close ends it.
+    channel.pushRemoteData(Buffer.from("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello", "latin1"));
+    await channel.close();
+    await waitFor(() => fake.writableEnded);
+    expect(Buffer.concat(fake.writes).toString("latin1")).toContain("hello");
+  });
+
+  it("answers a plain HTTP request from a real origin that treats a client FIN as an abort", async () => {
+    const origin = net.createServer({ allowHalfOpen: true }, (socket) => {
+      let request = "";
+      let aborted = false;
+      socket.on("end", () => {
+        aborted = true;
+      });
+      socket.on("data", (chunk: Buffer) => {
+        request += chunk.toString("latin1");
+        if (request.includes("\r\n\r\n")) {
+          // An origin that gives up on a client that has already gone away.
+          setTimeout(() => {
+            socket.end(aborted ? "" : "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+          }, 30);
+        }
+      });
+    });
+    await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+    const originPort = (origin.address() as net.AddressInfo).port;
+    const proxy = new Socks5Proxy({
+      listenHost: "127.0.0.1",
+      connectChannel: (target) => openDirectEgressChannel({ host: "127.0.0.1", port: target.port })
+    });
+    const endpoint = await proxy.start();
+    try {
+      const response = await new Promise<string>((resolve, reject) => {
+        const client = net.connect(endpoint.port, endpoint.host);
+        let received = "";
+        client.on("data", (chunk: Buffer) => {
+          received += chunk.toString("latin1");
+        });
+        client.on("end", () => resolve(received));
+        client.on("error", reject);
+        client.write(`GET http://origin.test:${originPort}/ HTTP/1.1\r\nHost: origin.test:${originPort}\r\n\r\n`);
+      });
+      expect(response).toContain("200 OK");
+      expect(response.endsWith("ok")).toBe(true);
+    } finally {
+      await proxy.stop();
+      await new Promise<void>((resolve) => origin.close(() => resolve()));
+    }
+  });
+
+  it("reads IPv4-mapped IPv6 targets as the IPv4 address they carry", async () => {
+    const socks = new FlowingFakeSocket() as unknown as Socket;
+    const socksRequest = readSocksConnectRequest(socks);
+    const mapped = Buffer.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 7]);
+    (socks as unknown as FlowingFakeSocket).pushInput(
+      Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x04]), mapped, Buffer.from([0x01, 0xbb])])
+    );
+    await expect(socksRequest).resolves.toEqual({ host: "192.0.2.7", port: 443 });
+
+    const connect = new FlowingFakeSocket() as unknown as Socket;
+    const connectRequest = readProxyConnectRequest(connect);
+    (connect as unknown as FlowingFakeSocket).pushInput(
+      Buffer.from("CONNECT [::ffff:198.51.100.4]:8443 HTTP/1.1\r\nHost: [::ffff:198.51.100.4]:8443\r\n\r\n", "latin1")
+    );
+    await expect(connectRequest).resolves.toMatchObject({ target: { host: "198.51.100.4", port: 8443 } });
+
+    const forward = new FlowingFakeSocket() as unknown as Socket;
+    const forwardRequest = readProxyConnectRequest(forward);
+    (forward as unknown as FlowingFakeSocket).pushInput(
+      Buffer.from("GET http://[::ffff:c633:6404]/ HTTP/1.1\r\nHost: [::ffff:c633:6404]\r\n\r\n", "latin1")
+    );
+    await expect(forwardRequest).resolves.toMatchObject({ target: { host: "198.51.100.4", port: 80 } });
+  });
+
   it("streams one chunked HTTP upload but drops a pipelined next request", async () => {
     const channel = new MemoryDirectTcpIpChannel();
     const proxy = new Socks5Proxy({ listenPort: 0, connectChannel: async () => channel });
@@ -683,46 +782,103 @@ describe("SOCKS5 proxy", () => {
     expect((proxy as unknown as { pendingChannelOpens: number }).pendingChannelOpens).toBe(0);
   });
 
-  it("retains local TCP pending-open leases after local socket churn", async () => {
-    const pending: Array<ReturnType<typeof deferred<DirectTcpIpChannel>>> = [];
-    const connectChannel = vi.fn(() => {
-      const open = deferred<DirectTcpIpChannel>();
-      pending.push(open);
-      return open.promise;
-    });
-    const proxy = new LocalTcpProxy({
-      listenPort: 0,
-      target: { host: "example.com", port: 443 },
-      maxConnections: 8,
-      maxPendingChannelOpens: 2,
-      connectChannel
-    });
-    const handlings: Promise<void>[] = [];
+});
 
-    for (let index = 0; index < 2; index += 1) {
-      const fake = new FlowingFakeSocket();
-      handlings.push((proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(fake as unknown as Socket));
-      await waitFor(() => connectChannel.mock.calls.length === index + 1);
-      fake.closeInput();
-    }
+describe("socket-backed channels", () => {
+  it("pause their socket while too much is unacknowledged and resume at half the window", async () => {
+    const socket = new PausableFakeSocket();
+    const channel = createSocketBackedChannel(socket as unknown as Socket, 1_000, 100);
+    const received: number[] = [];
+    channel.onData((data) => received.push(data.length));
 
-    const rejected = new FlowingFakeSocket();
-    await (proxy as unknown as { handleSocket(socket: Socket): Promise<void> }).handleSocket(rejected as unknown as Socket);
-    expect(connectChannel).toHaveBeenCalledTimes(2);
-    expect(rejected.destroyed).toBe(true);
-    expect((proxy as unknown as { pendingChannelOpens: number }).pendingChannelOpens).toBe(2);
+    socket.emit("data", Buffer.alloc(60));
+    expect(socket.pauses).toBe(0);
+    socket.emit("data", Buffer.alloc(60));
+    expect(socket.pauses).toBe(1);
+    expect(received).toEqual([60, 60]);
 
-    const lateChannels = pending.map(() => new MemoryDirectTcpIpChannel());
-    const closed = lateChannels.map((channel) => {
-      const result = deferred<void>();
-      channel.onClose(() => result.resolve(undefined));
-      return result.promise;
-    });
-    pending.forEach((open, index) => open.resolve(lateChannels[index]));
-    await Promise.all([...handlings, ...closed]);
-    expect((proxy as unknown as { pendingChannelOpens: number }).pendingChannelOpens).toBe(0);
+    await channel.acknowledgeData?.(60);
+    expect(socket.resumes).toBe(0);
+    await channel.acknowledgeData?.(60);
+    expect(socket.resumes).toBe(1);
+
+    socket.emit("data", Buffer.alloc(99));
+    expect(socket.pauses).toBe(1);
   });
 
+  // A direct or Xray-upstream connection used to read everything the far end
+  // sent while the local client was not reading, until the proxy's 16 MiB
+  // per-connection queue limit destroyed it.
+  it("slow the far end down instead of overflowing the proxy queue for a slow local reader", async () => {
+    const totalBytes = 24 * 1024 * 1024;
+    const upstream = net.createServer((socket) => {
+      const chunk = Buffer.alloc(64 * 1024, 0x61);
+      let sent = 0;
+      const pump = (): void => {
+        while (sent < totalBytes) {
+          sent += chunk.length;
+          if (!socket.write(chunk)) {
+            socket.once("drain", pump);
+            return;
+          }
+        }
+        socket.end();
+      };
+      pump();
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstream.address() as net.AddressInfo).port;
+    const events: Socks5ProxyEvent[] = [];
+    const proxy = new Socks5Proxy({
+      listenHost: "127.0.0.1",
+      connectChannel: () => openDirectEgressChannel({ host: "127.0.0.1", port: upstreamPort })
+    });
+    proxy.onEvent((event) => events.push(event));
+    const endpoint = await proxy.start();
+    const client = net.connect(endpoint.port, endpoint.host);
+    try {
+      await new Promise<void>((resolve) => client.once("connect", () => resolve()));
+      let received = 0;
+      let headerSeen = false;
+      const done = new Promise<void>((resolve, reject) => {
+        client.on("data", (chunk: Buffer) => {
+          if (!headerSeen) {
+            const text = chunk.toString("latin1");
+            const headerEnd = text.indexOf("\r\n\r\n");
+            if (headerEnd >= 0) {
+              headerSeen = true;
+              received += chunk.length - headerEnd - 4;
+              // Stop reading: the local application is busy.
+              client.pause();
+            }
+            return;
+          }
+          received += chunk.length;
+          if (received >= totalBytes) {
+            resolve();
+          }
+        });
+        client.on("error", reject);
+        client.on("close", () => (received >= totalBytes ? resolve() : reject(new Error(`closed after ${received} bytes`))));
+      });
+      // Observed by the await below; this only keeps an early failure from
+      // also surfacing as an unhandled rejection.
+      done.catch(() => undefined);
+      client.write("CONNECT bulk.example:443 HTTP/1.1\r\nHost: bulk.example:443\r\n\r\n");
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(events.filter((event) => /queue limit/u.test(event.message))).toEqual([]);
+      expect(client.destroyed).toBe(false);
+
+      client.resume();
+      await done;
+      expect(received).toBe(totalBytes);
+    } finally {
+      client.destroy();
+      await proxy.stop();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  }, 20_000);
 });
 
 describe("Windows PAC generation", () => {
@@ -754,13 +910,13 @@ describe("Windows PAC generation", () => {
   // proxy-list entries matched a domain together with its subdomains. Custom
   // rules therefore missed `www.` and every API/CDN subdomain and looked dead
   // next to the lists.
-  it("routes subdomains of a plain domain rule and still lets the direct list win", () => {
+  it("routes subdomains of a plain domain rule, ahead of the direct list", () => {
     const pac = buildProxyPac(
       [{ id: "1", type: "domain", value: "example.com", enabled: true, createdAt: "", updatedAt: "" }],
       "127.0.0.1",
       1080,
       "mixed",
-      { directDomains: ["cdn.example.com"], mode: "selected-rules" }
+      { directDomains: ["cdn.example.com", "direct.example"], mode: "selected-rules" }
     );
     const findProxyForURL = new Function(
       "dnsResolveEx",
@@ -772,8 +928,145 @@ describe("Windows PAC generation", () => {
     for (const host of ["example.com", "www.example.com", "api.example.com"]) {
       expect(findProxyForURL(`https://${host}/`, host)).toBe("PROXY 127.0.0.1:1080");
     }
-    expect(findProxyForURL("https://cdn.example.com/", "cdn.example.com")).toBe("DIRECT");
+    // A rule the user wrote outranks the curated direct list, as it does on
+    // the local listener and in the TUN policy.
+    expect(findProxyForURL("https://cdn.example.com/", "cdn.example.com")).toBe("PROXY 127.0.0.1:1080");
+    expect(findProxyForURL("https://direct.example/", "direct.example")).toBe("DIRECT");
     expect(findProxyForURL("https://notexample.com/", "notexample.com")).toBe("DIRECT");
+  });
+
+  it("keeps local and private destinations direct when no rule names them", () => {
+    // A public IP rule makes the PAC look hosts up, local ones included.
+    const rules: RoutingRule[] = [
+      { id: "public", type: "ip", value: "203.0.113.0/24", enabled: true, createdAt: "", updatedAt: "" },
+      { id: "site", type: "domain", value: "example.org", enabled: true, createdAt: "", updatedAt: "" }
+    ];
+    const answers = { intranet: "10.1.2.3", "printer.local": "192.168.1.5", localhost: "127.0.0.1" };
+    for (const mode of ["proxy-all", "selected-rules"] as const) {
+      const pac = buildProxyPac(rules, "127.0.0.1", 1080, "mixed", { mode, directDomains: ["direct.example"] });
+      for (const host of [
+        "127.0.0.1",
+        "10.20.30.40",
+        "172.16.0.1",
+        "172.31.255.254",
+        "192.168.1.1",
+        "169.254.10.10",
+        "100.64.0.1",
+        "100.127.255.255",
+        "0.0.0.0",
+        "localhost",
+        "intranet",
+        "printer.local",
+        "wiki.corp.local",
+        "[::1]",
+        "[fe80::1]",
+        "[fd12:3456::1]",
+        "[::ffff:192.168.1.1]",
+        "[::ffff:a00:1]"
+      ]) {
+        expect(evaluatePacWithDns(pac, host, answers), `${mode} ${host}`).toBe("DIRECT");
+      }
+    }
+
+    const proxyAll = buildProxyPac([], "127.0.0.1", 1080, "mixed", { mode: "proxy-all", directDomains: ["direct.example"] });
+    for (const host of ["172.32.0.1", "100.128.0.1", "8.8.8.8", "example.com", "[2001:db8::1]", "[fd::1]"]) {
+      expect(evaluatePac(proxyAll, host), host).toBe("PROXY 127.0.0.1:1080");
+    }
+  });
+
+  it("lets a user rule for the local network win over it, so it reaches the network behind the server", () => {
+    // 10.0.0.0/8 was the rules form's own example: an explicit rule wins.
+    const rules: RoutingRule[] = [
+      { id: "lan", type: "ip", value: "10.0.0.0/8", enabled: true, createdAt: "", updatedAt: "" },
+      { id: "intranet", type: "domain", value: "corp.local", enabled: true, createdAt: "", updatedAt: "" }
+    ];
+    const answers = { nas: "10.1.2.3", "printer.local": "192.168.1.5", localhost: "127.0.0.1" };
+    for (const mode of ["proxy-all", "selected-rules"] as const) {
+      const pac = buildProxyPac(rules, "127.0.0.1", 1080, "mixed", { mode, directDomains: ["direct.example"] });
+      for (const host of ["10.1.2.3", "10.20.30.40", "wiki.corp.local", "corp.local", "nas"]) {
+        expect(evaluatePacWithDns(pac, host, answers), `${mode} ${host}`).toBe("PROXY 127.0.0.1:1080");
+      }
+      // The rest of the local network still stays direct.
+      for (const host of ["192.168.1.1", "printer.local", "localhost", "[::1]", "172.16.0.1"]) {
+        expect(evaluatePacWithDns(pac, host, answers), `${mode} ${host}`).toBe("DIRECT");
+      }
+    }
+    // Without the rule, 10.1.2.3 stays direct.
+    const withoutRule = buildProxyPac([rules[1]], "127.0.0.1", 1080, "mixed", { mode: "selected-rules" });
+    expect(evaluatePacWithDns(withoutRule, "10.1.2.3", answers)).toBe("DIRECT");
+  });
+
+  it("ranks an address process discovery learned after the direct list, since the PAC cannot tell which application asks", () => {
+    // Chrome, selected by a process rule, was seen at yandex.ru's address.
+    // As a user IP rule that address pulled every application's yandex.ru -
+    // and any direct-list site sharing it - into the tunnel.
+    const rules = buildSelectedRulesWithProcessIps(
+      [{ id: "chrome", type: "process.name", value: "chrome.exe", enabled: true, createdAt: "", updatedAt: "" }],
+      new Set(["77.88.55.88"])
+    );
+    expect(rules.some((rule) => rule.id === "process-ip:77.88.55.88")).toBe(true);
+    const answers = { "yandex.ru": "77.88.55.88", "mail.yandex.ru": "77.88.55.88", "cdn-neighbour.example": "77.88.55.88" };
+    const pac = buildProxyPac(rules, "127.0.0.1", 1080, "mixed", { mode: "selected-rules", directDomains: ["yandex.ru"] });
+    expect(evaluatePacWithDns(pac, "yandex.ru", answers)).toBe("DIRECT");
+    expect(evaluatePacWithDns(pac, "mail.yandex.ru", answers)).toBe("DIRECT");
+    // It still selects what the direct list does not keep out, by name or as written.
+    expect(evaluatePacWithDns(pac, "cdn-neighbour.example", answers)).toBe("PROXY 127.0.0.1:1080");
+    expect(evaluatePacWithDns(pac, "77.88.55.88", answers)).toBe("PROXY 127.0.0.1:1080");
+    // A user's own rule for that address still beats the direct list.
+    const userRule = buildProxyPac(
+      [{ id: "mine", type: "ip", value: "77.88.55.88", enabled: true, createdAt: "", updatedAt: "" }],
+      "127.0.0.1",
+      1080,
+      "mixed",
+      { mode: "selected-rules", directDomains: ["yandex.ru"] }
+    );
+    expect(evaluatePacWithDns(userRule, "yandex.ru", answers)).toBe("PROXY 127.0.0.1:1080");
+  });
+
+  it("lets user rules win over the direct list in proxy-all and resolves only hosts that would go direct", () => {
+    const pac = buildProxyPac(
+      [
+        { id: "domain", type: "domain", value: "mail.service.ru", enabled: true, createdAt: "", updatedAt: "" },
+        { id: "ip", type: "ip", value: "203.0.113.0/24", enabled: true, createdAt: "", updatedAt: "" }
+      ],
+      "127.0.0.1",
+      1080,
+      "mixed",
+      { mode: "proxy-all", directDomains: [".ru"] }
+    );
+    let dnsCalls = 0;
+    const context: Record<string, unknown> = {
+      dnsResolveEx: (host: string) => {
+        dnsCalls += 1;
+        return host === "cdn.service.ru" ? "203.0.113.9" : "198.51.100.1";
+      },
+      isInNet: () => false,
+      isInNetEx: (address: string, range: string) => range === "203.0.113.0/24" && address.startsWith("203.0.113.")
+    };
+    const route = (host: string): string => {
+      runInNewContext(`${pac}\nresult = FindProxyForURL("https://${host}/", ${JSON.stringify(host)});`, context);
+      return context.result as string;
+    };
+
+    expect(route("example.com")).toBe("PROXY 127.0.0.1:1080");
+    expect(dnsCalls).toBe(0);
+    expect(route("mail.service.ru")).toBe("PROXY 127.0.0.1:1080");
+    expect(dnsCalls).toBe(0);
+    expect(route("cdn.service.ru")).toBe("PROXY 127.0.0.1:1080");
+    expect(route("news.service.ru")).toBe("DIRECT");
+    expect(dnsCalls).toBe(2);
+  });
+
+  it("lets the direct list win over the proxy list in split routing", () => {
+    const pac = buildProxyPac([], "127.0.0.1", 1080, "mixed", {
+      mode: "selected-rules",
+      proxyDomains: ["example.com"],
+      directDomains: ["direct.example.com"]
+    });
+
+    expect(evaluatePac(pac, "direct.example.com")).toBe("DIRECT");
+    expect(evaluatePac(pac, "api.direct.example.com")).toBe("DIRECT");
+    expect(evaluatePac(pac, "www.example.com")).toBe("PROXY 127.0.0.1:1080");
   });
 
   it("preserves DNS matching for a user-authored exact IPv4 rule", () => {
@@ -910,7 +1203,8 @@ describe("Windows PAC generation", () => {
 
     runInNewContext(`${pac}\nresult = FindProxyForURL("https://cdn.example/", "cdn.example");`, context);
 
-    expect(pac).toContain('var proxyResolvedExactIps = {"203.0.113.2":1};');
+    // Learned addresses rank after the direct list, so they have a table of their own.
+    expect(pac).toContain('var learnedResolvedExactIps = {"203.0.113.2":1};');
     expect(context.result).toBe("PROXY 127.0.0.1:1080");
   });
 
@@ -1170,6 +1464,44 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
   }
 }
 
+/**
+ * Runs the PAC with the DNS and network helpers a browser's PAC engine
+ * provides, IPv4 only: names resolve from `answers`, literals to themselves.
+ */
+function evaluatePacWithDns(pac: string, host: string, answers: Record<string, string>): string {
+  const ipv4 = (value: string): number | undefined => {
+    const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u.exec(value);
+    return match ? match.slice(1).reduce((sum, octet) => sum * 256 + Number(octet), 0) : undefined;
+  };
+  const inRange = (address: string, network: string, prefix: number): boolean => {
+    const value = ipv4(address);
+    const base = ipv4(network);
+    if (value === undefined || base === undefined) {
+      return false;
+    }
+    const size = 2 ** (32 - prefix);
+    return Math.floor(value / size) === Math.floor(base / size);
+  };
+  const resolve = (name: string): string => answers[name] ?? (ipv4(name) !== undefined || name.includes(":") ? name : "");
+  const context: Record<string, unknown> = {
+    dnsResolve: resolve,
+    dnsResolveEx: resolve,
+    isInNet: (address: string, network: string, mask: string) => {
+      const bits = (ipv4(mask) ?? 0).toString(2).replace(/0+$/u, "").length;
+      return inRange(address, network, bits);
+    },
+    isInNetEx: (address: string, range: string) => {
+      const [network = "", prefix = "32"] = range.split("/");
+      return inRange(address, network, Number(prefix));
+    }
+  };
+  runInNewContext(`${pac}\nresult = FindProxyForURL("https://${host}/", ${JSON.stringify(host)});`, context);
+  if (typeof context.result !== "string") {
+    throw new Error("PAC did not return a routing result.");
+  }
+  return context.result;
+}
+
 function evaluatePac(pac: string, host: string): string {
   const context: { result?: string } = {};
   runInNewContext(`${pac}\nresult = FindProxyForURL("https://${host}/", ${JSON.stringify(host)});`, context);
@@ -1345,5 +1677,21 @@ class FlowingFakeSocket extends EventEmitter {
       }
       this.flushPendingData();
     });
+  }
+}
+
+class PausableFakeSocket extends EventEmitter {
+  destroyed = false;
+  pauses = 0;
+  resumes = 0;
+
+  pause(): this {
+    this.pauses += 1;
+    return this;
+  }
+
+  resume(): this {
+    this.resumes += 1;
+    return this;
   }
 }

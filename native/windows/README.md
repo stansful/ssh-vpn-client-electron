@@ -5,9 +5,9 @@ Everything in `native/windows/<arch>/` is copied verbatim into the packaged app
 
 ## `shadow-ssh-service.exe`
 
-Built by `npm run native:build-service` (run `go mod download` in
-`native/service-go` first - the TUN dataplane pulls in a userspace network
-stack). Hosts per-connection process attribution and the TUN dataplane.
+Built by `npm run native:build-service` (the first build fetches the Go
+modules the TUN dataplane needs; see `native/README.md`). Hosts
+per-connection process attribution and the TUN dataplane.
 
 A quick smoke test without Windows, if Wine is available:
 
@@ -56,6 +56,15 @@ therefore also pointed at folders a person can actually use, in order:
 
 The Electron side passes 2 and 3 in `SHADOW_SSH_WINTUN_DIRS`. A failure lists
 every path that was tried.
+
+Every one of those folders is writable by the user - the first too, because the
+portable build runs from `%TEMP%` - and TUN mode runs the helper elevated. The
+helper therefore loads a candidate only if it is byte-for-byte the WireGuard
+0.14.1 DLL for its architecture (SHA-256 pinned in
+`native/service-go/internal/tun/verify.go`); any other file is skipped and named
+in the diagnostic. Updating wintun means updating those digests along with
+`scripts/wintun-checksums.json`; a Go test fails if the download script's
+version and the pinned one disagree.
 
 The DLL is deliberately not committed: it is a third-party signed binary and
 should be fetched from its vendor rather than vendored here.

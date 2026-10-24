@@ -23,6 +23,8 @@ export interface SshTcpConnectOptions {
   timeoutMs?: number;
   clientSoftwareVersion?: string;
   keepAliveInitialDelayMs?: number;
+  /** Destroys the socket and rejects while the lookup or TCP handshake is still running. */
+  signal?: AbortSignal;
 }
 
 export interface SshTransportLimits {
@@ -92,6 +94,10 @@ export class SshSocketTransport {
   }
 
   static async connect(options: SshTcpConnectOptions): Promise<SshSocketTransport> {
+    const { signal } = options;
+    if (signal?.aborted) {
+      throw connectAbortReason(signal);
+    }
     const socket = net.createConnection({ host: options.host, port: options.port });
     configureLowLatencySocket(socket, { keepAliveInitialDelayMs: options.keepAliveInitialDelayMs });
     await new Promise<void>((resolve, reject) => {
@@ -99,18 +105,28 @@ export class SshSocketTransport {
         socket.destroy(new Error(`SSH TCP connect timeout for ${options.host}:${options.port}.`));
       }, options.timeoutMs ?? 10000);
       timeout.unref();
-      const onConnect = (): void => {
+      // Destroying with an error is what settles the wait: a plain destroy()
+      // emits only "close", which nothing here listens for.
+      const onAbort = (): void => {
+        socket.destroy(connectAbortReason(signal!));
+      };
+      const cleanup = (): void => {
         clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const onConnect = (): void => {
+        cleanup();
         socket.off("error", onError);
         resolve();
       };
       const onError = (error: Error): void => {
-        clearTimeout(timeout);
+        cleanup();
         socket.off("connect", onConnect);
         reject(error);
       };
       socket.once("connect", onConnect);
       socket.once("error", onError);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
     return new SshSocketTransport(socket);
   }
@@ -344,8 +360,12 @@ export class SshSocketTransport {
       return;
     }
     this.packetReaderStarted = true;
-    this.socket.on("data", (chunk) => this.handleData(chunk));
+    // Take what is already buffered (bytes that arrived with the server's
+    // identification line, often its KEXINIT) before listening: read() also
+    // emits "data" to every listener present, and handling that chunk twice
+    // would desynchronise the packet sequence numbers behind every MAC.
     const buffered = this.socket.read();
+    this.socket.on("data", (chunk) => this.handleData(chunk));
     if (Buffer.isBuffer(buffered) && buffered.length > 0) {
       this.handleData(buffered);
     }
@@ -480,6 +500,15 @@ function isPriorityControlPayload(payload: Buffer): boolean {
 
 function outboundPayloadCancelledError(): Error {
   const error = new Error("SSH outbound payload was cancelled before writing.");
+  error.name = "AbortError";
+  return error;
+}
+
+function connectAbortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) {
+    return signal.reason;
+  }
+  const error = new Error("SSH TCP connect was cancelled.");
   error.name = "AbortError";
   return error;
 }

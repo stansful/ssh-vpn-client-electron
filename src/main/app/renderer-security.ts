@@ -109,6 +109,85 @@ export function assessRendererIpcTrust({
   return { trusted: true };
 }
 
+/**
+ * Web permissions the app's own renderer may use. Clipboard, notifications
+ * and external links all go through main-process IPC, so the only one left is
+ * `fileSystem`: "Export rules" writes the file the user just picked in the
+ * save dialog.
+ */
+const RENDERER_PERMISSIONS: ReadonlySet<string> = new Set(["fileSystem"]);
+
+/**
+ * Electron grants every permission request when no handler is set. This
+ * denies all of them except the ones the trusted renderer needs, and only
+ * for that renderer.
+ */
+export function isRendererPermissionAllowed(input: {
+  permission: string;
+  /** The requesting WebContents is one of the app's registered windows. */
+  fromApplicationWindow: boolean;
+  /** URL of the requesting frame (or its WebContents). */
+  requestingUrl: string;
+  trustedUrl: string;
+  platform?: NodeJS.Platform;
+}): boolean {
+  return (
+    RENDERER_PERMISSIONS.has(input.permission) &&
+    input.fromApplicationWindow &&
+    isTrustedRendererUrl(input.requestingUrl, input.trustedUrl, input.platform)
+  );
+}
+
+/**
+ * Electron's permission *check*, which is asked more than a request is. For
+ * every File System Access grant - the write grant the save picker just gave
+ * included - Electron checks the grant's status with no WebContents and only
+ * the origin that holds it, and once a check handler is set its answer
+ * replaces the grant's. Insisting on the window there refused "Export rules"
+ * its own write, after the picker had already created or emptied the chosen
+ * file. So a `fileSystem` check without a WebContents is allowed for a file
+ * path held by the trusted renderer's origin; the grant itself only ever came
+ * from that renderer's picker, through the request handler. Every other check
+ * needs the window, as a request does.
+ */
+export function isRendererPermissionCheckAllowed(input: {
+  permission: string;
+  /** Whether the check names a WebContents at all. */
+  hasWebContents: boolean;
+  /** The requesting WebContents is one of the app's registered windows. */
+  fromApplicationWindow: boolean;
+  /** The origin Electron passes to the check, e.g. "file:///". */
+  requestingOrigin: string;
+  /** URL of the requesting frame (or its WebContents). */
+  requestingUrl: string;
+  /** The path of a `fileSystem` check. */
+  filePath?: string;
+  trustedUrl: string;
+  platform?: NodeJS.Platform;
+}): boolean {
+  if (input.hasWebContents) {
+    return isRendererPermissionAllowed(input);
+  }
+  if (input.permission !== "fileSystem" || !input.filePath) {
+    return false;
+  }
+  const trustedOrigin = rendererOrigin(input.trustedUrl);
+  return trustedOrigin !== undefined && rendererOrigin(input.requestingOrigin) === trustedOrigin;
+}
+
+/** The origin a renderer URL is served from, as Electron reports it: every file: URL shares one. */
+function rendererOrigin(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "file:") {
+      return "file://";
+    }
+    return url.origin === "null" ? undefined : url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeRendererUrl(value: string, platform: NodeJS.Platform): string | undefined {
   try {
     const url = new URL(value);

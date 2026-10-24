@@ -20,7 +20,8 @@ import {
 import { SSH_MSG_CHANNEL_OPEN, SSH_MSG_CHANNEL_REQUEST } from "./channel-messages.js";
 import { SshPrivateKeyLoadError, buildSignedPublicKeyAuthRequest, loadPrivateKey } from "./private-key.js";
 import type { PacketProtectionConfig } from "./packet-codec.js";
-import { SshSessionStateMachine, type ChannelEvent } from "./session-state.js";
+import { SshHostKeyMismatchError, SshSessionStateMachine, type ChannelEvent, type PresentedHostKey } from "./session-state.js";
+import { hostKeyTypeOf, nextHostKeyAlgorithms, preferHostKeyType } from "./algorithms.js";
 import { SshSocketTransport, type SshIdentificationExchange, type SshPacketTransportEvent } from "./socket-transport.js";
 import {
   SSH_MSG_DISCONNECT,
@@ -32,13 +33,22 @@ import {
   encodeKeepaliveRequest,
   encodeRequestFailure
 } from "./transport-messages.js";
-import { SSH_MSG_KEXINIT } from "./messages.js";
+import { DEFAULT_KEX_INIT, SSH_MSG_KEXINIT, createDefaultKexInit } from "./messages.js";
 
 export interface SshLiveClientOptions {
   host: string;
   port: number;
   username: string;
   expectedServerFingerprint?: string;
+  /**
+   * Host key type ("ssh-ed25519" or "ssh-rsa") to ask the server for first:
+   * the type the expected fingerprint is known to belong to. Without it a pin
+   * of a server's RSA key costs a throw-away connection on every connect,
+   * since the server presents its Ed25519 key first. The other types are
+   * still offered, but a key of this type that does not match ends the
+   * connect: it is another key, not the server's other type.
+   */
+  preferredHostKeyType?: string;
   password?: string;
   privateKey?: string;
   privateKeyPassphrase?: string;
@@ -98,10 +108,20 @@ type ChannelDeliveryState = {
   pendingDataBytes: number;
 };
 
+type ConnectAttempt = {
+  signal?: AbortSignal;
+  /** The host-key algorithms offered, in order; undefined offers the defaults. */
+  hostKeyAlgorithms?: string[];
+  /** Wall-clock time by which the key exchange of this attempt must have finished. */
+  keyExchangeDeadline?: number;
+};
+
 const MAX_PRE_AUTH_QUEUED_PAYLOADS = 128;
 const MAX_PRE_AUTH_QUEUED_BYTES = 1024 * 1024;
-const MAX_REKEY_QUEUED_PAYLOADS = 2048;
-const MAX_REKEY_QUEUED_BYTES = 32 * 1024 * 1024;
+// During a runtime rekey only key-exchange messages wait in the queue (see
+// handleRuntimePayload); a handful is all a well-behaved peer ever sends.
+const MAX_REKEY_QUEUED_PAYLOADS = 64;
+const MAX_REKEY_QUEUED_BYTES = 1024 * 1024;
 const DEFAULT_REKEY_AFTER_BYTES = 1024 * 1024 * 1024;
 const DEFAULT_REKEY_INTERVAL_MS = 60 * 60 * 1000;
 const MAX_TIMER_DELAY_MS = 2_147_000_000;
@@ -116,6 +136,23 @@ const MAX_TOTAL_PENDING_CHANNEL_DATA_BYTES = 32 * 1024 * 1024;
  * quickly a half-open socket is noticed; half a minute keeps that under two
  * minutes end to end while still tolerating a slow link.
  */
+/** See hostKeysPresentedBeforeFailure. */
+const hostKeysBeforeFailure = new WeakMap<object, readonly PresentedHostKey[]>();
+
+/**
+ * The host keys that did not match on the attempts of one SshLiveClient.connect
+ * before the error it finally failed with, when that error is not a mismatch
+ * itself: the retry that asked for the server's other key type was reset,
+ * stalled or timed out. Such an error stays an ordinary, retryable one - a
+ * server whose other key is the expected one may just have dropped that
+ * connection - but the caller can still say which key was presented, since a
+ * server that drops the retry on purpose would otherwise hide the mismatch.
+ * Empty for every other error.
+ */
+export function hostKeysPresentedBeforeFailure(error: unknown): readonly PresentedHostKey[] {
+  return typeof error === "object" && error !== null ? hostKeysBeforeFailure.get(error) ?? [] : [];
+}
+
 export const DEFAULT_KEEPALIVE_TIMEOUT_MS = 30_000;
 /**
  * A probe issued because the machine just woke up or changed networks. The
@@ -178,16 +215,21 @@ export class SshLiveClient {
   private unansweredOutbound = false;
   private silentSendProbeTimer: NodeJS.Timeout | undefined;
   private verifiedHostKeyFingerprint: string | undefined;
+  private verifiedHostKeyType: string | undefined;
 
   private constructor(
     private readonly transport: SshSocketTransport,
     private readonly identification: SshIdentificationExchange,
-    private readonly options: SshLiveClientOptions
+    private readonly options: SshLiveClientOptions,
+    hostKeyAlgorithms?: readonly string[]
   ) {
     this.session = new SshSessionStateMachine({
       clientVersion: identification.clientLine,
       serverVersion: identification.serverLine,
-      expectedServerFingerprint: options.expectedServerFingerprint || undefined
+      expectedServerFingerprint: options.expectedServerFingerprint || undefined,
+      // A restriction or a preferred type holds for the whole session, rekeys
+      // included, so the server keeps signing with the key type that matched.
+      clientKexInit: hostKeyAlgorithms ? { ...createDefaultKexInit(), serverHostKeyAlgorithms: [...hostKeyAlgorithms] } : undefined
     });
     this.transport.onEvent((event) => this.handleTransportEvent(event));
   }
@@ -202,23 +244,129 @@ export class SshLiveClient {
     return this.verifiedHostKeyFingerprint;
   }
 
-  static async connect(options: SshLiveClientOptions): Promise<SshLiveClient> {
-    let transport: SshSocketTransport | undefined;
+  /** Type of that host key as OpenSSH names it: "ssh-ed25519" or "ssh-rsa". */
+  get hostKeyAlgorithm(): string | undefined {
+    return this.verifiedHostKeyType;
+  }
+
+  /**
+   * Opens and authenticates a session.
+   *
+   * With an expected fingerprint, a host key of the wrong type is not the end:
+   * a server usually holds an Ed25519 and an RSA key and presents the one the
+   * client asks for first. When the presented key does not match and the
+   * server offered another key type, a fresh connection asks for that type
+   * instead, before anything is authenticated, until a key matches or no type
+   * is left. Those retries share the time one attempt may spend before
+   * authentication, so a pin of the second key type never makes giving up
+   * slower. `preferredHostKeyType` saves that retry when the caller already
+   * knows which type the pin is - and then a non-matching key of that type is
+   * final. Retrying would prove nothing, since a server presents one key per
+   * type, and it would let whoever presented that key replace the mismatch
+   * with a reset or stalled second connection, which reads as an ordinary
+   * network failure and is retried for ever instead of stopping. Where the
+   * type is not known, such a failure is still ordinary and retryable, but it
+   * carries the key that did not match (hostKeysPresentedBeforeFailure).
+   *
+   * Aborting `signal` destroys the socket and rejects with an AbortError, at
+   * any stage up to the returned session.
+   */
+  static async connect(options: SshLiveClientOptions, signal?: AbortSignal): Promise<SshLiveClient> {
+    const startedAt = Date.now();
+    const triedKeyTypes = new Set<string>();
+    const presentedHostKeys: PresentedHostKey[] = [];
+    let hostKeyAlgorithms = preferHostKeyType(DEFAULT_KEX_INIT.serverHostKeyAlgorithms, options.preferredHostKeyType);
+    let retrying = false;
+    // A retry that fails for another reason does not erase the key that did
+    // not match: the error carries it (hostKeysPresentedBeforeFailure).
+    const failedAfterMismatch = (error: unknown): unknown => {
+      if (presentedHostKeys.length > 0 && typeof error === "object" && error !== null) {
+        hostKeysBeforeFailure.set(error, [...presentedHostKeys]);
+      }
+      return error;
+    };
+    for (;;) {
+      const keyExchangeDeadline = retrying ? startedAt + preAuthenticationBudgetMs(options) : undefined;
+      if (keyExchangeDeadline !== undefined && Date.now() >= keyExchangeDeadline) {
+        throw failedAfterMismatch(connectTimeoutError());
+      }
+      try {
+        return await SshLiveClient.connectAttempt(options, { signal, hostKeyAlgorithms, keyExchangeDeadline });
+      } catch (error) {
+        if (!(error instanceof SshHostKeyMismatchError)) {
+          throw failedAfterMismatch(error);
+        }
+        retrying = true;
+        const presentedKeyType = hostKeyTypeOf(error.negotiatedHostKeyAlgorithm);
+        triedKeyTypes.add(presentedKeyType);
+        presentedHostKeys.push(...error.presentedHostKeys);
+        hostKeyAlgorithms = presentedKeyType === options.preferredHostKeyType
+          ? undefined
+          : nextHostKeyAlgorithms(DEFAULT_KEX_INIT.serverHostKeyAlgorithms, error.serverHostKeyAlgorithms, triedKeyTypes);
+        if (!hostKeyAlgorithms) {
+          throw presentedHostKeys.length === error.presentedHostKeys.length
+            ? error
+            : new SshHostKeyMismatchError({
+                expectedFingerprint: error.expectedFingerprint,
+                presentedHostKeys,
+                negotiatedHostKeyAlgorithm: error.negotiatedHostKeyAlgorithm,
+                serverHostKeyAlgorithms: error.serverHostKeyAlgorithms
+              });
+        }
+      }
+    }
+  }
+
+  private static async connectAttempt(options: SshLiveClientOptions, attempt: ConnectAttempt): Promise<SshLiveClient> {
+    const { signal } = attempt;
+    if (signal?.aborted) {
+      throw connectCancelledError();
+    }
+    // One place that ends the attempt, whatever stage it is in: before the
+    // socket exists the TCP connect watches `cancel`, after that destroying
+    // the transport rejects every wait of the handshake.
+    const cancel = new AbortController();
+    const state: { transport?: SshSocketTransport; stopped?: Error } = {};
+    const stop = (reason: Error): void => {
+      if (state.stopped) {
+        return;
+      }
+      state.stopped = reason;
+      cancel.abort(reason);
+      state.transport?.destroy(reason);
+    };
+    const onAbort = (): void => stop(connectCancelledError());
+    signal?.addEventListener("abort", onAbort, { once: true });
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    if (attempt.keyExchangeDeadline !== undefined) {
+      deadlineTimer = setTimeout(() => stop(connectTimeoutError()), Math.max(0, attempt.keyExchangeDeadline - Date.now()));
+      deadlineTimer.unref();
+    }
     try {
-      transport = await SshSocketTransport.connect({
+      const transport = await SshSocketTransport.connect({
         host: options.host,
         port: options.port,
         timeoutMs: options.connectTimeoutMs,
         clientSoftwareVersion: "shadow-ssh-desktop",
-        keepAliveInitialDelayMs: sshKernelKeepaliveInitialDelayMs(options.keepaliveIntervalSec)
+        keepAliveInitialDelayMs: sshKernelKeepaliveInitialDelayMs(options.keepaliveIntervalSec),
+        signal: cancel.signal
       });
+      state.transport = transport;
+      if (state.stopped) {
+        // Stopped after the handshake finished but before this continuation ran.
+        throw state.stopped;
+      }
       const identification = await transport.exchangeIdentification(
         "shadow-ssh-desktop",
         options.connectTimeoutMs ?? options.operationTimeoutMs ?? 10000
       );
-      const client = new SshLiveClient(transport, identification, options);
+      const client = new SshLiveClient(transport, identification, options, attempt.hostKeyAlgorithms);
       await client.performKex();
+      clearTimeout(deadlineTimer);
       await client.authenticate();
+      if (state.stopped) {
+        throw state.stopped;
+      }
       client.resetRekeyCounters();
       client.startRuntimeDispatch();
       client.startKeepalive();
@@ -226,8 +374,12 @@ export class SshLiveClient {
       client.events.emit("event", { type: "ready" } satisfies SshLiveClientEvent);
       return client;
     } catch (error) {
-      transport?.destroy(error instanceof Error ? error : new Error(String(error)));
-      throw error;
+      const failure = state.stopped ?? (error instanceof Error ? error : new Error(String(error)));
+      state.transport?.destroy(failure);
+      throw failure;
+    } finally {
+      clearTimeout(deadlineTimer);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 
@@ -679,6 +831,7 @@ export class SshLiveClient {
     const kexReply = await this.waitForPayload((payload) => messageNumber(payload) === 31, this.operationTimeoutMs());
     const complete = this.session.completeKex(kexReply);
     this.verifiedHostKeyFingerprint ??= complete.serverHostKeyFingerprint;
+    this.verifiedHostKeyType ??= complete.serverHostKeyType;
     const inbound: PacketProtectionConfig = {
       cipherName: kexInit.negotiated.encryptionServerToClient as PacketProtectionConfig["cipherName"],
       encryptionKey: complete.transportKeys.encryptionKeyServerToClient,
@@ -913,20 +1066,23 @@ export class SshLiveClient {
 
   private handleRuntimePayload(payload: Buffer): void {
     const number = messageNumber(payload);
-    if (number === SSH_MSG_KEXINIT) {
-      if (this.rekeyPromise) {
-        this.enqueuePayload(payload, MAX_REKEY_QUEUED_PAYLOADS, MAX_REKEY_QUEUED_BYTES);
-        this.flushPayloadWaiters();
-      } else {
-        void this.beginRuntimeRekey(payload);
-      }
+    if (number === SSH_MSG_KEXINIT && !this.rekeyPromise) {
+      void this.beginRuntimeRekey(payload);
       return;
     }
-    if (this.rekeyPromise) {
+    if (this.rekeyPromise && isKeyExchangeMessage(number)) {
+      // Only the key exchange waits for these.
       this.enqueuePayload(payload, MAX_REKEY_QUEUED_PAYLOADS, MAX_REKEY_QUEUED_BYTES);
       this.flushPayloadWaiters();
       return;
     }
+    // Everything else keeps flowing during a rekey. Until its own KEXINIT the
+    // server may go on sending channel data, under the old keys, for as long
+    // as our KEXINIT takes to reach it; holding that back used to fill a
+    // bounded queue and kill the session on fast, long links. Whatever the
+    // dispatch wants to send in return - window adjustments, replies, close
+    // confirmations - goes through withRuntimeGate and the transport's KEX
+    // barrier, so none of it is written before NEWKEYS.
     this.dispatchRuntimePayload(payload);
     this.maybeStartAutomaticRekey();
   }
@@ -1510,6 +1666,27 @@ function channelOpenCancelledError(): Error {
   return error;
 }
 
+function connectCancelledError(): Error {
+  const error = new Error("SSH connect was cancelled.");
+  error.name = "AbortError";
+  return error;
+}
+
+// Retryable on purpose: a slow retry says nothing about the server's keys.
+function connectTimeoutError(): Error {
+  return new Error("SSH connect timed out before the key exchange finished.");
+}
+
+/**
+ * The longest a single attempt could already spend before authentication:
+ * TCP connect, identification, and the four key-exchange waits.
+ */
+function preAuthenticationBudgetMs(options: SshLiveClientOptions): number {
+  const tcpConnectTimeoutMs = options.connectTimeoutMs ?? 10000;
+  const identificationTimeoutMs = options.connectTimeoutMs ?? options.operationTimeoutMs ?? 10000;
+  return tcpConnectTimeoutMs + identificationTimeoutMs + 4 * (options.operationTimeoutMs ?? 15000);
+}
+
 class SshDirectTcpIpChannel implements DirectTcpIpChannel {
   private closed = false;
   private endRequested = false;
@@ -1617,6 +1794,11 @@ export function normalizedSshKeepaliveIntervalMs(configuredIntervalSec: number |
 export function sshKernelKeepaliveInitialDelayMs(configuredIntervalSec: number | undefined): number {
   const applicationIntervalMs = normalizedSshKeepaliveIntervalMs(configuredIntervalSec);
   return Math.max(120_000, applicationIntervalMs * 2);
+}
+
+/** RFC 4253 §7: KEXINIT, NEWKEYS and the method-specific range 30-49. */
+function isKeyExchangeMessage(number: number): boolean {
+  return number === SSH_MSG_KEXINIT || number === SSH_MSG_NEWKEYS || (number >= 30 && number <= 49);
 }
 
 function isChannelMessage(number: number): boolean {

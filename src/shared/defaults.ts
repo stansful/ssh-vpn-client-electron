@@ -7,6 +7,12 @@ import type { AppSettings, AppStore, CustomTheme, PlatformTarget, RuntimeStatus 
  * from that build records nothing the user decided.
  */
 export const STORE_SCHEMA_VERSION = 3;
+
+/**
+ * How long a private key or profile link Shadow copied stays on the
+ * clipboard (main's SecretClipboardGuard); the copy next to both says so.
+ */
+export const SECRET_CLIPBOARD_CLEAR_MS = 45_000;
 export const RUSSIA_INSIDE_PROXY_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst";
 export const RUSSIA_OUTSIDE_DIRECT_LIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/outside-raw.lst";
 export const PUBLIC_PROXY_LIST_URL = "https://gitverse.ru/api/repos/zieng2/wl/raw/branch/master/list_universal.txt";

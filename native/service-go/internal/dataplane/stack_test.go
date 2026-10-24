@@ -185,8 +185,11 @@ func (c *clientStack) close() {
 
 // recordingDialers stand in for the transport and the physical interface.
 type recordingDialers struct {
-	mu           sync.Mutex
-	tunnelled    []netip.AddrPort
+	mu        sync.Mutex
+	tunnelled []netip.AddrPort
+	// tunnelNames are the names the tunnel was asked for, one per tunnelled
+	// dial, "" for a dial by address.
+	tunnelNames  []string
 	direct       []netip.AddrPort
 	associations int
 	tunnelEnd    chan net.Conn
@@ -202,9 +205,10 @@ func newRecordingDialers() *recordingDialers {
 	}
 }
 
-func (r *recordingDialers) DialTCP(ctx context.Context, destination netip.AddrPort) (net.Conn, error) {
+func (r *recordingDialers) DialTCP(ctx context.Context, destination netip.AddrPort, name string) (net.Conn, error) {
 	r.mu.Lock()
 	r.tunnelled = append(r.tunnelled, destination)
+	r.tunnelNames = append(r.tunnelNames, name)
 	r.mu.Unlock()
 	ours, theirs := net.Pipe()
 	r.tunnelEnd <- theirs
@@ -354,6 +358,13 @@ func TestDataplaneRoutesTCPBySniffedServerName(t *testing.T) {
 	if names := domains.Lookup(destination.Addr()); len(names) != 1 || names[0] != "www.example.org" {
 		t.Fatalf("sniffed name was not remembered: %v", names)
 	}
+	// The tunnel was asked for the name the hello carried, so the far end
+	// resolves it rather than following the local resolver's answer.
+	dialers.mu.Lock()
+	if len(dialers.tunnelNames) != 1 || dialers.tunnelNames[0] != "www.example.org" || dialers.tunnelled[0] != destination {
+		t.Fatalf("expected a dial by name for %s, got %v %v", destination, dialers.tunnelNames, dialers.tunnelled)
+	}
+	dialers.mu.Unlock()
 	conn.Close()
 	remote.Close()
 
@@ -531,6 +542,12 @@ func TestDataplaneDoesNotHoldFlowsAlreadySelectedByAddress(t *testing.T) {
 	if waited := time.Since(started); waited > sniffTimeout {
 		t.Fatalf("address-selected flow waited %v", waited)
 	}
+	// Nothing named it, so it is dialled by its address.
+	dialers.mu.Lock()
+	if len(dialers.tunnelNames) != 1 || dialers.tunnelNames[0] != "" {
+		t.Fatalf("expected a dial by address, got names %q", dialers.tunnelNames)
+	}
+	dialers.mu.Unlock()
 	conn.Close()
 }
 
@@ -781,5 +798,373 @@ func TestDataplaneDropsTunnelledIPv6DatagramsWhileTheTunnelHasNone(t *testing.T)
 	defer dialers.mu.Unlock()
 	if dialers.associations != 0 {
 		t.Fatalf("an IPv6 datagram was handed to a tunnel that cannot carry it")
+	}
+}
+
+// openTLS opens a flow to destination that sends a ClientHello for
+// serverName, and reports which way it was dialled.
+func openTLS(t *testing.T, client *clientStack, dialers *recordingDialers, destination netip.AddrPort, serverName string) string {
+	t.Helper()
+	conn := client.dialTCP(t, destination)
+	defer conn.Close()
+	if _, err := conn.Write(clientHelloFor(t, serverName, tls.VersionTLS13)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case remote := <-dialers.tunnelEnd:
+		remote.Close()
+		return "tunnel"
+	case remote := <-dialers.directEnd:
+		remote.Close()
+		return "direct"
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dial")
+		return ""
+	}
+}
+
+func TestFullTunnelSendsDirectListSitesDirect(t *testing.T) {
+	// Full tunnel used to ignore the "Russian services" list on TUN while the
+	// PAC honoured it. The flow's own name is what places it on the list.
+	client, dialers, _ := startTestDataplane(t, Config{
+		Mode:          routing.ModeProxyAll,
+		DirectDomains: []string{".ru", "yandex.example"},
+		ProxyDomains:  []string{"blocked.example"},
+	})
+	destination := netip.MustParseAddrPort("203.0.113.7:443")
+	if egress := openTLS(t, client, dialers, destination, "www.gosuslugi.ru"); egress != "direct" {
+		t.Fatalf("a direct-list site went %s", egress)
+	}
+	if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("203.0.113.8:443"), "music.yandex.example"); egress != "direct" {
+		t.Fatalf("a direct-list site went %s", egress)
+	}
+	// A blocked site is dialled by its name, so a poisoned local answer is not
+	// followed; any other name - possibly borrowed, as REALITY and fake-TLS
+	// clients do - keeps the address the application chose.
+	if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("203.0.113.9:443"), "www.blocked.example"); egress != "tunnel" {
+		t.Fatalf("a blocked site went %s", egress)
+	}
+	if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("203.0.113.11:443"), "www.example.org"); egress != "tunnel" {
+		t.Fatalf("another site went %s", egress)
+	}
+	dialers.mu.Lock()
+	if len(dialers.tunnelNames) != 2 || dialers.tunnelNames[0] != "www.blocked.example" || dialers.tunnelNames[1] != "" {
+		t.Fatalf("expected only the blocked site to be dialled by name, got %q", dialers.tunnelNames)
+	}
+	dialers.mu.Unlock()
+
+	// A flow that names nothing is still tunnelled, by address, once the
+	// sniff window has passed.
+	conn := client.dialTCP(t, netip.MustParseAddrPort("203.0.113.10:22"))
+	defer conn.Close()
+	select {
+	case remote := <-dialers.tunnelEnd:
+		remote.Close()
+	case <-dialers.directEnd:
+		t.Fatal("a nameless flow left full tunnel")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dial")
+	}
+	dialers.mu.Lock()
+	defer dialers.mu.Unlock()
+	if last := dialers.tunnelNames[len(dialers.tunnelNames)-1]; last != "" {
+		t.Fatalf("a nameless flow was dialled by name %q", last)
+	}
+}
+
+func TestFullTunnelWithoutADirectListDoesNotHoldFlows(t *testing.T) {
+	client, dialers, _ := startTestDataplane(t, Config{Mode: routing.ModeProxyAll})
+	started := time.Now()
+	conn := client.dialTCP(t, netip.MustParseAddrPort("203.0.113.10:22"))
+	defer conn.Close()
+	select {
+	case remote := <-dialers.tunnelEnd:
+		remote.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dial")
+	}
+	if waited := time.Since(started); waited > sniffTimeout {
+		t.Fatalf("full tunnel without a direct list held a flow for %v", waited)
+	}
+}
+
+func TestDataplaneSendsPrivateDestinationsDirect(t *testing.T) {
+	// A private range that is not on-link is taken by the capture routes;
+	// full tunnel must not carry it to the remote server.
+	client, dialers, _ := startTestDataplane(t, Config{Mode: routing.ModeProxyAll})
+	conn := client.dialTCP(t, netip.MustParseAddrPort("10.20.30.40:445"))
+	defer conn.Close()
+	select {
+	case remote := <-dialers.directEnd:
+		remote.Close()
+	case <-dialers.tunnelEnd:
+		t.Fatal("a private destination was tunnelled")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dial")
+	}
+}
+
+func TestADomainRuleTunnelsAHostBehindTheServerOnANonWebPort(t *testing.T) {
+	// https://pve.home.example:8006, its private address resolved where the
+	// dataplane could not see it: the hello names the host the domain rule
+	// claims, ahead of the local network, in either mode.
+	for _, mode := range []routing.Mode{routing.ModeSelectedRules, routing.ModeProxyAll} {
+		client, dialers, _ := startTestDataplane(t, Config{
+			Mode:  mode,
+			Rules: []routing.Rule{{ID: "d1", Type: routing.RuleDomain, Value: "home.example", Enabled: true}},
+		})
+		if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("10.8.0.5:8006"), "pve.home.example"); egress != "tunnel" {
+			t.Fatalf("%s: a host behind the server on 8006 went %s", mode, egress)
+		}
+		// A server-speaks-first LAN flow is not held for a name it never sends.
+		// (Another address: the name just read now describes 10.8.0.5, and
+		// selects every later flow to it.)
+		started := time.Now()
+		conn := client.dialTCP(t, netip.MustParseAddrPort("10.8.0.6:3306"))
+		select {
+		case remote := <-dialers.directEnd:
+			remote.Close()
+		case <-dialers.tunnelEnd:
+			t.Fatalf("%s: a nameless LAN flow was tunnelled", mode)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: no dial", mode)
+		}
+		if waited := time.Since(started); waited > sniffTimeout {
+			t.Fatalf("%s: a server-speaks-first LAN flow was held for %v", mode, waited)
+		}
+		conn.Close()
+	}
+}
+
+func TestFullTunnelSendsASingleLabelSiteDirect(t *testing.T) {
+	// http://printer/, resolved by a DNS suffix search to an address outside
+	// the private ranges: the system-proxy paths send a single-label name
+	// direct, and so must TUN, which only learns the name from the request.
+	client, dialers, domains := startTestDataplane(t, Config{Mode: routing.ModeProxyAll})
+	destination := netip.MustParseAddrPort("192.0.2.20:80")
+	conn := client.dialTCP(t, destination)
+	defer conn.Close()
+	request := []byte("GET / HTTP/1.1\r\nHost: printer\r\n\r\n")
+	if _, err := conn.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case remote := <-dialers.directEnd:
+		if got := readWithin(t, remote, len(request)); !bytes.Equal(got, request) {
+			t.Fatalf("the request was not forwarded intact: %q", got)
+		}
+		remote.Close()
+	case <-dialers.tunnelEnd:
+		t.Fatal("a single-label site was tunnelled")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dial")
+	}
+	// The name describes that flow only; later flows to the address are not
+	// judged by it.
+	if names := domains.Lookup(destination.Addr()); len(names) != 0 {
+		t.Fatalf("a single-label name was remembered for the address: %v", names)
+	}
+	// A dotted name on the same kind of address stays in the tunnel.
+	if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("192.0.2.21:443"), "www.example.org"); egress != "tunnel" {
+		t.Fatalf("a public site went %s", egress)
+	}
+}
+
+func TestBlockedSitesAreDialledByNameWhateverTunnelsThem(t *testing.T) {
+	// A poisoned local answer sends the browser to a stub address. Full
+	// tunnel without the direct list, and a process rule's own flows, used to
+	// skip reading the name and followed the stub through the tunnel.
+	client, dialers, _ := startTestDataplane(t, Config{Mode: routing.ModeProxyAll, ProxyDomains: []string{"blocked.example"}})
+	if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("203.0.113.9:443"), "www.blocked.example"); egress != "tunnel" {
+		t.Fatalf("full tunnel: a blocked site went %s", egress)
+	}
+	dialers.mu.Lock()
+	if len(dialers.tunnelNames) != 1 || dialers.tunnelNames[0] != "www.blocked.example" {
+		t.Fatalf("full tunnel: expected a dial by name, got %q", dialers.tunnelNames)
+	}
+	dialers.mu.Unlock()
+
+	chrome := &countingAttributor{name: "chrome.exe"}
+	client, dialers = startAttributedDataplane(t, Config{
+		Mode:         routing.ModeSelectedRules,
+		Rules:        []routing.Rule{processRule("p", "chrome.exe")},
+		ProxyDomains: []string{"blocked.example"},
+	}, chrome)
+	if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("203.0.113.9:443"), "www.blocked.example"); egress != "tunnel" {
+		t.Fatalf("process rule: a blocked site went %s", egress)
+	}
+	if egress := openTLS(t, client, dialers, netip.MustParseAddrPort("203.0.113.10:443"), "www.example.org"); egress != "tunnel" {
+		t.Fatalf("process rule: another site went %s", egress)
+	}
+	dialers.mu.Lock()
+	defer dialers.mu.Unlock()
+	if len(dialers.tunnelNames) != 2 || dialers.tunnelNames[0] != "www.blocked.example" || dialers.tunnelNames[1] != "" {
+		t.Fatalf("process rule: expected only the blocked site to be dialled by name, got %q", dialers.tunnelNames)
+	}
+}
+
+func TestRequestsToAnHTTPProxyAreDialledToTheProxy(t *testing.T) {
+	// An application with its own plain-HTTP proxy at a public address names
+	// the site it wants inside the request. That name may route the flow, but
+	// dialled by it the flow would reach the site on the proxy's port and
+	// never the proxy.
+	split := Config{Mode: routing.ModeSelectedRules, ProxyDomains: []string{"youtube.com"}}
+	full := Config{Mode: routing.ModeProxyAll, ProxyDomains: []string{"youtube.com"}}
+	for _, test := range []struct {
+		label       string
+		cfg         Config
+		destination string
+		request     string
+		dialName    string
+	}{
+		{"connect", split, "203.0.113.5:3128", "CONNECT www.youtube.com:443 HTTP/1.1\r\nHost: www.youtube.com:443\r\n\r\n", ""},
+		{"absolute-form", split, "203.0.113.5:8080", "GET http://www.youtube.com/x HTTP/1.1\r\n\r\n", ""},
+		{"absolute-form with a host", split, "203.0.113.5:8080", "GET http://www.youtube.com/x HTTP/1.1\r\nHost: www.youtube.com\r\n\r\n", ""},
+		{"full tunnel connect", full, "203.0.113.5:80", "CONNECT www.youtube.com:443 HTTP/1.1\r\nHost: www.youtube.com:443\r\n\r\n", ""},
+		// A request to the site itself is still dialled by the name it carries.
+		{"origin-form", split, "203.0.113.6:80", "GET /x HTTP/1.1\r\nHost: www.youtube.com\r\n\r\n", "www.youtube.com"},
+		{"full tunnel origin-form", full, "203.0.113.6:80", "GET / HTTP/1.1\r\nHost: www.youtube.com\r\n\r\n", "www.youtube.com"},
+	} {
+		t.Run(test.label, func(t *testing.T) {
+			client, dialers, _ := startTestDataplane(t, test.cfg)
+			destination := netip.MustParseAddrPort(test.destination)
+			conn := client.dialTCP(t, destination)
+			defer conn.Close()
+			request := []byte(test.request)
+			if _, err := conn.Write(request); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case remote := <-dialers.tunnelEnd:
+				if got := readWithin(t, remote, len(request)); !bytes.Equal(got, request) {
+					t.Fatalf("the request was not forwarded intact: %q", got)
+				}
+				remote.Close()
+			case <-dialers.directEnd:
+				t.Fatal("a request for a listed site went direct")
+			case <-time.After(3 * time.Second):
+				t.Fatal("no dial")
+			}
+			dialers.mu.Lock()
+			defer dialers.mu.Unlock()
+			if len(dialers.tunnelled) != 1 || dialers.tunnelled[0] != destination {
+				t.Fatalf("tunnelled to %v, want %v", dialers.tunnelled, destination)
+			}
+			if dialers.tunnelNames[0] != test.dialName {
+				t.Fatalf("dialled by name %q, want %q", dialers.tunnelNames[0], test.dialName)
+			}
+		})
+	}
+}
+
+// countingAttributor names one owner for every socket and counts the lookups.
+type countingAttributor struct {
+	mu      sync.Mutex
+	name    string
+	pid     uint32
+	lookups int
+}
+
+func (a *countingAttributor) Process(Protocol, netip.AddrPort) SocketOwner {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lookups++
+	return SocketOwner{Name: a.name, PID: a.pid}
+}
+
+func (a *countingAttributor) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lookups
+}
+
+func startAttributedDataplane(t *testing.T, cfg Config, attribution Attributor) (*clientStack, *recordingDialers) {
+	t.Helper()
+	adapter := newPipeAdapter()
+	dialers := newRecordingDialers()
+	plane, err := Start(Options{
+		Adapter:     adapter,
+		Attribution: attribution,
+		Tunnel:      dialers,
+		Direct:      testDirectDialer{dialers},
+		Policy:      NewPolicy(cfg),
+		Log:         func(level, message string) { t.Logf("%s: %s", level, message) },
+	})
+	if err != nil {
+		t.Fatalf("start dataplane: %v", err)
+	}
+	client := newClientStack(t, adapter)
+	t.Cleanup(func() {
+		client.close()
+		_ = plane.Close()
+	})
+	return client, dialers
+}
+
+func TestTheTransportsOwnProcessIsNeverTunnelled(t *testing.T) {
+	// Xray behind a CDN dials a server address the host routes do not cover.
+	// In full tunnel that dial was captured and proxied into Xray's own inbound.
+	transport := []ProcessIdentity{{PID: 4242, Name: "xray.exe"}}
+	xray := &countingAttributor{name: "xray.exe", pid: 4242}
+	client, dialers := startAttributedDataplane(t, Config{
+		Mode:            routing.ModeProxyAll,
+		DirectProcesses: transport,
+	}, xray)
+	conn := client.dialTCP(t, netip.MustParseAddrPort("203.0.113.77:443"))
+	defer conn.Close()
+	select {
+	case remote := <-dialers.directEnd:
+		remote.Close()
+	case <-dialers.tunnelEnd:
+		t.Fatal("the transport's own dial was tunnelled")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dial")
+	}
+	if xray.count() != 1 {
+		t.Fatalf("expected one owner lookup, got %d", xray.count())
+	}
+
+	// Any other process is tunnelled as before, another program called
+	// xray.exe included.
+	for _, other := range []*countingAttributor{
+		{name: "chrome.exe", pid: 1001},
+		{name: "xray.exe", pid: 777},
+	} {
+		client, dialers = startAttributedDataplane(t, Config{
+			Mode:            routing.ModeProxyAll,
+			DirectProcesses: transport,
+		}, other)
+		conn = client.dialTCP(t, netip.MustParseAddrPort("203.0.113.77:443"))
+		defer conn.Close()
+		select {
+		case remote := <-dialers.tunnelEnd:
+			remote.Close()
+		case <-dialers.directEnd:
+			t.Fatalf("a flow of %s (%d) went direct", other.name, other.pid)
+		case <-time.After(3 * time.Second):
+			t.Fatal("no dial")
+		}
+	}
+}
+
+func TestOwnerIsNotLookedUpForAFlowItCannotChange(t *testing.T) {
+	// Only the transport's process is listed, and this flow goes direct
+	// anyway: reading the owner tables would only cost time.
+	attribution := &countingAttributor{name: "xray.exe", pid: 4242}
+	client, dialers := startAttributedDataplane(t, Config{
+		Mode:            routing.ModeSelectedRules,
+		Rules:           []routing.Rule{{ID: "ip", Type: routing.RuleIP, Value: "198.51.100.0/24", Enabled: true}},
+		DirectProcesses: []ProcessIdentity{{PID: 4242, Name: "xray.exe"}},
+	}, attribution)
+	conn := client.dialTCP(t, netip.MustParseAddrPort("203.0.113.77:22"))
+	defer conn.Close()
+	select {
+	case remote := <-dialers.directEnd:
+		remote.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dial")
+	}
+	if attribution.count() != 0 {
+		t.Fatalf("the owner was looked up %d times for a flow it could not change", attribution.count())
 	}
 }

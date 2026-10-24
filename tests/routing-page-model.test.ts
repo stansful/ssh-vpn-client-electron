@@ -8,6 +8,7 @@ import {
   filterDomains,
   filterRules,
   findDuplicateRule,
+  followRoutingTabIntent,
   listMetaText,
   MAX_PROCESS_CHIPS,
   presentTun,
@@ -16,12 +17,14 @@ import {
   ruleMatchKey,
   ruleMeta,
   rulesHeading,
+  splitNeedsGuard,
   summaryCopy,
   tabCopy,
   validateRuleDraft,
   wouldCutLastTarget
 } from "../src/renderer/components/pages/routing/routing-model.js";
 import { createDefaultStore } from "../src/shared/defaults.js";
+import { validateIpOrCidr } from "../src/shared/validation.js";
 import type { RoutingRule, RoutingRuleType, TunStatus } from "../src/shared/types.js";
 
 const at = "2026-10-06T09:00:00.000Z";
@@ -87,6 +90,24 @@ describe("routing targets", () => {
     ).toBe(true);
   });
 
+  it("guards a switch to Split tunnel with pending deletes and a list turning off counted as done", () => {
+    const list = { ...createDefaultStore().routingProxyList, enabled: true, domains: ["youtube.com"] };
+    const listOff = { ...list, enabled: false };
+    const nothingPending = { deletingRuleIds: new Set<string>(), proxyListTurningOff: false };
+    const one = [rule("a", "domain", "a.com")];
+
+    expect(splitNeedsGuard(one, listOff, nothingPending)).toBe(false);
+    expect(splitNeedsGuard([], list, nothingPending)).toBe(false);
+    expect(splitNeedsGuard([], listOff, nothingPending)).toBe(true);
+    // The only rule is playing its delete animation.
+    expect(splitNeedsGuard(one, listOff, { ...nothingPending, deletingRuleIds: new Set(["a"]) })).toBe(true);
+    // Blocked in Russia still reads as on, but its turn-off is on the way.
+    expect(splitNeedsGuard([], list, { ...nothingPending, proxyListTurningOff: true })).toBe(true);
+    // Something else is left, so no dialog.
+    expect(splitNeedsGuard([...one, rule("b", "ip", "1.1.1.1")], listOff, { ...nothingPending, deletingRuleIds: new Set(["a"]) })).toBe(false);
+    expect(splitNeedsGuard(one, list, { ...nothingPending, proxyListTurningOff: true })).toBe(false);
+  });
+
   it("describes the summary for each mode", () => {
     const none = countTargets([], noList);
     const one = countTargets([rule("1", "domain", "x.com")], noList);
@@ -113,6 +134,29 @@ describe("adding a rule", () => {
     expect(domain("a".repeat(254)).error).toMatch(/253/u);
   });
 
+  it("sends IPv6 addresses and ranges to the IPs tab instead of asking to drop a port or path", () => {
+    const domain = (value: string) => validateRuleDraft("domain", value, "windows");
+    const address = { error: "That’s an IP address. Add it on the IPs tab." };
+    const range = { error: "That’s an IP range. Add it on the IPs tab." };
+    expect(domain("2001:db8::1")).toEqual(address);
+    expect(domain("2001:DB8::8a2e:370:7334")).toEqual(address);
+    expect(domain("[2001:db8::1]")).toEqual(address);
+    expect(domain("::1")).toEqual(address);
+    expect(domain("2001:db8::/32")).toEqual(range);
+    expect(domain("10.0.0.0/8")).toEqual(range);
+    // A port on a name or an IPv4 address is still a port.
+    expect(domain("youtube.com:443")).toEqual({ error: "Enter just the domain, without a port." });
+    expect(domain("8.8.8.8:53")).toEqual({ error: "Enter just the domain, without a port." });
+  });
+
+  it("measures the 253-character limit on the name, without *. or a trailing dot", () => {
+    const name = ["a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61)].join(".");
+    expect(name).toHaveLength(253);
+    expect(validateRuleDraft("domain", `*.${name}`, "windows")).toEqual({ value: `*.${name}` });
+    expect(validateRuleDraft("domain", `${name}.`, "windows")).toEqual({ value: name });
+    expect(validateRuleDraft("domain", `*.${name}x`, "windows").error).toMatch(/253/u);
+  });
+
   it("normalizes accepted domains", () => {
     expect(validateRuleDraft("domain", "  YouTube.COM. ", "windows")).toEqual({ value: "youtube.com" });
     expect(validateRuleDraft("domain", "*.googlevideo.com", "windows")).toEqual({ value: "*.googlevideo.com" });
@@ -128,6 +172,38 @@ describe("adding a rule", () => {
     expect(ip("youtube.com")).toEqual({ error: "That’s a domain. Add it on the Domains tab." });
     expect(ip("2A00:1450::/32")).toEqual({ value: "2a00:1450::/32" });
     expect(ip(" 8.8.8.8 ")).toEqual({ value: "8.8.8.8" });
+  });
+
+  it("refuses leading-zero CIDR prefixes, which the TUN dataplane can't read", () => {
+    const ip = (value: string) => validateRuleDraft("ip", value, "windows");
+    expect(ip("10.0.0.0/08")).toEqual({ error: "Write the CIDR prefix without leading zeros, like /8." });
+    expect(ip("2001:db8::/032")).toEqual({ error: "Write the CIDR prefix without leading zeros, like /32." });
+    expect(ip("0.0.0.0/00")).toEqual({ error: "Write the CIDR prefix without leading zeros, like /0." });
+    expect(ip("0.0.0.0/0")).toEqual({ value: "0.0.0.0/0" });
+    // Whatever the add row accepts, the shared validator (main process, matchers) accepts too.
+    for (const value of ["91.108.4.0/22", "0.0.0.0/0", "2001:db8::/32", "8.8.8.8", "2a00:1450::1"]) {
+      const draft = ip(value);
+      expect(draft.value).toBeDefined();
+      expect(validateIpOrCidr(draft.value!).ok).toBe(true);
+    }
+    // A stored rule the dataplane would skip is shown as skipped and isn't counted as a target.
+    expect(ruleMeta({ type: "ip", value: "10.0.0.0/08" })).toBe("Not a valid rule, so it’s skipped");
+    expect(countTargets([rule("1", "ip", "10.0.0.0/08")], noList).total).toBe(0);
+  });
+
+  it("accepts rules for the local network, which reach the network behind the server", () => {
+    // An explicit rule wins over the step that keeps the local network direct.
+    const ip = (value: string) => validateRuleDraft("ip", value, "windows");
+    for (const value of ["10.0.0.0/8", "10.8.0.0/16", "192.168.1.1", "100.64.0.0/10", "172.16.5.0/24", "fd00::/8"]) {
+      expect(ip(value)).toEqual({ value });
+    }
+    expect(validateRuleDraft("domain", "nas.local", "windows")).toEqual({ value: "nas.local" });
+    expect(validateRuleDraft("domain", "*.corp.local", "windows")).toEqual({ value: "*.corp.local" });
+    expect(ruleMeta({ type: "ip", value: "10.8.0.0/16" })).toBe("IPv4 range");
+    expect(ruleMeta({ type: "domain", value: "corp.local" })).toBe("Includes subdomains");
+    expect(countTargets([rule("1", "ip", "10.8.0.0/16"), rule("2", "domain", "nas.local")], noList)).toMatchObject({ domains: 1, ips: 1, total: 2 });
+    expect(tabCopy("ips", "windows").emptyText).toBe("Add an address or a range above, like 8.8.8.8 or 10.0.0.0/8.");
+    expect(ip("")).toEqual({ error: "Enter an IP address or range, like 8.8.8.8 or 10.0.0.0/8." });
   });
 
   it("checks app names per platform", () => {
@@ -155,6 +231,58 @@ describe("adding a rule", () => {
     expect(tabCopy("apps", "macos").placeholder).toBe("Telegram");
     expect(tabCopy("ips", "windows").addLabel).toBe("Add an IP address or range");
     expect(tabCopy("domains", "linux").type).toBe("domain");
+  });
+});
+
+describe("routing tab intent", () => {
+  function fakeFrames() {
+    const queued = new Map<number, () => void>();
+    let next = 0;
+    return {
+      queued,
+      frames: {
+        request: (callback: () => void) => {
+          next += 1;
+          queued.set(next, callback);
+          return next;
+        },
+        cancel: (frame: number) => {
+          queued.delete(frame);
+        }
+      },
+      flush: () => {
+        const callbacks = [...queued.values()];
+        queued.clear();
+        callbacks.forEach((callback) => callback());
+      }
+    };
+  }
+
+  it("switches the tab at once and clears the intent only after the scroll frame", () => {
+    const calls: string[] = [];
+    const { frames, flush } = fakeFrames();
+    followRoutingTabIntent(
+      "apps",
+      { setTab: (tab) => calls.push(`tab:${tab}`), scroll: () => calls.push("scroll"), clearIntent: () => calls.push("clear") },
+      frames
+    );
+    // Clearing now would re-render the page and cancel the frame before it scrolls.
+    expect(calls).toEqual(["tab:apps"]);
+    flush();
+    expect(calls).toEqual(["tab:apps", "scroll", "clear"]);
+  });
+
+  it("keeps the intent when the effect is cleaned up before the frame, so the next run can act on it", () => {
+    const calls: string[] = [];
+    const { frames, flush, queued } = fakeFrames();
+    const steps = { setTab: () => calls.push("tab"), scroll: () => calls.push("scroll"), clearIntent: () => calls.push("clear") };
+    const cleanup = followRoutingTabIntent("ips", steps, frames);
+    cleanup();
+    expect(queued.size).toBe(0);
+    // React StrictMode runs the effect again with the same intent.
+    followRoutingTabIntent("ips", steps, frames);
+    flush();
+    expect(calls).toEqual(["tab", "tab", "scroll", "clear"]);
   });
 });
 
