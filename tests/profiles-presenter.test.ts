@@ -21,6 +21,7 @@ import {
   renameFailedTitle,
   resultsSummary,
   savedProfileCopy,
+  sessionWouldStop,
   singleRemoveCopy,
   sourceLabel,
   summarizeRefresh,
@@ -340,13 +341,23 @@ describe("saving and removing", () => {
       description: "Your 12 pinned profiles stay. This can’t be undone.",
       confirmLabel: "Remove 116 profiles",
       removedHint: "including 5 gone from source",
-      xrayWarning: "The tunnel through de-fra-reality closes before anything is removed, even though that profile is pinned. Connect again when it’s done."
+      // Main keeps a session on a pinned profile, so nothing is said to close.
+      xrayWarning: undefined,
+      calmNote: "The Xray tunnel through de-fra-reality stays up: its profile is pinned, so it isn’t removed."
     });
     expect(bulkRemoveCopy({ counts, session: { phase: "connected", profileId: "ams" }, sessionProfile: ams }).xrayWarning).toBe(
       "The tunnel through nl-ams-ws closes first, and nl-ams-ws is removed with the other unpinned profiles. Pick another profile on Connect when it’s done."
     );
+    // A session whose profile is already gone keeps running too.
+    expect(bulkRemoveCopy({ counts, session: { phase: "connected", profileId: "deleted", name: "old-one" } })).toMatchObject({
+      xrayWarning: undefined,
+      calmNote: "The Xray tunnel through old-one stays up: its profile is no longer in your library."
+    });
     expect(bulkRemoveCopy({ counts, sshSessionName: "Frankfurt-01" }).calmNote).toBe(
-      "Xray isn’t running, so your SSH session to Frankfurt-01 stays up. When Xray is connected, it disconnects before profiles are removed."
+      "Xray isn’t running, so your SSH session to Frankfurt-01 stays up. A running Xray disconnects first only if its own profile is removed."
+    );
+    expect(bulkRemoveCopy({ counts }).calmNote).toBe(
+      "Xray isn’t running right now. When it is, it disconnects first only if its own profile is removed; a pinned profile keeps its tunnel."
     );
     expect(bulkRemoveCopy({ counts: { ...counts, goneUnpinned: 0 } })).toMatchObject({ removedHint: "unpinned profiles", xrayWarning: undefined });
     expect(bulkRemoveCopy({ counts: { all: 3, pinned: 0, gone: 0, goneUnpinned: 0, unpinned: 3 } }).description).toBe("Nothing is pinned, so every profile goes. This can’t be undone.");
@@ -355,6 +366,17 @@ describe("saving and removing", () => {
       title: "Removed 116 unpinned profiles",
       message: "12 pinned profiles kept. Xray was disconnected first. Connect again when you are ready."
     });
+  });
+
+  it("predicts a disconnect only where main makes one: a session on a saved, unpinned profile", () => {
+    const library = [fra, ams];
+    expect(fra.isPinned).toBe(true);
+    expect(ams.isPinned).toBe(false);
+    expect(sessionWouldStop({ phase: "connected", profileId: "ams" }, library)).toBe(true);
+    expect(sessionWouldStop({ phase: "connected", profileId: "fra" }, library)).toBe(false);
+    expect(sessionWouldStop({ phase: "connected", profileId: "deleted" }, library)).toBe(false);
+    expect(sessionWouldStop({ phase: "disconnecting", profileId: "ams" }, library)).toBe(false);
+    expect(sessionWouldStop(undefined, library)).toBe(false);
   });
 
   it("names the profile being removed and where the selection goes", () => {
@@ -378,7 +400,8 @@ describe("renaming and copying links", () => {
   it("warns that a copied link carries credentials, except for public profiles", () => {
     expect(copiedLinkCopy(ams)).toEqual({
       title: "Link copied",
-      message: "Anyone with the link to nl-ams-ws can connect through it, so share it only with people you trust. Your clipboard isn’t cleared automatically."
+      message:
+        "Anyone with the link to nl-ams-ws can connect through it, so share it only with people you trust. It leaves your clipboard after 45 seconds, and when Shadow quits, but clipboard history (Win+V on Windows) can still keep a copy."
     });
     expect(copiedLinkCopy(fra).message).toMatch(/^Anyone with the link to de-fra-reality/u);
     expect(copiedLinkCopy(gone)).toEqual({ title: "Link copied", message: "public-23 is from the public list." });

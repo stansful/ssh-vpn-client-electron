@@ -1,3 +1,4 @@
+import { SECRET_CLIPBOARD_CLEAR_MS } from "../../../../shared/defaults.js";
 import type { AppStore, GlobalTab, ImportProxyProfilesResult, ProxyProfile, ProxyProfileSource, PublicProxyRefresh, RuntimeStatus } from "../../../../shared/types.js";
 import { phaseOf } from "../../../lib/connection.js";
 import { describeError, errorText, stripIpcPrefix } from "../../../lib/errors.js";
@@ -133,9 +134,22 @@ export function xraySessionOf(activeTransport: GlobalTab, runtime: RuntimeStatus
   return { phase, profileId: runtime.activeConfigId, name: runtime.activeConfigName };
 }
 
-/** Removing unpinned profiles stops this session first (Connected, starting or retrying). */
-export function sessionWouldStop(session: XraySession | undefined): boolean {
-  return Boolean(session && session.phase !== "disconnecting");
+/**
+ * Removing unpinned profiles stops this session first (Connected, starting or
+ * retrying) only when it removes the profile the session runs on: one that is
+ * saved and not pinned. A pinned profile keeps its tunnel, as does a session
+ * whose profile is already gone - main decides the same way
+ * (unpinnedRemovalEndsSession).
+ */
+export function sessionWouldStop(
+  session: XraySession | undefined,
+  profiles: ReadonlyArray<Pick<ProxyProfile, "id" | "isPinned">>
+): boolean {
+  if (!session || session.phase === "disconnecting" || !session.profileId) {
+    return false;
+  }
+  const profile = profiles.find((candidate) => candidate.id === session.profileId);
+  return profile !== undefined && !profile.isPinned;
 }
 
 // ---------- cards ----------
@@ -299,8 +313,10 @@ export function renamedNotice(name: string): string {
 }
 
 /**
- * Toast after Copy link. The link carries the profile's credentials and stays
- * on the clipboard; a public-list link is free to share anyway.
+ * Toast after Copy link. The link carries the profile's credentials, and main
+ * takes it off the clipboard after a while and when Shadow quits - but not out
+ * of clipboard history, which Electron cannot keep it from; a public-list
+ * link is free to share anyway.
  */
 export function copiedLinkCopy(profile: Pick<ProxyProfile, "name" | "source">): ToastCopy {
   return {
@@ -308,7 +324,7 @@ export function copiedLinkCopy(profile: Pick<ProxyProfile, "name" | "source">): 
     message:
       profile.source === "remote"
         ? `${profile.name} is from the public list.`
-        : `Anyone with the link to ${profile.name} can connect through it, so share it only with people you trust. Your clipboard isn’t cleared automatically.`
+        : `Anyone with the link to ${profile.name} can connect through it, so share it only with people you trust. It leaves your clipboard after ${SECRET_CLIPBOARD_CLEAR_MS / 1000} seconds, and when Shadow quits, but clipboard history (Win+V on Windows) can still keep a copy.`
   };
 }
 
@@ -618,7 +634,7 @@ export interface BulkRemoveCopy {
   removed: string;
   removedHint: string;
   kept: string;
-  /** "Xray disconnects first" callout text, while a session runs. */
+  /** "Xray disconnects first" callout text, while a session runs on an unpinned profile. */
   xrayWarning?: string;
   /** "Nothing disconnects" callout text otherwise. */
   calmNote?: string;
@@ -638,20 +654,20 @@ export function bulkRemoveCopy(input: {
   const pinned = formatCount(counts.pinned);
   let xrayWarning: string | undefined;
   let calmNote: string | undefined;
-  if (sessionWouldStop(input.session)) {
-    const name = input.sessionProfile?.name ?? input.session?.name;
-    const through = name ? `The tunnel through ${name}` : "The Xray tunnel";
-    if (!input.sessionProfile) {
-      xrayWarning = `${through} closes before anything is removed. Connect again when it’s done.`;
-    } else if (input.sessionProfile.isPinned) {
-      xrayWarning = `${through} closes before anything is removed, even though that profile is pinned. Connect again when it’s done.`;
-    } else {
-      xrayWarning = `${through} closes first, and ${name} is removed with the other unpinned profiles. Pick another profile on Connect when it’s done.`;
-    }
+  const session = input.session && input.session.phase !== "disconnecting" ? input.session : undefined;
+  if (input.sessionProfile && sessionWouldStop(session, [input.sessionProfile])) {
+    const name = input.sessionProfile.name;
+    xrayWarning = `The tunnel through ${name} closes first, and ${name} is removed with the other unpinned profiles. Pick another profile on Connect when it’s done.`;
+  } else if (session) {
+    const name = input.sessionProfile?.name ?? session.name;
+    const through = name ? `The Xray tunnel through ${name}` : "The Xray tunnel";
+    calmNote = input.sessionProfile
+      ? `${through} stays up: its profile is pinned, so it isn’t removed.`
+      : `${through} stays up: its profile is no longer in your library.`;
   } else if (input.sshSessionName) {
-    calmNote = `Xray isn’t running, so your SSH session to ${input.sshSessionName} stays up. When Xray is connected, it disconnects before profiles are removed.`;
+    calmNote = `Xray isn’t running, so your SSH session to ${input.sshSessionName} stays up. A running Xray disconnects first only if its own profile is removed.`;
   } else {
-    calmNote = "Xray isn’t running right now. When it is, it disconnects before profiles are removed, even if its profile is pinned.";
+    calmNote = "Xray isn’t running right now. When it is, it disconnects first only if its own profile is removed; a pinned profile keeps its tunnel.";
   }
   return {
     title: `Remove ${unpinned} unpinned ${counts.unpinned === 1 ? "profile" : "profiles"}?`,

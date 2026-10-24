@@ -17,12 +17,40 @@ describe("SSH failure copy", () => {
     ["SSH password is unavailable.", "No password is saved for Frankfurt-01. Add it in the server settings, then try again."],
     ["SSH private key is unavailable.", "No key is attached to Frankfurt-01. Pick a key in the server settings, then try again."],
     [
-      "SSH authentication failed: Encrypted OpenSSH private keys are not supported yet. Use an unencrypted OpenSSH key or convert the key to encrypted PKCS8/PEM.",
-      "The key for Frankfurt-01 is a passphrase-protected OpenSSH key, which Shadow can't load yet. Use an unencrypted key or convert it to PKCS8 or PEM."
+      "SSH authentication failed: Encrypted OpenSSH private keys are not supported with this cipher or bcrypt round count. Re-encrypt the key with ssh-keygen -p -Z aes256-ctr, or convert it to encrypted PKCS8/PEM.",
+      "The key for Frankfurt-01 is encrypted in a way Shadow can't open. Re-encrypt it with ssh-keygen -p -Z aes256-ctr, then paste it again in SSH keys."
+    ],
+    [
+      "SSH authentication failed: Unable to load SSH private key because it is protected with a passphrase, and none was provided.",
+      "The key for Frankfurt-01 is protected with a passphrase that isn't saved. Edit the key in SSH keys and type its passphrase."
+    ],
+    [
+      "SSH authentication failed: Unable to load SSH private key because the passphrase is wrong.",
+      "The saved passphrase for the key of Frankfurt-01 is wrong. Edit the key in SSH keys and type it again."
+    ],
+    [
+      "SSH authentication failed: Unable to load SSH private key. Check the key format and passphrase.",
+      "The key for Frankfurt-01 couldn't be read. Check the key format and its passphrase, then try again."
+    ],
+    [
+      "SSH server fingerprint mismatch: expected SHA256:aaa, got SHA256:bbb (ssh-ed25519), SHA256:ccc (ssh-rsa).",
+      "Frankfurt-01 presented a host key that doesn't match the pinned one. If the server was reinstalled, update the pinned key; otherwise don't connect."
     ],
     [
       "SSH server fingerprint mismatch: expected SHA256:aaa, got SHA256:bbb.",
       "Frankfurt-01 presented a host key that doesn't match the pinned one. If the server was reinstalled, update the pinned key; otherwise don't connect."
+    ],
+    [
+      "SSH server host key does not match the key Shadow trusted on its first connection to vpn.example.com: expected SHA256:aaa, got SHA256:bbb (ssh-ed25519). Shadow stopped so nothing is sent to a server that may be an impostor. If the server's key was changed on purpose, paste the new fingerprint into the server's Fingerprint field.",
+      "Frankfurt-01 presented a different host key than the one Shadow trusted on the first connection. If the server's key was changed on purpose, paste the new fingerprint into the server's Fingerprint field; otherwise don't connect."
+    ],
+    [
+      "Reconnect attempt 3 failed: SSH server host key does not match the key vpn.example.com presented earlier in this session: expected SHA256:aaa, got SHA256:bbb (ssh-ed25519). Shadow stopped so nothing is sent to a server that may be an impostor. If the server's key was changed on purpose, paste the new fingerprint into the server's Fingerprint field.",
+      "Frankfurt-01 presented a different host key than earlier in this session. If the server's key was changed on purpose, paste the new fingerprint into the server's Fingerprint field; otherwise don't connect."
+    ],
+    [
+      "SSH authentication failed: Unable to load SSH private key because it is a security-key (FIDO) key, which signs only with its hardware key. Use an Ed25519, ECDSA or RSA key.",
+      "The key for Frankfurt-01 is a security-key (FIDO) key, which Shadow can't sign in with. Use an Ed25519, ECDSA or RSA key."
     ],
     ["Unsupported SSH host key algorithm ssh-dss.", "Frankfurt-01 uses a host key type Shadow can't verify, so it won't connect."]
   ])("explains %s", (message, description) => {

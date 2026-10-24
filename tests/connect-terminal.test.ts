@@ -6,6 +6,8 @@ import {
   stripAnsi,
   terminalState
 } from "../src/renderer/components/pages/connect/terminal-view.js";
+import type { ShellRecord } from "../src/renderer/components/pages/connect/terminal-view.js";
+import { isOpenPending, nextShellRecord, shellNeedsClose, type ShellRecordEvent } from "../src/renderer/components/pages/connect/shell-record.js";
 import type { TerminalLine } from "../src/shared/types.js";
 
 let counter = 0;
@@ -96,5 +98,71 @@ describe("Shell state", () => {
       "failed"
     );
     expect(terminalState({ live: true, expanded: true, session: "s2", history: [], record: { session: "s1", phase: "open" } })).toBe("opening");
+  });
+});
+
+describe("Shell record across open and collapse", () => {
+  const replay = (events: ShellRecordEvent[], start?: ShellRecord): ShellRecord | undefined => events.reduce(nextShellRecord, start);
+  const view = (record: ShellRecord | undefined, history: TerminalLine[] = []) =>
+    terminalState({ live: true, expanded: true, session: "s1", record, history });
+
+  it("opens again after a collapse and re-expand while the first open was still on its way", () => {
+    // Expand (open #1), collapse (close), expand again (open #2), then the answers arrive in order.
+    let record = replay([
+      { type: "open", session: "s1", attempt: 1 },
+      { type: "close" }
+    ]);
+    expect(record).toBeUndefined();
+    // The panel isn't blocked by the first open: a new request goes out.
+    expect(isOpenPending(record, "s1")).toBe(false);
+    record = nextShellRecord(record, { type: "open", session: "s1", attempt: 2, afterId: "t-before" });
+    expect(isOpenPending(record, "s1")).toBe(true);
+
+    // Open #1 answers first; main has queued close and open #2 behind it, so it doesn't count.
+    record = nextShellRecord(record, { type: "opened", session: "s1", attempt: 1 });
+    expect(record).toMatchObject({ phase: "opening", attempt: 2 });
+    expect(view(record)).toBe("opening");
+
+    // Open #2 answers: the shell is live and input is enabled.
+    record = nextShellRecord(record, { type: "opened", session: "s1", attempt: 2 });
+    expect(record).toEqual({ session: "s1", phase: "open", attempt: 2, afterId: "t-before" });
+    const opened = chunk("system", "SSH shell channel opened.\n");
+    expect(view(record, [chunk("system", "\nSSH shell channel closed.\n"), opened])).toBe("live");
+  });
+
+  it("ignores a late failure from a replaced open and answers after a collapse", () => {
+    const opening = replay([{ type: "open", session: "s1", attempt: 1 }, { type: "close" }, { type: "open", session: "s1", attempt: 2 }]);
+    expect(nextShellRecord(opening, { type: "open-failed", session: "s1", attempt: 1, error: "late" })).toBe(opening);
+    expect(nextShellRecord(opening, { type: "open-failed", session: "s1", attempt: 2, error: "PTY allocation failed." })).toMatchObject({
+      phase: "failed",
+      error: "PTY allocation failed."
+    });
+    // Collapsed for good: the answer of the open that was on its way changes nothing.
+    const collapsed = replay([{ type: "open", session: "s1", attempt: 3 }, { type: "close" }, { type: "opened", session: "s1", attempt: 3 }]);
+    expect(collapsed).toBeUndefined();
+    expect(terminalState({ live: true, expanded: false, session: "s1", record: collapsed, history: [] })).toBe("idle");
+  });
+
+  it("ignores answers for another session and answers that arrive twice", () => {
+    const opening = nextShellRecord(undefined, { type: "open", session: "s2", attempt: 4 });
+    expect(nextShellRecord(opening, { type: "opened", session: "s1", attempt: 4 })).toBe(opening);
+    const open = nextShellRecord(opening, { type: "opened", session: "s2", attempt: 4 });
+    expect(nextShellRecord(open, { type: "open-failed", session: "s2", attempt: 4, error: "late" })).toBe(open);
+  });
+
+  it("dedupes a repeated open only while one is still pending for the session", () => {
+    expect(isOpenPending(undefined, "s1")).toBe(false);
+    expect(isOpenPending({ session: "s1", phase: "opening", attempt: 1 }, "s1")).toBe(true);
+    expect(isOpenPending({ session: "s1", phase: "opening", attempt: 1 }, "s2")).toBe(false);
+    expect(isOpenPending({ session: "s1", phase: "failed", attempt: 1 }, "s1")).toBe(false);
+    expect(isOpenPending({ session: "s1", phase: "open", attempt: 1 }, "s1")).toBe(false);
+  });
+
+  it("closes a shell that is open or still opening, never after a failed open", () => {
+    expect(shellNeedsClose({ session: "s1", phase: "opening", attempt: 1 }, "s1")).toBe(true);
+    expect(shellNeedsClose({ session: "s1", phase: "open", attempt: 1 }, "s1")).toBe(true);
+    expect(shellNeedsClose({ session: "s1", phase: "failed", attempt: 1 }, "s1")).toBe(false);
+    expect(shellNeedsClose({ session: "s0", phase: "open", attempt: 1 }, "s1")).toBe(false);
+    expect(shellNeedsClose(undefined, "s1")).toBe(false);
   });
 });

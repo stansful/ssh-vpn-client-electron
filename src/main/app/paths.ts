@@ -1,6 +1,12 @@
 import os from "node:os";
 import path from "node:path";
 
+/**
+ * SHADOW_SSH_USER_DATA_DIR moves the data folder in every build, packaged
+ * too: it is how a second, isolated profile runs (tests, a side-by-side
+ * copy), and the folder belongs to the user either way. bootstrap.cts mirrors
+ * this before the app is ready.
+ */
 export function resolveUserDataPath(name: string, platform: NodeJS.Platform = process.platform, env = process.env): string {
   if (env.SHADOW_SSH_USER_DATA_DIR) {
     return env.SHADOW_SSH_USER_DATA_DIR;
@@ -58,7 +64,8 @@ export function resolveXrayExecutablePath({
   arch?: string;
   env?: NodeJS.ProcessEnv;
 }): string | undefined {
-  if (env.SHADOW_SSH_XRAY_PATH) {
+  // A development override only: a packaged build runs the Xray it shipped with.
+  if (!packaged && env.SHADOW_SSH_XRAY_PATH) {
     return env.SHADOW_SSH_XRAY_PATH;
   }
   const platformFolder = xrayPlatformFolder(platform);

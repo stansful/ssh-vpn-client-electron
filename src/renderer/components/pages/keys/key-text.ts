@@ -12,9 +12,15 @@ export interface KeyTextAnalysis {
   kind: KeyTextKind;
   keyType?: SshKeyType;
   keyFormat?: SshKeyFormat;
-  /** Passphrase-protected OpenSSH key, which the SSH core cannot load yet. */
+  /** Passphrase-protected OpenSSH key. */
   encryptedOpenSsh?: boolean;
-  /** Encrypted PEM or PKCS#8: it needs the passphrase to sign in. */
+  /** Cipher of a passphrase-protected OpenSSH key, when the SSH core cannot read it. */
+  unsupportedOpenSshCipher?: string;
+  /** bcrypt rounds of a passphrase-protected OpenSSH key, when more than the SSH core opens. */
+  excessiveBcryptRounds?: number;
+  /** A security-key (FIDO) key: it signs only with its hardware key, so it cannot sign in. */
+  securityKey?: boolean;
+  /** Encrypted OpenSSH, PEM or PKCS#8: it needs the passphrase to sign in. */
   needsPassphrase?: boolean;
   /** The BEGIN line has no matching END line. */
   truncated?: boolean;
@@ -92,22 +98,59 @@ export function keyTextProblem(analysis: KeyTextAnalysis): KeyTextProblem | unde
   }
 }
 
-/** Keys that save fine but cannot sign in yet (the SSH core supports RSA and Ed25519, PEM passphrases only). */
+/**
+ * Keys that save fine but cannot sign in: the SSH core signs with Ed25519,
+ * ECDSA and RSA keys, and opens passphrase-protected OpenSSH keys made with
+ * the AES ciphers ssh-keygen offers.
+ */
 export function keyTextWarning(analysis: KeyTextAnalysis): string | undefined {
   if (analysis.kind !== "private" || analysis.truncated) {
     return undefined;
   }
-  if (analysis.encryptedOpenSsh) {
-    return "Passphrase-protected OpenSSH keys can’t sign in yet. Convert the key to PEM with ssh-keygen -p -m PEM, then paste it again.";
+  if (analysis.securityKey) {
+    return "Security-key (FIDO) keys can’t sign in: they sign only with their hardware key. Use an Ed25519, ECDSA or RSA key.";
   }
-  if (analysis.keyType === "ecdsa") {
-    return "ECDSA keys can be saved but can’t sign in yet. Use an RSA or Ed25519 key to connect.";
+  const encryption = openSshEncryptionWarning(analysis);
+  if (encryption) {
+    return encryption;
   }
   if (analysis.keyType === "dsa") {
-    return "DSA keys can be saved but can’t sign in yet. Use an RSA or Ed25519 key to connect.";
+    return "DSA keys can be saved but can’t sign in. Use an Ed25519, ECDSA or RSA key to connect.";
   }
   return undefined;
 }
+
+/**
+ * A passphrase-protected OpenSSH key the SSH core cannot open whatever the
+ * passphrase. The key list says the same of a saved key (keySupportIssue),
+ * from what was recorded when it was saved.
+ */
+export function openSshEncryptionWarning(
+  key: Pick<KeyTextAnalysis, "unsupportedOpenSshCipher" | "excessiveBcryptRounds">
+): string | undefined {
+  if (key.unsupportedOpenSshCipher) {
+    return `This key is encrypted with ${key.unsupportedOpenSshCipher}, which Shadow can’t open. Re-encrypt it with ssh-keygen -p -Z aes256-ctr, then paste it again.`;
+  }
+  if (key.excessiveBcryptRounds !== undefined) {
+    return `This key is encrypted with ${key.excessiveBcryptRounds} bcrypt rounds; Shadow opens keys with up to ${MAXIMUM_BCRYPT_ROUNDS}, because each round slows every connect. Re-encrypt it with ssh-keygen -p -a 64, then paste it again.`;
+  }
+  return undefined;
+}
+
+/** The most bcrypt rounds the SSH core opens a key with (MAXIMUM_BCRYPT_ROUNDS in private-key.ts). */
+const MAXIMUM_BCRYPT_ROUNDS = 128;
+
+/** Ciphers of passphrase-protected OpenSSH keys the SSH core can decrypt. */
+const SUPPORTED_OPENSSH_CIPHERS = new Set([
+  "aes128-ctr",
+  "aes192-ctr",
+  "aes256-ctr",
+  "aes128-cbc",
+  "aes192-cbc",
+  "aes256-cbc",
+  "aes128-gcm@openssh.com",
+  "aes256-gcm@openssh.com"
+]);
 
 function analyzePrivateKey(normalized: string, label: string, headerIndex: number): KeyTextAnalysis {
   const footer = `-----END ${label}-----`;
@@ -115,8 +158,10 @@ function analyzePrivateKey(normalized: string, label: string, headerIndex: numbe
   const truncated = footerIndex < 0;
   const body = normalized.slice(headerIndex, truncated ? undefined : footerIndex);
   switch (label) {
-    case "OPENSSH PRIVATE KEY":
-      return { kind: "private", keyFormat: "openssh", truncated, ...readOpenSshEnvelope(body) };
+    case "OPENSSH PRIVATE KEY": {
+      const envelope = readOpenSshEnvelope(body);
+      return { kind: "private", keyFormat: "openssh", truncated, ...envelope, needsPassphrase: envelope.encryptedOpenSsh };
+    }
     case "RSA PRIVATE KEY":
       return { kind: "private", keyFormat: "pem", keyType: "rsa", truncated, needsPassphrase: isLegacyEncryptedPem(body) };
     case "DSA PRIVATE KEY":
@@ -192,7 +237,9 @@ class ByteReader {
 const OPENSSH_MAGIC = "openssh-key-v1\0";
 
 /** Reads the cipher and the key type from the readable part of an OpenSSH envelope. */
-function readOpenSshEnvelope(block: string): Pick<KeyTextAnalysis, "keyType" | "encryptedOpenSsh"> {
+function readOpenSshEnvelope(
+  block: string
+): Pick<KeyTextAnalysis, "keyType" | "encryptedOpenSsh" | "unsupportedOpenSshCipher" | "excessiveBcryptRounds" | "securityKey"> {
   const bytes = base64Body(block);
   if (!bytes || String.fromCharCode(...bytes.subarray(0, OPENSSH_MAGIC.length)) !== OPENSSH_MAGIC) {
     return { keyType: "unknown", encryptedOpenSsh: false };
@@ -202,7 +249,7 @@ function readOpenSshEnvelope(block: string): Pick<KeyTextAnalysis, "keyType" | "
     reader.skip(OPENSSH_MAGIC.length);
     const cipher = reader.text();
     const kdf = reader.text();
-    reader.bytesField();
+    const kdfOptions = reader.bytesField();
     const count = reader.uint32();
     const encrypted = cipher !== "none" || kdf !== "none";
     let algorithm: string | undefined;
@@ -214,9 +261,28 @@ function readOpenSshEnvelope(block: string): Pick<KeyTextAnalysis, "keyType" | "
       privateBlock.uint32();
       algorithm = privateBlock.text();
     }
-    return { keyType: sshAlgorithmType(algorithm), encryptedOpenSsh: encrypted };
+    const unsupported = encrypted && (!SUPPORTED_OPENSSH_CIPHERS.has(cipher) || kdf !== "bcrypt");
+    const rounds = encrypted && !unsupported ? bcryptRounds(kdfOptions) : undefined;
+    return {
+      keyType: sshAlgorithmType(algorithm),
+      encryptedOpenSsh: encrypted,
+      ...(unsupported ? { unsupportedOpenSshCipher: /^[\w@.+-]{1,64}$/u.test(cipher) ? cipher : "an unknown cipher" } : {}),
+      ...(rounds !== undefined && rounds > MAXIMUM_BCRYPT_ROUNDS ? { excessiveBcryptRounds: rounds } : {}),
+      ...(algorithm?.startsWith("sk-") ? { securityKey: true } : {})
+    };
   } catch {
     return { keyType: "unknown", encryptedOpenSsh: false };
+  }
+}
+
+/** The round count in bcrypt KDF options: a salt string, then a uint32. */
+function bcryptRounds(options: Uint8Array): number | undefined {
+  try {
+    const reader = new ByteReader(options);
+    reader.bytesField();
+    return reader.uint32();
+  } catch {
+    return undefined;
   }
 }
 

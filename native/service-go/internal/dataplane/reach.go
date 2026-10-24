@@ -125,7 +125,9 @@ func ProbeTunnelIPv6(ctx context.Context, tunnel TunnelDialer) IPv6Reach {
 // outcome is beside the point and nothing is sent once it ends, which is why
 // the certificate is not verified.
 func answersThroughTunnel(ctx context.Context, tunnel TunnelDialer, destination netip.AddrPort) bool {
-	conn, err := tunnel.DialTCP(ctx, destination)
+	// By address, for the same reason the hello has no name: the question is
+	// what the far end reaches at this address.
+	conn, err := tunnel.DialTCP(ctx, destination, "")
 	if err != nil {
 		return false
 	}
@@ -232,5 +234,5 @@ func (d *Dataplane) refusesForIPv6(flow Flow, decision Decision, heldForName boo
 		return true
 	}
 	port := flow.Destination.Port()
-	return heldForName && len(flow.Domains) == 0 && (port == 443 || port == 80)
+	return heldForName && len(flow.Domains) == 0 && isWebPort(port)
 }

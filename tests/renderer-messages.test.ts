@@ -67,6 +67,14 @@ describe("reconnect reasons", () => {
     }
   });
 
+  it("does not call a key Shadow trusted by itself a pinned one", () => {
+    const reason = classifyReconnectReason(
+      "Reconnect attempt 2 failed: SSH server host key does not match the key Shadow trusted on its first connection to vpn.example.com: expected SHA256:aaa, got SHA256:bbb (ssh-ed25519)."
+    );
+    expect(reason).toMatchObject({ kind: "stuck", likelyStuck: true });
+    expect(reason?.detail).not.toMatch(/pinned/iu);
+  });
+
   it("extracts the attempt number with a fallback", () => {
     expect(extractAttempt("Reconnecting to 203.0.113.10:22 (attempt 3).")).toBe(3);
     expect(extractAttempt("Reconnect attempt 7 failed: x")).toBe(7);

@@ -21,6 +21,19 @@ describe("selected routing targets", () => {
     expect(hasSelectedRoutingTargets(state({ proxyListEnabled: true, proxyDomains: ["example.com"] }))).toBe(true);
   });
 
+  it("counts a rule for the local network like any other, since it tunnels the network behind the server", () => {
+    const lan = [
+      { id: "lan", type: "ip" as const, value: "10.8.0.0/16", enabled: true, createdAt: "", updatedAt: "" },
+      { id: "nas", type: "domain" as const, value: "nas.local", enabled: true, createdAt: "", updatedAt: "" }
+    ];
+    for (const rules of [lan, lan.slice(0, 1), lan.slice(1)]) {
+      expect(hasSelectedRoutingTargets(state({ rules }))).toBe(true);
+      expect(routingMutationAction(mutationState({ rules }), "Connected")).toBe("apply");
+    }
+    const off = [{ id: "off", type: "ip" as const, value: "192.168.0.0/16", enabled: false, createdAt: "", updatedAt: "" }];
+    expect(hasSelectedRoutingTargets(state({ rules: off }))).toBe(false);
+  });
+
   it("rejects disabled or empty targets", () => {
     expect(
       hasSelectedRoutingTargets(

@@ -93,6 +93,38 @@ describe("attention from transport diagnostics", () => {
     );
   });
 
+  it("says what happens next when the TUN adapter stops under a session", () => {
+    const ssh = attentionFromDiagnostic(
+      { level: "warning", message: "TUN dataplane stopped unexpectedly: Native helper exited (3). Routing is being applied again: the adapter is restarted, or the Windows proxy path takes over." },
+      "ssh"
+    );
+    expect(ssh).toMatchObject({ kind: "tun-unavailable", level: "error", title: "TUN adapter stopped" });
+    // Both transports restore routing by themselves; telling the user to
+    // reconnect would send them after a fix that already happened.
+    expect(ssh?.message).toContain("applied routing again right away");
+    expect(ssh?.message).not.toContain("Reconnect");
+
+    const xray = attentionFromDiagnostic(
+      { level: "warning", message: "TUN dataplane stopped unexpectedly: Native helper exited (3). Routing is being applied again: the adapter is restarted, or the Windows proxy path takes over." },
+      "xray"
+    );
+    expect(xray).toMatchObject({ kind: "tun-unavailable", level: "error", title: "TUN adapter stopped" });
+    expect(xray?.message).toContain("applied routing again right away");
+    expect(xray?.message).not.toContain("Reconnect");
+  });
+
+  it("does not claim routing was applied again when the adapter stopped while the connection was down", () => {
+    for (const [origin, message] of [
+      ["ssh", "TUN dataplane stopped unexpectedly: Native helper exited (3). Routing is applied again when the session is back: the adapter is restarted, or the Windows proxy path takes over. Until then apps connect directly."],
+      ["xray", "TUN dataplane stopped unexpectedly: Native helper exited (3). Routing is applied again when Xray is back: the adapter is restarted, or the Windows proxy path takes over. Until then apps connect directly."]
+    ] as const) {
+      const attention = attentionFromDiagnostic({ level: "warning", message }, origin);
+      expect(attention).toMatchObject({ kind: "tun-unavailable", level: "error", title: "TUN adapter stopped" });
+      expect(attention?.message).toContain("apps connect directly until it is back");
+      expect(attention?.message).not.toContain("right away");
+    }
+  });
+
   it("names the missing TUN prerequisite", () => {
     const message = "TUN routing is unavailable, continuing on the Windows proxy path: The native helper cannot create a tunnel adapter.";
     expect(attentionFromDiagnostic({ level: "warning", message }, "ssh", { tun: { elevated: false, wintunFound: true } })?.title).toBe(
@@ -127,6 +159,25 @@ describe("attention from transport diagnostics", () => {
         { targetName: "Frankfurt-01" }
       )?.message
     ).toContain("Frankfurt-01 was down for 30 s");
+    // Xray says the same of the same event, and of a hold another program cut short.
+    const xrayHold = attentionFromDiagnostic(
+      { level: "warning", message: "The tunnel has been down for 30 s; returning the machine to direct routing until the session is back." },
+      "xray",
+      { targetName: "Paris VLESS" }
+    );
+    expect(xrayHold).toMatchObject({ title: "Traffic went direct while the tunnel was down", source: "routing" });
+    expect(xrayHold?.message).toContain("Paris VLESS was down for 30 s");
+    expect(
+      attentionFromDiagnostic(
+        {
+          level: "warning",
+          message:
+            "Another program took Xray's local port while Xray was down (listen EADDRINUSE 127.0.0.1:32000); returning the machine to direct routing until Xray is back."
+        },
+        "xray",
+        { targetName: "Paris VLESS" }
+      )
+    ).toMatchObject({ title: "Traffic went direct while the tunnel was down", source: "routing" });
   });
 
   it("ignores routine diagnostics without building the context", () => {

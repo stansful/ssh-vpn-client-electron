@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WindowsSystemProxyManager } from "../src/core/network/windows-system-proxy.js";
 import { LiveSshServiceBridge } from "../src/service/live-ssh-service.js";
+import type { ProcessRouteLearner } from "../src/service/process-route-learning.js";
 import { XrayServiceBridge } from "../src/service/xray-service.js";
 import type { ConnectRequest, RoutingRule, RuntimeStatus } from "../src/shared/types.js";
 
@@ -13,8 +14,7 @@ const ELAPSED_MS = 60 * 1000;
 const DNS_RECORD_TTL_SECONDS = 30;
 
 interface ProcessRoutingState {
-  processRoutingIps: Map<string, number>;
-  processRoutingDomains: Map<string, number>;
+  processRoutes: ProcessRouteLearner;
 }
 
 interface LiveSshInternals extends ProcessRoutingState {
@@ -51,14 +51,14 @@ describe("process-name route retention", () => {
       try {
         await internals.learnProcessRoutingIps(liveSshRequest());
 
-        expect([...internals.processRoutingDomains.keys()]).toEqual([DOMAIN]);
+        expect([...internals.processRoutes.domains.keys()]).toEqual([DOMAIN]);
         expect(remainingLifetimeMs(internals, DOMAIN)).toBeGreaterThan(DNS_RECORD_TTL_SECONDS * 1000);
 
         rewind(internals, ELAPSED_MS);
         await internals.learnProcessRoutingIps(liveSshRequest());
 
-        expect([...internals.processRoutingDomains.keys()]).toEqual([DOMAIN]);
-        expect([...internals.processRoutingIps.keys()]).toEqual([ADDRESS]);
+        expect([...internals.processRoutes.domains.keys()]).toEqual([DOMAIN]);
+        expect([...internals.processRoutes.ips.keys()]).toEqual([ADDRESS]);
         // The renewal must restore a full process-route TTL, not merely survive
         // one cycle, otherwise the route still decays a minute later.
         expect(remainingLifetimeMs(internals, DOMAIN)).toBeGreaterThan(PROCESS_ROUTE_TTL_MS - ELAPSED_MS);
@@ -83,13 +83,13 @@ describe("process-name route retention", () => {
       try {
         await internals.learnProcessRoutingIps([processRule()]);
 
-        expect([...internals.processRoutingDomains.keys()]).toEqual([DOMAIN]);
+        expect([...internals.processRoutes.domains.keys()]).toEqual([DOMAIN]);
 
         rewind(internals, ELAPSED_MS);
         await internals.learnProcessRoutingIps([processRule()]);
 
-        expect([...internals.processRoutingDomains.keys()]).toEqual([DOMAIN]);
-        expect([...internals.processRoutingIps.keys()]).toEqual([ADDRESS]);
+        expect([...internals.processRoutes.domains.keys()]).toEqual([DOMAIN]);
+        expect([...internals.processRoutes.ips.keys()]).toEqual([ADDRESS]);
       } finally {
         await service.dispose();
       }
@@ -117,13 +117,13 @@ describe("process-name route retention", () => {
 
       try {
         await internals.learnProcessRoutingIps(liveSshRequest());
-        expect([...internals.processRoutingDomains.keys()]).toEqual([DOMAIN]);
+        expect([...internals.processRoutes.domains.keys()]).toEqual([DOMAIN]);
 
         rewind(internals, PROCESS_ROUTE_TTL_MS + 1_000);
         await internals.learnProcessRoutingIps(liveSshRequest());
 
-        expect([...internals.processRoutingDomains.keys()]).toEqual([]);
-        expect([...internals.processRoutingIps.keys()]).toEqual([]);
+        expect([...internals.processRoutes.domains.keys()]).toEqual([]);
+        expect([...internals.processRoutes.ips.keys()]).toEqual([]);
       } finally {
         await service.dispose();
       }
@@ -218,15 +218,15 @@ function liveSshRequest(): ConnectRequest {
 }
 
 function remainingLifetimeMs(internals: ProcessRoutingState, domain: string): number {
-  return (internals.processRoutingDomains.get(domain) ?? 0) - Date.now();
+  return (internals.processRoutes.domains.get(domain) ?? 0) - Date.now();
 }
 
 /** Simulates elapsed wall-clock time without waiting for it. */
 function rewind(internals: ProcessRoutingState, elapsedMs: number): void {
-  for (const [domain, expiresAt] of internals.processRoutingDomains) {
-    internals.processRoutingDomains.set(domain, expiresAt - elapsedMs);
+  for (const [domain, expiresAt] of internals.processRoutes.domains) {
+    internals.processRoutes.domains.set(domain, expiresAt - elapsedMs);
   }
-  for (const [address, observedAt] of internals.processRoutingIps) {
-    internals.processRoutingIps.set(address, observedAt - elapsedMs);
+  for (const [address, observedAt] of internals.processRoutes.ips) {
+    internals.processRoutes.ips.set(address, observedAt - elapsedMs);
   }
 }

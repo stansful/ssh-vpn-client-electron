@@ -229,7 +229,7 @@ export function presentConnection(input: ConnectionInput): ConnectionPresentatio
     } else if (ssh) {
       description = `Restoring the session to ${address}. Routing holds for 30 s, then traffic goes direct until the tunnel is back.`;
     } else {
-      description = `Xray stopped unexpectedly. Restarting ${name}${attempt ? ` — attempt ${attempt}` : ""}.`;
+      description = `Xray stopped unexpectedly. Restarting ${name}${attempt ? ` — attempt ${attempt}` : ""}. Routing holds for 30 s, then traffic goes direct until Xray is back.`;
     }
     return {
       ...base,

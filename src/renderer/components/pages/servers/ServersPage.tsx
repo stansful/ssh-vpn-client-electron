@@ -260,8 +260,8 @@ export function ServersPage({ intent }: PageProps): JSX.Element {
               Pin the host key
             </h3>
             <p>
-              Paste the server’s SHA256 fingerprint when you edit it. Shadow then refuses to connect if that key ever changes, and can fall back to the
-              last working address when DNS fails after sleep.
+              Paste the server’s SHA256 fingerprint when you edit it. Shadow then refuses to connect if that key ever changes, from the very first
+              connect on; without a pin it trusts whatever key the server shows first.
             </p>
             <code className="sv-code">ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>
             <span className="hint">Run it on the server and copy the part that starts with SHA256:</span>

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
+import { unmapIpv4MappedAddress } from "../routing/ip-address.js";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "./local-tcp-proxy.js";
 import {
   configureLowLatencySocket,
@@ -366,11 +367,16 @@ export class Socks5Proxy {
           return false;
         }
         requestUploadComplete = true;
-        await (channel.end?.() ?? channel.close());
+        // The request is complete, but the upstream is deliberately not
+        // half-closed: many origins (a default Node HTTP server among them)
+        // read a client FIN as an abort and answer with nothing. The forwarded
+        // request carries `Connection: close`, so the origin ends the exchange
+        // itself once the response is sent. The local socket stays paused, so
+        // nothing after this request can reach the same origin.
         if (result.extra.length > 0) {
           this.events.emit("event", {
             type: "error",
-            message: "HTTP proxy connection attempted another request after its one-request upstream was half-closed."
+            message: "HTTP proxy connection attempted another request after its one-request upstream was complete."
           } satisfies Socks5ProxyEvent);
         }
         return true;
@@ -583,9 +589,9 @@ async function readSocksConnectRequestFromReader(reader: ProxySocketReader, firs
     if (length === 0) {
       throw new Error("SOCKS5 target host is empty.");
     }
-    host = (await reader.read(length)).toString("utf8");
+    host = unmapIpv4MappedAddress((await reader.read(length)).toString("utf8"));
   } else if (addressType === 0x04) {
-    host = formatIpv6(await reader.read(16));
+    host = unmapIpv4MappedAddress(formatIpv6(await reader.read(16)));
   } else {
     throw new Error(`Unsupported SOCKS5 address type ${addressType}.`);
   }
@@ -871,7 +877,7 @@ function parseHttpForwardTarget(requestTarget: string, hostHeader: string | unde
     }
     return {
       target: {
-        host: url.hostname.replace(/^\[(.*)\]$/u, "$1"),
+        host: unmapIpv4MappedAddress(url.hostname.replace(/^\[(.*)\]$/u, "$1")),
         port: url.port ? Number(url.port) : 80
       },
       path: `${url.pathname || "/"}${url.search}`
@@ -960,12 +966,12 @@ function parseHostPort(value: string, defaultPort: number): DirectTcpIpTarget {
     const host = trimmed.slice(1, end);
     const rest = trimmed.slice(end + 1);
     if (rest === "") {
-      return { host, port: defaultPort };
+      return { host: unmapIpv4MappedAddress(host), port: defaultPort };
     }
     if (!rest.startsWith(":")) {
       throw new Error("Invalid IPv6 proxy target.");
     }
-    return { host, port: parsePort(rest.slice(1)) };
+    return { host: unmapIpv4MappedAddress(host), port: parsePort(rest.slice(1)) };
   }
   const separator = trimmed.lastIndexOf(":");
   if (separator > 0 && trimmed.indexOf(":") === separator) {

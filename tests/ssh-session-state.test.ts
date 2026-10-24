@@ -21,8 +21,8 @@ import {
   SSH_MSG_CHANNEL_REQUEST
 } from "../src/core/ssh/channel-messages.js";
 import { deriveTransportKeys, transportKeyLengthsFor } from "../src/core/ssh/key-derivation.js";
-import { SshPacketProtector } from "../src/core/ssh/packet-codec.js";
-import { SshSessionStateMachine } from "../src/core/ssh/session-state.js";
+import { SshEncryptedPacketStreamReader, SshEncryptedPacketStreamWriter } from "../src/core/ssh/packet-stream.js";
+import { SshHostKeyMismatchError, SshSessionStateMachine } from "../src/core/ssh/session-state.js";
 import { createDefaultKexInit, encodeKexInit } from "../src/core/ssh/messages.js";
 import {
   computeCurve25519Sha256ExchangeHash,
@@ -43,14 +43,14 @@ describe("SSH packet codec stream state", () => {
       macName: "hmac-sha2-256" as const,
       macKey: keys.integrityKeyClientToServer
     };
-    const sender = new SshPacketProtector(config);
-    const receiver = new SshPacketProtector(config);
+    const sender = new SshEncryptedPacketStreamWriter(config);
+    const receiver = new SshEncryptedPacketStreamReader(config);
 
-    const first = sender.protect(Buffer.from("first"));
-    const second = sender.protect(Buffer.from("second"));
+    const first = sender.write(Buffer.from("first"));
+    const second = sender.write(Buffer.from("second"));
 
-    expect(receiver.unprotect(first)).toEqual(Buffer.from("first"));
-    expect(receiver.unprotect(second)).toEqual(Buffer.from("second"));
+    expect(receiver.push(first)).toEqual([Buffer.from("first")]);
+    expect(receiver.push(second)).toEqual([Buffer.from("second")]);
   });
 });
 
@@ -134,6 +134,48 @@ describe("SSH session state machine", () => {
 
     expect(() => session.completeKex(exchange.replyPayload)).toThrow("SSH server fingerprint mismatch");
     expect(session.getPhase()).toBe("kexdh-sent");
+  });
+
+  it("says which key the server presented and what else it offered when the pin does not match", () => {
+    const hostIdentity = createEd25519HostIdentity();
+    const pin = `SHA256:${"A".repeat(43)}`;
+    const session = new SshSessionStateMachine({
+      clientVersion: "SSH-2.0-client",
+      serverVersion: "SSH-2.0-server",
+      expectedServerFingerprint: pin
+    });
+    const exchange = prepareCurveExchange(session, hostIdentity, ["ssh-ed25519", "rsa-sha2-512"]);
+
+    let failure: unknown;
+    try {
+      session.completeKex(exchange.replyPayload);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(SshHostKeyMismatchError);
+    expect(failure).toMatchObject({
+      message: `SSH server fingerprint mismatch: expected ${pin}, got ${hostIdentity.fingerprint} (ssh-ed25519).`,
+      expectedFingerprint: pin,
+      presentedHostKeys: [{ fingerprint: hostIdentity.fingerprint, keyType: "ssh-ed25519" }],
+      negotiatedHostKeyAlgorithm: "ssh-ed25519",
+      serverHostKeyAlgorithms: ["ssh-ed25519", "rsa-sha2-512"]
+    });
+  });
+
+  it("reports the verified host key's type with its fingerprint", () => {
+    const hostIdentity = createEd25519HostIdentity();
+    const session = new SshSessionStateMachine({
+      clientVersion: "SSH-2.0-client",
+      serverVersion: "SSH-2.0-server",
+      expectedServerFingerprint: hostIdentity.fingerprint
+    });
+    const exchange = prepareCurveExchange(session, hostIdentity);
+
+    expect(session.completeKex(exchange.replyPayload)).toMatchObject({
+      serverHostKeyFingerprint: hostIdentity.fingerprint,
+      serverHostKeyType: "ssh-ed25519"
+    });
   });
 
   it("preserves the first session id and authenticated phase across runtime rekey", () => {
@@ -556,12 +598,16 @@ function createEd25519HostIdentity(): TestHostIdentity {
   return { privateKey, hostKeyBlob, fingerprint: sha256Fingerprint(hostKeyBlob) };
 }
 
-function prepareCurveExchange(session: SshSessionStateMachine, hostIdentity: TestHostIdentity): { replyPayload: Buffer } {
+function prepareCurveExchange(
+  session: SshSessionStateMachine,
+  hostIdentity: TestHostIdentity,
+  serverHostKeyAlgorithms = ["ssh-ed25519"]
+): { replyPayload: Buffer } {
   const started = session.startKex();
   const serverKexInitPayload = encodeKexInit({
     ...createDefaultKexInit(),
     kexAlgorithms: ["curve25519-sha256"],
-    serverHostKeyAlgorithms: ["ssh-ed25519"]
+    serverHostKeyAlgorithms
   });
   const kexInit = session.receiveServerKexInit(serverKexInitPayload);
   const clientInit = new SshBinaryReader(kexInit.kexDhInitPayload);

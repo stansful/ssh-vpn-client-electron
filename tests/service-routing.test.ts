@@ -2,34 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   buildProcessRouteSignature,
   buildSelectedRulesWithProcessIps,
-  describeUnsupportedSelectedRouting,
   recordBoundedProcessRouteDomain,
   recordBoundedProcessRouteIp
-} from "../src/service/live-ssh-service.js";
-import type { ConnectRequest, RoutingRule, SshConfig } from "../src/shared/types.js";
+} from "../src/service/process-route-learning.js";
+import type { RoutingRule } from "../src/shared/types.js";
 
-describe("live service routing support checks", () => {
-  it("allows process-only selected routing on Windows", () => {
-    const message = describeUnsupportedSelectedRouting(
-      requestWithRules([{ id: "proc", type: "process.name", value: "chrome.exe", enabled: true, createdAt: "", updatedAt: "" }]),
-      "win32"
-    );
-
-    expect(message).toBeUndefined();
-  });
-
-  it("allows mixed selected routing so PAC-compatible domain/IP rules still apply", () => {
-    const message = describeUnsupportedSelectedRouting(
-      requestWithRules([
-        { id: "proc", type: "process.name", value: "chrome.exe", enabled: true, createdAt: "", updatedAt: "" },
-        { id: "ip", type: "ip", value: "203.0.113.0/24", enabled: true, createdAt: "", updatedAt: "" }
-      ]),
-      "win32"
-    );
-
-    expect(message).toBeUndefined();
-  });
-
+describe("live service process-route learning", () => {
   it("adds learned process IPs without dropping domain or process rules", () => {
     const rules: RoutingRule[] = [
       { id: "domain", type: "domain", value: "youtube.com", enabled: true, createdAt: "", updatedAt: "" },
@@ -67,6 +45,24 @@ describe("live service routing support checks", () => {
     const augmented = buildSelectedRulesWithProcessIps(rules, new Set(["*", "0", "999.1.1.1", "149.154.167.50"]));
 
     expect(augmented.filter((rule) => rule.type === "ip").map((rule) => rule.value)).toEqual(["149.154.167.50"]);
+  });
+
+  it("leaves a selected process's local-network destinations out of the PAC rules", () => {
+    // A process rule comes after the local network; as PAC rules, learned
+    // destinations would rank with the user's own, which win over it.
+    const rules: RoutingRule[] = [
+      { id: "proc", type: "process.name", value: "telegram.exe", enabled: true, createdAt: "", updatedAt: "" },
+      { id: "lan", type: "ip", value: "10.0.0.0/8", enabled: true, createdAt: "", updatedAt: "" }
+    ];
+
+    const augmented = buildSelectedRulesWithProcessIps(
+      rules,
+      new Set(["192.168.1.5", "10.1.2.3", "100.64.0.7", "fd00::5", "149.154.167.50"]),
+      new Set(["nas.local", "*.corp.local", "api.telegram.org"])
+    );
+
+    expect(augmented.slice(0, 2)).toEqual(rules);
+    expect(augmented.slice(2).map((rule) => rule.value)).toEqual(["api.telegram.org", "149.154.167.50"]);
   });
 
   it("adds exact and wildcard process domains without duplicating user rules", () => {
@@ -118,31 +114,3 @@ describe("live service routing support checks", () => {
     );
   });
 });
-
-function requestWithRules(routingRules: RoutingRule[]): ConnectRequest {
-  return {
-    config: config(),
-    routingMode: "selected-rules",
-    routingRules,
-    routingProxyDomains: [],
-    routingDirectDomains: [],
-    checkEndpoint: "example.com:443",
-    secrets: { password: "secret" }
-  };
-}
-
-function config(): SshConfig {
-  return {
-    id: "config",
-    name: "Config",
-    host: "ssh.example.com",
-    port: 22,
-    username: "user",
-    authType: "password",
-    expectedServerFingerprint: "",
-    keepaliveIntervalSec: 30,
-    note: "",
-    createdAt: "",
-    updatedAt: ""
-  };
-}

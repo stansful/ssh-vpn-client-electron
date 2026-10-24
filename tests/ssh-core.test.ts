@@ -1,9 +1,8 @@
 import { diffieHellman, generateKeyPairSync, getDiffieHellman } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { negotiateAlgorithms } from "../src/core/ssh/algorithms.js";
+import { hostKeyTypeOf, negotiateAlgorithms, nextHostKeyAlgorithms } from "../src/core/ssh/algorithms.js";
 import {
   encodePasswordAuthRequest,
-  encodePublicKeyAuthProbe,
   encodeServiceRequest,
   SSH_MSG_SERVICE_REQUEST,
   SSH_MSG_USERAUTH_REQUEST
@@ -31,7 +30,7 @@ import {
   SSH_MSG_KEXDH_REPLY
 } from "../src/core/ssh/kex-group14.js";
 import { createCurve25519ClientExchange, exportRawX25519PublicKey, importRawX25519PublicKey } from "../src/core/ssh/kex-curve25519.js";
-import { createDefaultKexInit, encodeKexInit } from "../src/core/ssh/messages.js";
+import { createDefaultKexInit, DEFAULT_KEX_INIT, encodeKexInit } from "../src/core/ssh/messages.js";
 import { SshBinaryWriter } from "../src/core/ssh/binary.js";
 
 describe("SSH algorithm negotiation", () => {
@@ -48,6 +47,29 @@ describe("SSH algorithm negotiation", () => {
     expect(negotiated.kexAlgorithm).toBe("curve25519-sha256");
     expect(negotiated.encryptionClientToServer).toBe("aes128-ctr");
     expect(client.encryptionAlgorithmsClientToServer[0]).toBe("aes128-ctr");
+  });
+
+  it("prefers the Ed25519 host key over RSA when the server has both", () => {
+    const negotiated = negotiateAlgorithms(createDefaultKexInit(), {
+      ...createDefaultKexInit(),
+      serverHostKeyAlgorithms: ["rsa-sha2-512", "rsa-sha2-256", "ecdsa-sha2-nistp256", "ssh-ed25519"]
+    });
+
+    expect(negotiated.serverHostKeyAlgorithm).toBe("ssh-ed25519");
+  });
+
+  it("picks the next untried host key type the server offers for a fingerprint retry", () => {
+    const client = DEFAULT_KEX_INIT.serverHostKeyAlgorithms;
+    const stockServer = ["rsa-sha2-512", "rsa-sha2-256", "ecdsa-sha2-nistp256", "ssh-ed25519"];
+
+    expect(nextHostKeyAlgorithms(client, stockServer, new Set())).toEqual(["ssh-ed25519"]);
+    expect(nextHostKeyAlgorithms(client, stockServer, new Set(["ssh-ed25519"]))).toEqual(["rsa-sha2-512", "rsa-sha2-256"]);
+    expect(nextHostKeyAlgorithms(client, stockServer, new Set(["ssh-ed25519", "ssh-rsa"]))).toBeUndefined();
+    expect(nextHostKeyAlgorithms(client, ["ssh-ed25519", "rsa-sha2-256"], new Set(["ssh-ed25519"]))).toEqual(["rsa-sha2-256"]);
+    // SHA-1 "ssh-rsa" signatures are not something the client asks for.
+    expect(nextHostKeyAlgorithms(client, ["ssh-ed25519", "ssh-rsa"], new Set(["ssh-ed25519"]))).toBeUndefined();
+    expect(hostKeyTypeOf("rsa-sha2-512")).toBe("ssh-rsa");
+    expect(hostKeyTypeOf("ssh-ed25519")).toBe("ssh-ed25519");
   });
 
   it("computes SHA256 host key fingerprints", () => {
@@ -146,20 +168,6 @@ describe("SSH auth and channel message encoders", () => {
     expect(auth.utf8String()).toBe("password");
     expect(auth.boolean()).toBe(false);
     expect(auth.utf8String()).toBe("secret");
-  });
-
-  it("encodes public key auth probes without signatures", () => {
-    const auth = new SshBinaryReader(
-      encodePublicKeyAuthProbe({ username: "alice", publicKeyAlgorithm: "ssh-ed25519", publicKeyBlob: Buffer.from("pub") })
-    );
-
-    expect(auth.byte()).toBe(SSH_MSG_USERAUTH_REQUEST);
-    expect(auth.utf8String()).toBe("alice");
-    expect(auth.utf8String()).toBe("ssh-connection");
-    expect(auth.utf8String()).toBe("publickey");
-    expect(auth.boolean()).toBe(false);
-    expect(auth.utf8String()).toBe("ssh-ed25519");
-    expect(auth.string()).toEqual(Buffer.from("pub"));
   });
 
   it("encodes session and direct-tcpip channel opens", () => {

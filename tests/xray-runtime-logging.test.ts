@@ -33,6 +33,15 @@ describe("Xray runtime logging", () => {
     )).toBe(
       "infra/conf: failed to build outbound config with tag proxy > infra/conf: failed to build stream settings for outbound detour > infra/conf: Failed to build TLS config. > common/errors: The feature \"allowInsecure\" has been removed and migrated to \"pinnedPeerCertSha256\". Please update your config(s) according to release note and documentation."
     );
+    // The config arrives on stdin now, and Xray names that instead of a file.
+    // Verbatim from Xray 26.3.27 given an unknown inbound protocol on stdin.
+    expect(xrayStartupFailureReason(
+      "Failed to start: main: failed to load config files: [stdin:] > infra/conf: failed to build inbound config with tag  > infra/conf: failed to load inbound detour config for protocol nope > infra/conf: unknown config id: nope"
+    )).toBe(
+      "infra/conf: failed to build inbound config with tag  > infra/conf: failed to load inbound detour config for protocol nope > infra/conf: unknown config id: nope"
+    );
+    expect(classifyXrayLogLevel("2026/10/21 01:34:15.075335 [Info] infra/conf/serial: Reading config: &{Name:stdin: Format:json}", "info"))
+      .toBe("info");
     // Other startup failures keep their own wording.
     expect(xrayStartupFailureReason("Failed to start: main: failed to create server > app/proxyman/inbound: failed to listen TCP on 32000"))
       .toBe("main: failed to create server > app/proxyman/inbound: failed to listen TCP on 32000");

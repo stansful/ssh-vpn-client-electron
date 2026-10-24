@@ -27,8 +27,15 @@ export const SERVICE_LONG_REQUEST_TIMEOUT_MS = 90_000;
  * table through several `netsh` calls, any one of which can take seconds on a
  * busy network stack. The default request timeout would abort a start that was
  * about to succeed and leave the adapter half-configured.
+ *
+ * The helper's own budgets set the floor: 20 s per `netsh` call, two minutes
+ * for a rollback and three minutes for a whole teardown. A deadline shorter
+ * than those gives up on a start or stop the helper is still finishing - a
+ * start that then succeeds runs on with nobody tracking it, and a stop that is
+ * abandoned half way is what a helper killed on quit cuts short. So the
+ * deadline is the longest budget plus a margin.
  */
-export const SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS = 60_000;
+export const SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS = 200_000;
 
 export interface NativeServiceCapabilities {
   target: PlatformTarget;
@@ -50,6 +57,11 @@ export interface NativeServiceCapabilities {
    * cannot tell which is missing on its own.
    */
   tunUnavailableReason?: string;
+  /**
+   * The helper understands `recover-routes`. Helpers built before it leave
+   * the field out, and must not be sent the command.
+   */
+  routeRecovery?: boolean;
 }
 
 export interface NativeServiceHandshake {
@@ -105,11 +117,34 @@ export interface DataplaneStartRequest {
    * on `protectedPort`, and hops across the rest.
    */
   protectedPorts?: string;
+  /**
+   * Processes whose flows always leave directly, decided right after the
+   * protected endpoint, each named by its process ID and executable base name
+   * (e.g. { pid: 4242, name: "xray.exe" }). Only the Xray transport sends it -
+   * its own Xray child - so that a server address the helper was never told
+   * about cannot loop back into Xray. The ID is what tells that child apart:
+   * any other program called xray.exe is routed as usual. A helper that
+   * predates the field ignores it.
+   */
+  directProcesses?: Array<{ pid: number; name: string }>;
   /** Whether the active transport can carry datagrams at all. */
   udpSupported: boolean;
   enforceIpv6: boolean;
   adapterName: string;
   journalPath: string;
+}
+
+/**
+ * Undoes the routing changes a killed helper left in its journal, without
+ * starting a dataplane. Needs an elevated helper.
+ */
+export interface RouteRecoveryRequest {
+  journalPath: string;
+}
+
+export interface RouteRecoveryPayload {
+  /** How many journal entries were undone. */
+  recovered: number;
 }
 
 type VersionedWireMessage = { protocolVersion?: number };
@@ -129,6 +164,7 @@ const SERVICE_COMMAND_TYPES = new Set([
   "list-process-connections",
   "start-dataplane",
   "stop-dataplane",
+  "recover-routes",
   "shutdown"
 ]);
 const SERVICE_EVENT_TYPES = new Set([
@@ -158,6 +194,7 @@ export type ServiceCommand = VersionedWireMessage & { id: string; authToken?: st
   | { type: "list-process-connections" }
   | { type: "start-dataplane"; payload: DataplaneStartRequest }
   | { type: "stop-dataplane" }
+  | { type: "recover-routes"; payload: RouteRecoveryRequest }
   | { type: "shutdown" }
 );
 
@@ -170,6 +207,7 @@ export type ServiceResponsePayload =
   | TunnelCheckResult
   | NativeServiceHandshake
   | NativeProcessConnectionsPayload
+  | RouteRecoveryPayload
   | { accepted: true };
 export type ServiceEventEnvelope = VersionedWireMessage & { kind: "event"; event: ServiceEvent };
 export type ServiceWireMessage = ServiceCommand | ServiceResponse | ServiceEventEnvelope;
@@ -316,7 +354,7 @@ export function requestTimeoutMs(commandType: ServiceCommand["type"]): number {
   if (commandType === "connect") {
     return SERVICE_LONG_REQUEST_TIMEOUT_MS;
   }
-  if (commandType === "start-dataplane" || commandType === "stop-dataplane") {
+  if (commandType === "start-dataplane" || commandType === "stop-dataplane" || commandType === "recover-routes") {
     return SERVICE_DATAPLANE_REQUEST_TIMEOUT_MS;
   }
   return commandType === "get-status" || commandType === "get-capabilities"

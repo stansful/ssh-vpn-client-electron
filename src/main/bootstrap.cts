@@ -4,12 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { acquireSingleInstanceLock } from "./app/single-instance.cjs";
 
-const developmentBuild = process.env.SHADOW_SSH_BUILD_CHANNEL === "development";
+const developmentBuild = isDevelopmentBuild();
 /**
  * Kept from before the rename to Shadow. Electron names the Keychain/keyring
  * entry that encrypts saved secrets "<app name> Safe Storage" from the name
  * set here, before the app is ready, and the data folder carries it too.
- * Mirrors main.ts.
+ * Mirrors appIdentity in app/packaged-runtime.ts.
  */
 const appSystemName = developmentBuild ? "Shadow SSH Dev" : "Shadow SSH";
 const appDisplayName = developmentBuild ? "Shadow Dev" : "Shadow";
@@ -74,6 +74,23 @@ function uniqueLogPaths(): string[] {
   return [primaryLogPath];
 }
 
+/**
+ * Mirrors resolveBuildChannel in app/packaged-runtime.ts (this CommonJS
+ * loader cannot import it): a packaged build takes its channel from the
+ * package.json electron-builder baked it into, never from the environment.
+ */
+function isDevelopmentBuild(): boolean {
+  if (!app.isPackaged) {
+    return process.env.SHADOW_SSH_BUILD_CHANNEL === "development";
+  }
+  try {
+    const metadata = JSON.parse(readFileSync(path.join(app.getAppPath(), "package.json"), "utf8")) as { shadowBuildChannel?: unknown };
+    return metadata.shadowBuildChannel === "development";
+  } catch {
+    return false;
+  }
+}
+
 function readPersistedLoggingEnabled(): boolean {
   try {
     const parsed = JSON.parse(readFileSync(persistedStorePath, "utf8")) as { settings?: { loggingEnabled?: unknown } };
@@ -83,6 +100,7 @@ function readPersistedLoggingEnabled(): boolean {
   }
 }
 
+/** Mirrors resolveUserDataPath in app/paths.ts, including the override packaged builds keep. */
 function resolveUserDataPath(name: string): string {
   if (process.env.SHADOW_SSH_USER_DATA_DIR) {
     return process.env.SHADOW_SSH_USER_DATA_DIR;

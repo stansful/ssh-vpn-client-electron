@@ -44,6 +44,50 @@ describe("TransportMutationCoordinator", () => {
     expect(cleanup).toHaveBeenCalledOnce();
   });
 
+  it("runs an intent's preempt at once, ahead of the work it is queued behind", async () => {
+    const coordinator = new TransportMutationCoordinator();
+    const blocker = deferred<void>();
+    const order: string[] = [];
+    const busy = coordinator.enqueue(async () => {
+      await blocker.promise;
+      order.push("work ahead");
+    });
+    const intent = coordinator.requestIntent(
+      async () => {
+        order.push("intent");
+      },
+      { preempt: () => order.push("preempt") }
+    );
+    expect(order).toEqual(["preempt"]);
+
+    blocker.resolve(undefined);
+    await busy;
+    await expect(intent).resolves.toBe(true);
+    expect(order).toEqual(["preempt", "work ahead", "intent"]);
+  });
+
+  it("skips the preempt of an intent it does not accept, and runs the intent when the preempt throws", async () => {
+    const coordinator = new TransportMutationCoordinator();
+    const preempt = vi.fn();
+    await coordinator.requestIntent(async () => undefined);
+    await expect(coordinator.requestIntent(async () => undefined, { expectedGeneration: 0, preempt })).resolves.toBe(false);
+    expect(preempt).not.toHaveBeenCalled();
+
+    const operation = vi.fn(async () => undefined);
+    await expect(
+      coordinator.requestIntent(operation, {
+        preempt: () => {
+          throw new Error("no session");
+        }
+      })
+    ).resolves.toBe(true);
+    expect(operation).toHaveBeenCalledOnce();
+
+    coordinator.stopAcceptingIntents();
+    await expect(coordinator.requestIntent(async () => undefined, { preempt })).resolves.toBe(false);
+    expect(preempt).not.toHaveBeenCalled();
+  });
+
   it("rejects a delayed startup intent when a user intent already exists", async () => {
     const coordinator = new TransportMutationCoordinator();
     const userIntent = coordinator.requestIntent(async () => undefined);

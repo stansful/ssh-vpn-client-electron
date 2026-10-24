@@ -110,6 +110,11 @@ export function validateIpOrCidr(value: string): ValidationResult {
     if (!/^\d+$/.test(rawPrefix)) {
       return { ok: false, message: "CIDR prefix must be a number." };
     }
+    // The TUN dataplane parses ranges with Go's netip.ParsePrefix, which
+    // refuses "/08": a rule only TypeScript accepts would do nothing there.
+    if (rawPrefix.length > 1 && rawPrefix.startsWith("0")) {
+      return { ok: false, message: "CIDR prefix must not have leading zeros." };
+    }
 
     const prefix = Number(rawPrefix);
     const max = version === 4 ? 32 : 128;
@@ -119,6 +124,18 @@ export function validateIpOrCidr(value: string): ValidationResult {
   }
 
   return { ok: true };
+}
+
+/**
+ * An IP rule as earlier versions accepted and saved it, a prefix padded with
+ * zeros ("10.0.0.0/08"), written the one way every path reads - Go's
+ * netip.ParsePrefix included. A new rule is still refused in that form; one
+ * already saved is rewritten rather than dropped, or it would stop working
+ * with no change of its own, and Undo after deleting it would be refused.
+ */
+export function canonicalIpRuleValue(value: string): string {
+  const match = /^(.*)\/(0\d+)$/u.exec(value.trim());
+  return match ? `${match[1]}/${Number(match[2])}` : value;
 }
 
 export function validateProcessName(value: string): ValidationResult {

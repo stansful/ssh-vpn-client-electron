@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -72,6 +72,22 @@ describe("RotatingFileLog", () => {
     await logger.close();
 
     expect(await readFile(filePath, "utf8")).toBe("before-close\nafter-close\n");
+  });
+
+  it("reports a clear that could not empty the log, and keeps logging afterwards", async () => {
+    const directory = await makeTempDir(cleanupDirs);
+    const filePath = path.join(directory, "main.log");
+    const logger = new RotatingFileLog(filePath, { maxFileBytes: 1024, backupCount: 1 });
+    await logger.append("kept");
+    // A directory where the archive should go stands in for a file Windows keeps locked.
+    await mkdir(`${filePath}.1`);
+    await writeFile(path.join(`${filePath}.1`, "locked"), "x");
+
+    await expect(logger.clear()).rejects.toThrow();
+    await logger.append("still-writing");
+    await logger.close();
+
+    expect(await readFile(filePath, "utf8")).toContain("still-writing");
   });
 });
 

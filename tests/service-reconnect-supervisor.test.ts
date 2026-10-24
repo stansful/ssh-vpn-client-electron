@@ -1,3 +1,4 @@
+import net from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Socks5Proxy, type Socks5ProxyOptions } from "../src/core/network/socks5-proxy.js";
 import type { DirectTcpIpChannel } from "../src/core/network/local-tcp-proxy.js";
@@ -5,6 +6,8 @@ import type { DataplaneController } from "../src/service/native-dataplane.js";
 import type { DataplaneStartRequest } from "../src/service/local-ipc-protocol.js";
 import type { WindowsSystemProxyManager } from "../src/core/network/windows-system-proxy.js";
 import { SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../src/core/ssh/live-client.js";
+import { SshHostKeyMismatchError } from "../src/core/ssh/session-state.js";
+import { TransportMutationCoordinator } from "../src/main/app/transport-mutation-coordinator.js";
 import { LiveSshServiceBridge } from "../src/service/live-ssh-service.js";
 import type { ServiceEvent } from "../src/shared/ipc.js";
 import type { ConnectRequest, RuntimeStatus } from "../src/shared/types.js";
@@ -694,6 +697,267 @@ describe("live SSH service reconnect supervisor", () => {
     });
   });
 
+  it("resolves the name again when another server answers at the protected address", async () => {
+    await withWin32(async () => {
+      vi.useFakeTimers();
+      // The server moved while the session was down, and another host with
+      // its own key now has the old address. A fresh lookup finds the server
+      // and its unchanged key; halting as if it were an impostor would not.
+      const clients = [new FakeSshClient("203.0.113.9"), new FakeSshClient("203.0.113.20")];
+      const connect = vi.spyOn(SshLiveClient, "connect")
+        .mockResolvedValueOnce(clients[0].asClient())
+        .mockRejectedValueOnce(new SshHostKeyMismatchError({
+          expectedFingerprint: "SHA256:server",
+          presentedHostKeys: [{ fingerprint: "SHA256:someone-else", keyType: "ssh-ed25519" }],
+          negotiatedHostKeyAlgorithm: "ssh-ed25519",
+          serverHostKeyAlgorithms: ["ssh-ed25519"]
+        }))
+        .mockResolvedValueOnce(clients[1].asClient());
+      mockProxy();
+      const dataplane = fakeDataplane();
+      const { service, diagnostics } = createService({ dataplane, tun: true });
+      await service.connect({ ...connectRequest("tun-moved"), tunDataplaneEnabled: true });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      clients[0].emit({ type: "close" });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(connect.mock.calls[1][0].host).toBe("203.0.113.9");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(service.getStatus().state).toBe("Reconnecting");
+      expect(service.getStatus().message).not.toMatch(/host key|fingerprint/iu);
+      expect(dataplane.stopped).toBe(1);
+      expect(diagnostics.some((entry) => entry.includes("A different SSH server answers at 203.0.113.9"))).toBe(true);
+      await vi.advanceTimersByTimeAsync(1_300);
+      expect(connect).toHaveBeenCalledTimes(3);
+      expect(connect.mock.calls[2][0].host).toBe("tun-moved.example.com");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(service.getStatus().state).toBe("Connected");
+      await service.dispose();
+    });
+  });
+
+  it("keeps the local network out of the tunnel on the Windows proxy path", async () => {
+    // Full tunnel through the plain listener: WinINet's bypass list cannot
+    // name a private address or an IPv6 unique-local one, and a client that
+    // ignores it sends the rest here too. LAN destinations still go direct.
+    await withWin32(async () => {
+      const lan = net.createServer((socket) => socket.end());
+      await new Promise<void>((resolve) => lan.listen(0, "127.0.0.1", () => resolve()));
+      const port = (lan.address() as net.AddressInfo).port;
+      const client = new FakeSshClient();
+      vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+      const listener = mockProxy();
+      const { service } = createService();
+      try {
+        await service.connect(connectRequest("lan"));
+        const channel = await listener.connectChannel()({ host: "127.0.0.1", port }, { address: "127.0.0.1", port: 50003 });
+        expect(client.openDirectTcpIpChannel).not.toHaveBeenCalled();
+        await channel.close();
+
+        await listener.connectChannel()({ host: "api.example.com", port: 443 }, { address: "127.0.0.1", port: 50004 });
+        expect(client.openDirectTcpIpChannel).toHaveBeenCalledTimes(1);
+      } finally {
+        await service.dispose();
+        await new Promise<void>((resolve) => lan.close(() => resolve()));
+      }
+    });
+  });
+
+  it("tunnels the local network for an app pointed at the listener by hand", async () => {
+    // macOS and Linux: nothing steers the system's traffic, so whatever
+    // reaches the listener was sent to it on purpose - `ssh -D` reaches the
+    // server's own network and its localhost.
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+    const client = new FakeSshClient();
+    vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+    const listener = mockProxy();
+    const { service } = createService();
+    try {
+      await service.connect(connectRequest("manual"));
+      for (const [index, host] of ["10.0.0.5", "localhost", "jenkins", "192.168.1.1"].entries()) {
+        await listener.connectChannel()({ host, port: 8080 }, { address: "127.0.0.1", port: 50010 + index });
+      }
+      expect(client.openDirectTcpIpChannel.mock.calls.map((call) => (call as unknown[])[0])).toEqual([
+        { host: "10.0.0.5", port: 8080 },
+        { host: "localhost", port: 8080 },
+        { host: "jenkins", port: 8080 },
+        { host: "192.168.1.1", port: 8080 }
+      ]);
+    } finally {
+      await service.dispose();
+      if (platform) {
+        Object.defineProperty(process, "platform", platform);
+      }
+    }
+  });
+
+  it("tunnels a private address the TUN adapter sends, which a domain rule picked by a learned name", async () => {
+    // wiki.corp.example resolves to 10.20.0.5 behind the server. The adapter
+    // proxies ssh to it under the domain rule, by address: port 22 carries no
+    // name. Sending it direct here would take it out of the tunnel and back
+    // into the adapter.
+    await withWin32(async () => {
+      const client = new FakeSshClient("203.0.113.9");
+      vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+      const listener = mockProxy();
+      const dataplane = fakeDataplane();
+      const { service } = createService({ dataplane, tun: true });
+      try {
+        await service.connect({
+          ...connectRequest("tun-intranet"),
+          tunDataplaneEnabled: true,
+          routingMode: "selected-rules",
+          routingRules: [{ id: "corp", type: "domain", value: "corp.example", enabled: true, createdAt: "", updatedAt: "" }]
+        });
+        expect(service.getStatus().tunActive).toBe(true);
+        await listener.connectChannel()({ host: "10.20.0.5", port: 22 }, { address: "127.0.0.1", port: 50020 });
+        expect(client.openDirectTcpIpChannel).toHaveBeenCalledTimes(1);
+        expect((client.openDirectTcpIpChannel.mock.calls[0] as unknown[])[0]).toMatchObject({ host: "10.20.0.5", port: 22 });
+      } finally {
+        await service.dispose();
+      }
+    });
+  });
+
+  it("stops waiting for a TUN start when the user disconnects, and tries it no second time", async () => {
+    // netsh can take minutes over a start the helper cannot be interrupted
+    // in; Disconnect must not sit behind both attempts.
+    await withWin32(async () => {
+      vi.spyOn(SshLiveClient, "connect").mockResolvedValue(new FakeSshClient("203.0.113.9").asClient());
+      mockProxy();
+      const dataplane = fakeDataplane();
+      const signals: Array<AbortSignal | undefined> = [];
+      dataplane.start = (request, signal) => {
+        dataplane.started.push(request);
+        signals.push(signal);
+        return new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("Native helper start-dataplane request was abandoned.")), { once: true });
+        });
+      };
+      const { service, diagnostics, systemProxy } = createService({ dataplane, tun: true });
+      const connecting = service.connect({ ...connectRequest("tun-slow"), tunDataplaneEnabled: true });
+      await vi.waitFor(() => expect(dataplane.started).toHaveLength(1));
+
+      await service.disconnect();
+      await connecting.catch(() => undefined);
+
+      expect(service.getStatus().state).toBe("Disconnected");
+      expect(dataplane.started).toHaveLength(1);
+      expect(signals[0]?.aborted).toBe(true);
+      // The helper still finishes that start; the teardown owes it a stop.
+      expect(dataplane.stopped).toBe(1);
+      expect(diagnostics.some((entry) => entry.includes("did not start on attempt"))).toBe(false);
+      expect(diagnostics.some((entry) => entry.includes("TUN routing could not start"))).toBe(false);
+      // And no proxy path was put on top of it.
+      expect(systemProxy.apply).not.toHaveBeenCalled();
+      await service.dispose();
+    });
+  });
+
+  it("stops waiting for a routing update's TUN start when main queues a Disconnect behind it", async () => {
+    // Main runs every intent through one queue: the Disconnect waits for the
+    // routing update ahead of it, which waits for the TUN start. Only the part
+    // of the disconnect that runs at once - the preempt - can cut that short.
+    await withWin32(async () => {
+      vi.spyOn(SshLiveClient, "connect").mockResolvedValue(new FakeSshClient("203.0.113.9").asClient());
+      mockProxy();
+      const dataplane = fakeDataplane();
+      // TUN was unavailable at connect, so the session runs on the proxy
+      // path; a routing update then tries a full start, which hangs.
+      let tunAvailable = false;
+      dataplane.probe = async () => (tunAvailable ? { available: true } : { available: false, reason: "wintun.dll is missing" });
+      const signals: Array<AbortSignal | undefined> = [];
+      dataplane.start = (request, signal) => {
+        dataplane.started.push(request);
+        signals.push(signal);
+        return new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("Native helper start-dataplane request was abandoned.")), { once: true });
+        });
+      };
+      const { service, systemProxy } = createService({ dataplane, tun: true });
+      const coordinator = new TransportMutationCoordinator();
+      const request = { ...connectRequest("tun-update"), tunDataplaneEnabled: true };
+      await coordinator.requestIntent(async () => {
+        await service.connect(request);
+      });
+      expect(service.getStatus().state).toBe("Connected");
+      const appliesBefore = systemProxy.apply.mock.calls.length;
+
+      tunAvailable = true;
+      const updating = coordinator.enqueue(() =>
+        service.updateRouting({
+          routingMode: request.routingMode,
+          routingRules: request.routingRules,
+          routingProxyDomains: request.routingProxyDomains,
+          routingDirectDomains: request.routingDirectDomains,
+          checkEndpoint: request.checkEndpoint,
+          tunDataplaneEnabled: true
+        })
+      );
+      await vi.waitFor(() => expect(dataplane.started).toHaveLength(1));
+      const disconnecting = coordinator.requestIntent(
+        async () => {
+          await service.disconnect();
+        },
+        { preempt: () => service.beginDisconnect() }
+      );
+      expect(signals[0]?.aborted).toBe(true);
+      expect(service.getStatus().state).toBe("Disconnecting");
+
+      await updating;
+      await expect(disconnecting).resolves.toBe(true);
+      expect(service.getStatus().state).toBe("Disconnected");
+      expect(dataplane.started).toHaveLength(1);
+      // The overtaken update put no proxy path on before the teardown.
+      expect(systemProxy.apply.mock.calls.length).toBe(appliesBefore);
+      await service.dispose();
+    });
+  });
+
+  it("leaves an idle bridge alone when a disconnect begins", () => {
+    const { service } = createService();
+    service.beginDisconnect();
+    expect(service.getStatus().state).toBe("Disconnected");
+  });
+
+  it("tunnels a local destination a user rule names on the Windows proxy path", async () => {
+    // The PAC sent 10.1.2.3 here because of the rule; the listener must not
+    // take it back out of the tunnel.
+    await withWin32(async () => {
+      const lan = net.createServer((socket) => socket.end());
+      await new Promise<void>((resolve) => lan.listen(0, "127.0.0.1", () => resolve()));
+      const port = (lan.address() as net.AddressInfo).port;
+      const client = new FakeSshClient();
+      vi.spyOn(SshLiveClient, "connect").mockResolvedValue(client.asClient());
+      const listener = mockProxy();
+      const { service } = createService();
+      try {
+        await service.connect({
+          ...connectRequest("lan-rule"),
+          routingMode: "selected-rules",
+          routingRules: [
+            { id: "lan", type: "ip", value: "10.0.0.0/8", enabled: true, createdAt: "", updatedAt: "" },
+            { id: "corp", type: "domain", value: "corp.local", enabled: true, createdAt: "", updatedAt: "" }
+          ]
+        });
+        await listener.connectChannel()({ host: "10.1.2.3", port: 445 }, { address: "127.0.0.1", port: 50005 });
+        expect(client.openDirectTcpIpChannel).toHaveBeenCalledTimes(1);
+        expect((client.openDirectTcpIpChannel.mock.calls[0] as unknown[])[0]).toMatchObject({ host: "10.1.2.3", port: 445 });
+        await listener.connectChannel()({ host: "wiki.corp.local", port: 443 }, { address: "127.0.0.1", port: 50006 });
+        expect(client.openDirectTcpIpChannel).toHaveBeenCalledTimes(2);
+
+        // The rest of the local network still leaves directly.
+        const channel = await listener.connectChannel()({ host: "127.0.0.1", port }, { address: "127.0.0.1", port: 50007 });
+        expect(client.openDirectTcpIpChannel).toHaveBeenCalledTimes(2);
+        await channel.close();
+      } finally {
+        await service.dispose();
+        await new Promise<void>((resolve) => lan.close(() => resolve()));
+      }
+    });
+  });
+
   it("does not use a cached address for a different host or a literal address", async () => {
     vi.useFakeTimers();
     const client = new FakeSshClient("203.0.113.5");
@@ -712,6 +976,197 @@ describe("live SSH service reconnect supervisor", () => {
     await service.connect(connectRequest("other"));
     expect(connect).toHaveBeenCalledTimes(2);
     expect(service.getStatus().state).toBe("Reconnecting");
+    await service.dispose();
+  });
+
+  it("applies routing again at once when the TUN adapter dies under a connected session", async () => {
+    // The helper's death takes the adapter and its capture routes with it,
+    // and the Windows proxy setting went when TUN came up: selected traffic
+    // leaves directly while the session still reads Connected.
+    await withWin32(async () => {
+      vi.useFakeTimers();
+      vi.spyOn(SshLiveClient, "connect").mockResolvedValueOnce(new FakeSshClient("203.0.113.9").asClient());
+      mockProxy();
+      const dataplane = fakeDataplane();
+      const { service, diagnostics } = createService({ dataplane, tun: true });
+      await service.connect({ ...connectRequest("tun-death"), tunDataplaneEnabled: true });
+      expect(service.getStatus().tunActive).toBe(true);
+
+      dataplane.die("Native helper exited (3).");
+      expect(service.getStatus().tunActive).toBe(false);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A fresh start brings the adapter back; the session never dropped.
+      expect(dataplane.started).toHaveLength(2);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+      const warning = diagnostics.find((entry) => entry.startsWith("TUN dataplane stopped unexpectedly"));
+      expect(warning).toContain("Native helper exited (3).");
+      expect(warning).toContain("Routing is being applied again");
+      await service.dispose();
+    });
+  });
+
+  it("says traffic goes direct until the session is back when the adapter dies while it is down", async () => {
+    // Nothing is applied again before the reconnect - the Windows proxy
+    // setting went when TUN came up - so the routing hold holds nothing.
+    await withWin32(async () => {
+      vi.useFakeTimers();
+      const client = new FakeSshClient("203.0.113.9");
+      vi.spyOn(SshLiveClient, "connect")
+        .mockResolvedValueOnce(client.asClient())
+        .mockRejectedValue(new Error("connect ECONNREFUSED 203.0.113.9:22"));
+      mockProxy();
+      const dataplane = fakeDataplane();
+      const { service, diagnostics } = createService({ dataplane, tun: true });
+      await service.connect({ ...connectRequest("tun-death-held"), tunDataplaneEnabled: true });
+      expect(service.getStatus().tunActive).toBe(true);
+
+      client.emit({ type: "close" });
+      expect(service.getStatus().state).toBe("Reconnecting");
+      dataplane.die("Native helper exited (3).");
+
+      const warning = diagnostics.find((entry) => entry.startsWith("TUN dataplane stopped unexpectedly"));
+      expect(warning).toContain("Routing is applied again when the session is back");
+      expect(warning).toContain("Until then apps connect directly.");
+      expect(warning).not.toContain("Routing is being applied again");
+      await service.dispose();
+    });
+  });
+
+  it("falls back to the proxy path for the session once the adapter keeps dying", async () => {
+    await withWin32(async () => {
+      vi.useFakeTimers();
+      vi.spyOn(SshLiveClient, "connect").mockResolvedValueOnce(new FakeSshClient("203.0.113.9").asClient());
+      mockProxy();
+      const dataplane = fakeDataplane();
+      const { service, diagnostics, systemProxy } = createService({ dataplane, tun: true });
+      await service.connect({ ...connectRequest("tun-flap"), tunDataplaneEnabled: true });
+      expect(systemProxy.apply).not.toHaveBeenCalled();
+
+      for (let death = 0; death < 3; death += 1) {
+        dataplane.die("the adapter read failed");
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      // Two deaths were answered with a restart; the third ends the loop of
+      // adapters coming and going, and the proxy path takes over.
+      expect(dataplane.started).toHaveLength(3);
+      expect(dataplane.isActive).toBe(false);
+      expect(systemProxy.apply).toHaveBeenCalledTimes(1);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: false });
+      expect(diagnostics.some((entry) => entry.includes("Routing continues on the Windows proxy path"))).toBe(true);
+      expect(diagnostics.some((entry) => entry.startsWith("TUN routing is unavailable") && entry.includes("stopped unexpectedly 3 times"))).toBe(true);
+      await service.dispose();
+    });
+  });
+
+  it("does not hold an adapter whose helper died while the session was down", async () => {
+    await withWin32(async () => {
+      vi.useFakeTimers();
+      const clients = [new FakeSshClient("203.0.113.9"), new FakeSshClient("203.0.113.9")];
+      const connect = vi.spyOn(SshLiveClient, "connect")
+        .mockResolvedValueOnce(clients[0].asClient())
+        .mockResolvedValueOnce(clients[1].asClient());
+      mockProxy();
+      const dataplane = fakeDataplane();
+      const { service } = createService({ dataplane, tun: true });
+      await service.connect({ ...connectRequest("tun-dead-hold"), tunDataplaneEnabled: true });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      clients[0].emit({ type: "close" });
+      // The adapter is gone without a word (a controller that could not
+      // report it); the hold has to check for itself.
+      dataplane.isActive = false;
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Nothing captures traffic any more, so there is no adapter to keep:
+      // the server is reached the ordinary way and the adapter is rebuilt,
+      // instead of reporting Connected with no routing at all.
+      expect(connect.mock.calls[1][0].host).toBe("tun-dead-hold.example.com");
+      expect(dataplane.started).toHaveLength(2);
+      expect(service.getStatus()).toMatchObject({ state: "Connected", tunActive: true });
+      await service.dispose();
+    });
+  });
+
+  it("arms the routing hold when an attempt fails after routing went in", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(SshLiveClient, "connect").mockImplementation(async () => new FakeSshClient().asClient());
+    mockProxy();
+    const { service, systemProxy } = createService();
+    systemProxy.apply.mockRejectedValue(new Error("proxy apply failed"));
+    await service.connect(connectRequest("routing-fails"));
+    // A user Connect starts from direct routing: that is the one restore.
+    expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+    expect(service.getStatus().state).toBe("Reconnecting");
+
+    // The half-applied routing is kept for the retries, but only for the
+    // hold window the UI promises; then the machine goes direct.
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(systemProxy.restore).toHaveBeenCalledTimes(2);
+    await service.dispose();
+  });
+
+  it("does not restart an expired hold when the attempt in flight then fails", async () => {
+    vi.useFakeTimers();
+    const first = new FakeSshClient();
+    // Every retry hangs for 10 s (a blackholed server: the TCP connect
+    // timeout) and then fails, so the hold expires while one is in flight.
+    vi.spyOn(SshLiveClient, "connect")
+      .mockResolvedValueOnce(first.asClient())
+      .mockImplementation((_options, signal) => new Promise<SshLiveClient>((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("connect ETIMEDOUT")), 10_000);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(Object.assign(new Error("SSH connect was cancelled."), { name: "AbortError" }));
+        });
+      }));
+    mockProxy();
+    const { service, systemProxy, diagnostics } = createService();
+    await service.connect(connectRequest("hold-expiry"));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+
+    first.emit({ type: "close" });
+    await vi.advanceTimersByTimeAsync(29_500);
+    expect(systemProxy.restore).toHaveBeenCalledTimes(1);
+    // The hold fires during the third attempt (23-33 s) and queues the return
+    // to direct routing behind it; that attempt's failure must not arm a new
+    // window over the same outage and cancel it.
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(systemProxy.restore).toHaveBeenCalledTimes(2);
+    expect(service.getStatus().state).toBe("Reconnecting");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(diagnostics.filter((entry) => entry.includes("down for 30 s"))).toHaveLength(1);
+    await service.dispose();
+  });
+
+  it("cancels a connect that hangs when the user disconnects", async () => {
+    vi.useFakeTimers();
+    let connectSignal: AbortSignal | undefined;
+    vi.spyOn(SshLiveClient, "connect").mockImplementation((_options, signal) => {
+      connectSignal = signal;
+      return new Promise<SshLiveClient>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(Object.assign(new Error("SSH connect was cancelled."), { name: "AbortError" })));
+      });
+    });
+    mockProxy();
+    const { service, diagnostics } = createService();
+    const connecting = service.connect(connectRequest("hanging"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(connectSignal?.aborted).toBe(false);
+
+    // No timer is advanced: the disconnect must not wait out the connect's
+    // own timeouts behind the mutation queue.
+    await service.disconnect();
+    await connecting;
+    expect(connectSignal?.aborted).toBe(true);
+    expect(service.getStatus().state).toBe("Disconnected");
+    // The cancelled attempt belongs to a superseded lifecycle and says nothing.
+    expect(diagnostics.some((entry) => entry.includes("cancelled"))).toBe(false);
     await service.dispose();
   });
 });
@@ -782,11 +1237,12 @@ function mockProxy(): { connectChannel: () => ConnectChannel } {
 
 function createService(
   options: { dataplane?: DataplaneController; tun?: boolean } = {}
-): { service: LiveSshServiceBridge; diagnostics: string[] } {
-  const systemProxy = {
+): { service: LiveSshServiceBridge; diagnostics: string[]; systemProxy: { apply: ReturnType<typeof vi.fn>; restore: ReturnType<typeof vi.fn> } } {
+  const proxy = {
     apply: vi.fn(async () => ({ applied: true, message: "applied" })),
     restore: vi.fn(async () => undefined)
-  } as unknown as WindowsSystemProxyManager;
+  };
+  const systemProxy = proxy as unknown as WindowsSystemProxyManager;
   const service = new LiveSshServiceBridge(initialStatus(), {
     systemProxy,
     systemWakeDetection: false,
@@ -805,7 +1261,7 @@ function createService(
       diagnostics.push(event.entry.message);
     }
   });
-  return { service, diagnostics };
+  return { service, diagnostics, systemProxy: proxy };
 }
 
 function connectRequest(id: string): ConnectRequest {
@@ -844,9 +1300,18 @@ async function withWin32(run: () => Promise<void>): Promise<void> {
   }
 }
 
-type FakeDataplane = DataplaneController & { started: DataplaneStartRequest[]; stopped: number };
+type FakeDataplane = DataplaneController & {
+  started: DataplaneStartRequest[];
+  stopped: number;
+  isActive: boolean;
+  /** Plays the helper dying under a running adapter. */
+  die(reason: string): void;
+};
 
 function fakeDataplane(): FakeDataplane {
+  const listeners = new Set<(reason: string) => void>();
+  // Like the real controller: active from a successful start until a stop
+  // or the helper's death.
   const controller: FakeDataplane = {
     started: [],
     stopped: 0,
@@ -854,11 +1319,26 @@ function fakeDataplane(): FakeDataplane {
     probe: async () => ({ available: true }),
     start: async (request) => {
       controller.started.push(request);
+      controller.isActive = true;
     },
     stop: async () => {
       controller.stopped += 1;
+      controller.isActive = false;
     },
-    dispose: async () => undefined
+    dispose: async () => undefined,
+    onUnexpectedStop: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    die: (reason) => {
+      if (!controller.isActive) {
+        return;
+      }
+      controller.isActive = false;
+      for (const listener of listeners) {
+        listener(reason);
+      }
+    }
   };
   return controller;
 }

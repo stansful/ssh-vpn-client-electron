@@ -135,7 +135,12 @@ export function ServerRow({
                   Host key pinned
                 </span>
               ) : (
-                <span className="sv-dim" title="Any host key is accepted for this server">
+                <span
+                  className="sv-dim"
+                  title={config.trustedHostKeyFingerprint
+                    ? "Connect checks the server against the key it presented the first time"
+                    : "The first host key this server presents is trusted, and later connections must match it"}
+                >
                   Host key not pinned
                 </span>
               )}

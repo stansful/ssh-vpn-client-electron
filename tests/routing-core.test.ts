@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { parseCidrRange, parseIpAddress, ipMatchesCidr } from "../src/core/routing/ip-address.js";
+import {
+  ipMatchesCidr,
+  isLocalDestinationHost,
+  isLocalDestinationIp,
+  parseCidrRange,
+  parseIpAddress,
+  parseIpAddressUnmapped,
+  unmapIpv4MappedAddress
+} from "../src/core/routing/ip-address.js";
 import { RoutingMatcher } from "../src/core/routing/routing-matcher.js";
 import type { RoutingRule } from "../src/shared/types.js";
 
@@ -98,6 +106,67 @@ describe("routing matcher core", () => {
       shouldProxy: false,
       reason: "no-match"
     });
+  });
+
+  // The shared routing order puts domain and IP rules first, the local
+  // network after them and process rules after that, so a caller can rank the
+  // local network and the direct list between the steps.
+  it("reports a matching rule ahead of proxy-all, domain and IP rules first", () => {
+    const matcher = new RoutingMatcher("proxy-all", [
+      rule("domain", "example.com", "domain"),
+      rule("ip", "10.0.0.0/8", "lan"),
+      rule("process.name", "chrome.exe", "process")
+    ]);
+
+    expect(matcher.match({ destinationDomain: "www.example.com", processName: "chrome.exe" })).toEqual({
+      shouldProxy: true,
+      reason: "domain",
+      ruleId: "domain"
+    });
+    expect(matcher.match({ destinationIp: "10.1.2.3", processName: "chrome.exe" })).toMatchObject({ reason: "ip", ruleId: "lan" });
+    expect(matcher.match({ destinationDomain: "other.example", processName: "Chrome.exe" })).toMatchObject({ reason: "process.name" });
+    expect(matcher.match({ destinationDomain: "other.example" })).toEqual({ shouldProxy: true, reason: "proxy-all" });
+    // The steps on their own, for callers that put something between them.
+    expect(matcher.matchDestination({ destinationIp: "10.1.2.3" })).toMatchObject({ reason: "ip", ruleId: "lan" });
+    expect(matcher.matchDestination({ destinationIp: "192.168.1.1" })).toBeUndefined();
+    expect(matcher.matchProcess("CHROME.EXE")).toMatchObject({ reason: "process.name", ruleId: "process" });
+    expect(matcher.matchProcess(undefined)).toBeUndefined();
+    expect(matcher.unmatched()).toEqual({ shouldProxy: true, reason: "proxy-all" });
+    expect(new RoutingMatcher("selected-rules", []).unmatched()).toEqual({ shouldProxy: false, reason: "no-enabled-rules" });
+    expect(new RoutingMatcher("selected-rules", [rule("ip", "10.0.0.0/8")]).unmatched()).toEqual({ shouldProxy: false, reason: "no-match" });
+  });
+
+  it("matches an IPv4-mapped IPv6 destination against IPv4 ranges", () => {
+    const matcher = new RoutingMatcher("selected-rules", [rule("ip", "142.250.0.0/15")]);
+
+    expect(matcher.match({ destinationIp: "::ffff:142.250.72.14" })).toMatchObject({ shouldProxy: true, reason: "ip" });
+    expect(matcher.match({ destinationIp: "[::ffff:8efa:480e]" })).toMatchObject({ shouldProxy: true, reason: "ip" });
+    expect(matcher.match({ destinationIp: "::ffff:8.8.8.8" })).toMatchObject({ shouldProxy: false, reason: "no-match" });
+  });
+
+  it("reads IPv4-mapped addresses as IPv4 and recognises local destinations", () => {
+    expect(parseIpAddressUnmapped("::ffff:192.0.2.7")).toEqual({ version: 4, value: 0xc0000207n });
+    expect(parseIpAddressUnmapped("0:0:0:0:0:ffff:c000:207")).toEqual({ version: 4, value: 0xc0000207n });
+    expect(parseIpAddressUnmapped("::192.0.2.7")?.version).toBe(6);
+    expect(parseIpAddressUnmapped("::ffff:999.0.2.7")).toBeUndefined();
+    expect(unmapIpv4MappedAddress("::ffff:c000:207")).toBe("192.0.2.7");
+    expect(unmapIpv4MappedAddress("2001:db8::1")).toBe("2001:db8::1");
+    expect(unmapIpv4MappedAddress("example.com")).toBe("example.com");
+
+    for (const host of [
+      "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.10", "169.254.1.1", "100.64.0.1",
+      "100.127.255.255", "0.0.0.0", "::1", "[::1]", "fe80::1", "febf::1", "fc00::1", "fdab:1::2",
+      "::ffff:10.0.0.1", "localhost", "LOCALHOST.", "intranet", "printer.local", "nas.home.local"
+    ]) {
+      expect(isLocalDestinationHost(host), host).toBe(true);
+    }
+    for (const host of [
+      "8.8.8.8", "172.15.0.1", "172.32.0.1", "100.63.255.255", "100.128.0.1", "192.169.0.1", "2001:db8::1",
+      "fd::1", "fec0::1", "::ffff:8.8.8.8", "example.com", "local.example.com", ""
+    ]) {
+      expect(isLocalDestinationHost(host), host).toBe(false);
+    }
+    expect(isLocalDestinationIp("printer.local")).toBe(false);
   });
 
   it("parses CIDR ranges to network masks", () => {

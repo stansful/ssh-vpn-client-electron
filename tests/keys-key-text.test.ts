@@ -27,7 +27,7 @@ function pem(label: string, body: Buffer): string {
 }
 
 /** Minimal OpenSSH envelope: enough for the analyzer, not a loadable key. */
-function openSshKey(options: { algorithm: string; cipher?: string; kdf?: string; withPublicKey?: boolean }): string {
+function openSshKey(options: { algorithm: string; cipher?: string; kdf?: string; withPublicKey?: boolean; rounds?: number }): string {
   const cipher = options.cipher ?? "none";
   const kdf = options.kdf ?? "none";
   const publicBlob = Buffer.concat([sshString(options.algorithm), sshString(Buffer.alloc(32, 7))]);
@@ -37,7 +37,13 @@ function openSshKey(options: { algorithm: string; cipher?: string; kdf?: string;
     Buffer.from("openssh-key-v1\0", "binary"),
     sshString(cipher),
     sshString(kdf),
-    sshString(kdf === "none" ? Buffer.alloc(0) : Buffer.alloc(24, 9)),
+    sshString(
+      kdf === "none"
+        ? Buffer.alloc(0)
+        : options.rounds === undefined
+          ? Buffer.alloc(24, 9)
+          : Buffer.concat([sshString(Buffer.alloc(16, 9)), uint32(options.rounds)])
+    ),
     uint32(withPublic ? 1 : 0),
     ...(withPublic ? [sshString(publicBlob)] : []),
     sshString(cipher === "none" ? privateBlock : Buffer.alloc(64, 3))
@@ -65,11 +71,41 @@ describe("analyzeKeyText", () => {
     expect(analyzeKeyText(openSshKey({ algorithm: "ssh-ed25519", withPublicKey: false })).keyType).toBe("ed25519");
   });
 
-  it("flags passphrase-protected OpenSSH keys as saveable but not able to sign in", () => {
+  it("asks for the passphrase of a protected OpenSSH key instead of calling it unsupported", () => {
     const analysis = analyzeKeyText(openSshKey({ algorithm: "ssh-ed25519", cipher: "aes256-ctr", kdf: "bcrypt" }));
-    expect(analysis).toMatchObject({ kind: "private", keyType: "ed25519", encryptedOpenSsh: true });
+    expect(analysis).toMatchObject({ kind: "private", keyType: "ed25519", encryptedOpenSsh: true, needsPassphrase: true });
+    expect(analysis.unsupportedOpenSshCipher).toBeUndefined();
     expect(keyTextProblem(analysis)).toBeUndefined();
-    expect(keyTextWarning(analysis)).toMatch(/Passphrase-protected OpenSSH keys can’t sign in yet/u);
+    expect(keyTextWarning(analysis)).toBeUndefined();
+
+    for (const cipher of ["aes128-ctr", "aes256-cbc", "aes256-gcm@openssh.com"]) {
+      expect(keyTextWarning(analyzeKeyText(openSshKey({ algorithm: "ssh-ed25519", cipher, kdf: "bcrypt" })))).toBeUndefined();
+    }
+  });
+
+  it("warns about an OpenSSH key encrypted with a cipher the core cannot open", () => {
+    const analysis = analyzeKeyText(openSshKey({ algorithm: "ssh-ed25519", cipher: "chacha20-poly1305@openssh.com", kdf: "bcrypt" }));
+    expect(analysis).toMatchObject({ encryptedOpenSsh: true, unsupportedOpenSshCipher: "chacha20-poly1305@openssh.com" });
+    expect(keyTextWarning(analysis)).toMatch(/encrypted with chacha20-poly1305@openssh\.com, which Shadow can’t open/u);
+  });
+
+  it("warns about a key encrypted with more bcrypt rounds than the core opens", () => {
+    const usual = analyzeKeyText(openSshKey({ algorithm: "ssh-ed25519", cipher: "aes256-ctr", kdf: "bcrypt", rounds: 100 }));
+    expect(usual.excessiveBcryptRounds).toBeUndefined();
+    expect(keyTextWarning(usual)).toBeUndefined();
+
+    const slow = analyzeKeyText(openSshKey({ algorithm: "ssh-ed25519", cipher: "aes256-ctr", kdf: "bcrypt", rounds: 500 }));
+    expect(slow.excessiveBcryptRounds).toBe(500);
+    expect(keyTextWarning(slow)).toMatch(/500 bcrypt rounds; Shadow opens keys with up to 128/u);
+  });
+
+  it("warns that a security-key (FIDO) key can't sign in", () => {
+    for (const algorithm of ["sk-ecdsa-sha2-nistp256@openssh.com", "sk-ssh-ed25519@openssh.com"]) {
+      const analysis = analyzeKeyText(openSshKey({ algorithm }));
+      expect(analysis.securityKey).toBe(true);
+      expect(keyTextWarning(analysis)).toMatch(/^Security-key \(FIDO\) keys can’t sign in/u);
+    }
+    expect(analyzeKeyText(openSshKey({ algorithm: "ecdsa-sha2-nistp256" })).securityKey).toBeUndefined();
   });
 
   it("detects PEM and PKCS#8 keys made by node", () => {
@@ -83,7 +119,9 @@ describe("analyzeKeyText", () => {
 
     const ecPem = analyzeKeyText(ec.privateKey.export({ type: "sec1", format: "pem" }).toString());
     expect(ecPem).toMatchObject({ keyType: "ecdsa", keyFormat: "pem" });
-    expect(keyTextWarning(ecPem)).toMatch(/ECDSA keys can be saved but can’t sign in yet/u);
+    expect(keyTextWarning(ecPem)).toBeUndefined();
+    expect(keyTextWarning(analyzeKeyText(openSshKey({ algorithm: "ecdsa-sha2-nistp384" })))).toBeUndefined();
+    expect(keyTextWarning(analyzeKeyText(openSshKey({ algorithm: "ssh-dss" })))).toMatch(/DSA keys can be saved but can’t sign in/u);
   });
 
   it("knows encrypted PEM and PKCS#8 keys need a passphrase", () => {

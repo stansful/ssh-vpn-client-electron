@@ -92,7 +92,7 @@ export function FingerprintField({ id, value, onChange, onReveal, analysis, erro
         </StateLine>
       ) : pin === "will-unpin" ? (
         <StateLine tone="warn" icon={TriangleAlert} id={messageId}>
-          <b>Saving removes the pin.</b> {serverName} will accept any host key again.
+          <b>Saving removes the pin.</b> {serverName} will trust the next host key it sees and hold later connections to it.
         </StateLine>
       ) : showSuggestion && suggestion ? (
         <div className="fm-suggest anim-swap" id={messageId}>
@@ -112,8 +112,9 @@ export function FingerprintField({ id, value, onChange, onReveal, analysis, erro
         </div>
       ) : null}
       <p className="hint" id={hintId}>
-        A pinned server must present this exact key, or Shadow stops instead of retrying. Pinning also helps when DNS fails, say right after {device}{" "}
-        wakes up: a pinned server can reconnect through its last known IP. Get it on the server with{" "}
+        A pinned server must present this exact key, or Shadow stops instead of retrying. Once Shadow knows the server’s key, pinned here or
+        trusted on the first connect, it can reconnect through the last known IP when DNS fails, say right after {device} wakes up. Get it on
+        the server with{" "}
         <span className="fm-cmd">ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</span>
       </p>
     </div>

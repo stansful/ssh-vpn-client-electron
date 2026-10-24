@@ -67,6 +67,15 @@ describe("Connect presentation", () => {
     const stuck = presentConnection(input("Reconnecting", {}, "Reconnect attempt 7 failed: getaddrinfo ENOTFOUND helsinki.example.net"));
     expect(stuck.reconnectReason?.likelyStuck).toBe(true);
     expect(stuck.description).toBe("Still trying 203.0.113.10:22. Retries keep going until you stop them.");
+
+    // Xray holds routing for its restart the way an SSH reconnect does.
+    const xray = presentConnection({
+      ...input("Reconnecting", { transport: "xray", activeTransport: "xray", targetName: "fi-hel-hy2" }),
+      runtime: createTestRuntime({ state: "Reconnecting", transport: "xray", reconnectAttempt: 2, message: "Restarting Xray transport after failure: Xray runtime exited with code 1." })
+    });
+    expect(xray.description).toBe(
+      "Xray stopped unexpectedly. Restarting fi-hel-hy2 — attempt 2. Routing holds for 30 s, then traffic goes direct until Xray is back."
+    );
   });
 
   it("explains blocked, unsupported and first-run Off states and disables the orb", () => {

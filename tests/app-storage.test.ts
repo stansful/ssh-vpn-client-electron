@@ -3,6 +3,8 @@ import { copyFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SshBinaryWriter } from "../src/core/ssh/binary.js";
+import { SSH_KEY_FIXTURES } from "./ssh-key-fixtures.js";
 import {
   createDefaultStore,
   DEFAULT_CUSTOM_THEME,
@@ -35,6 +37,7 @@ const {
   isProductionSecretStorageRuntime,
   isSafeStorageBackendUsable,
   readJsonFileWithLimit,
+  renameWithRetry,
   writeJsonAtomic
 } = await import("../src/main/storage/app-storage.js");
 
@@ -538,7 +541,9 @@ describe("AppStorage recovery", () => {
       () => storage.deleteProxyProfile("missing"),
       () => storage.deleteUnpinnedProxyProfiles(),
       () => storage.updateRoutingProxyList(createDefaultStore().routingProxyList),
-      () => storage.updateRoutingDirectList(createDefaultStore().routingDirectList)
+      () => storage.updateRoutingDirectList(createDefaultStore().routingDirectList),
+      () => storage.setRoutingProxyListEnabled(true),
+      () => storage.setRoutingDirectListEnabled(true)
     ];
     for (const write of writes) {
       await expect(write()).rejects.toThrow(STORAGE_WRITE_BLOCKED_MESSAGE);
@@ -730,6 +735,61 @@ describe("AppStorage schema 3", () => {
     expect(persisted.sshKeys[0]?.keyType).toBe("ed25519");
   });
 
+  it("flags a security-key (FIDO) key saved before such keys were told apart, once", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    await storage.upsertKey({ name: "fido", privateKey: securityKeyText() });
+    const store = await storage.upsertKey({ name: "plain", privateKey: SSH_KEY_FIXTURES.ecdsaP256Unencrypted.privateKey });
+    expect(store.sshKeys.map((key) => key.securityKey)).toEqual([true, false]);
+    // 2.6.1 recorded both as plain ECDSA keys, with no securityKey at all.
+    const legacyStore = { ...store, sshKeys: store.sshKeys.map((key) => ({ ...key, securityKey: undefined })) };
+    await writeFile(path.join(dir, "app-store.v1.json"), JSON.stringify(legacyStore), "utf8");
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+
+    expect(reopened.getStore().sshKeys.map((key) => [key.name, key.keyType, key.securityKey])).toEqual([
+      ["fido", "ecdsa", true],
+      ["plain", "ecdsa", false]
+    ]);
+    const persisted = JSON.parse(await readFile(path.join(dir, "app-store.v1.json"), "utf8")) as ReturnType<typeof createDefaultStore>;
+    expect(persisted.sshKeys.map((key) => key.securityKey)).toEqual([true, false]);
+    // A rename keeps what was found.
+    const renamed = await reopened.upsertKey({ id: persisted.sshKeys[1]?.id, name: "plain-renamed" });
+    expect(renamed.sshKeys[1]).toMatchObject({ name: "plain-renamed", securityKey: false });
+  });
+
+  it("records, and backfills once, an encrypted key the SSH core cannot open", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    const store = await storage.upsertKey({
+      name: "chacha",
+      privateKey: SSH_KEY_FIXTURES.ed25519ChaCha20Poly1305.privateKey,
+      privateKeyPassphrase: "pass123"
+    });
+    expect(store.sshKeys[0]).toMatchObject({
+      encryptedOpenSsh: true,
+      securityKey: false,
+      unsupportedOpenSshCipher: "chacha20-poly1305@openssh.com"
+    });
+    // A rename keeps it.
+    const renamed = await storage.upsertKey({ id: store.sshKeys[0]?.id, name: "chacha-renamed" });
+    expect(renamed.sshKeys[0]?.unsupportedOpenSshCipher).toBe("chacha20-poly1305@openssh.com");
+    // 2.6.1 saved the key with its passphrase and recorded nothing of this.
+    const legacyStore = {
+      ...renamed,
+      sshKeys: renamed.sshKeys.map((key) => ({ ...key, securityKey: undefined, unsupportedOpenSshCipher: undefined }))
+    };
+    await writeFile(path.join(dir, "app-store.v1.json"), JSON.stringify(legacyStore), "utf8");
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+
+    expect(reopened.getStore().sshKeys[0]).toMatchObject({ securityKey: false, unsupportedOpenSshCipher: "chacha20-poly1305@openssh.com" });
+  });
+
   it("returns every failed import line with its line number, up to 500", async () => {
     const dir = await makeTempDir(cleanupDirs);
     const storage = new AppStorage(dir);
@@ -847,6 +907,52 @@ describe("AppStorage profiles Xray 26 can no longer run", () => {
     expect(store.proxyProfiles.find((profile) => profile.id === h2.id)).toMatchObject({ transport: "unknown", isSelected: false });
     expect(store.proxyProfiles.find((profile) => profile.name === "ws")?.isSelected).toBe(true);
     await expect(reopened.selectProxyProfile(h2.id)).rejects.toThrow(UNSUPPORTED_PROXY_PROFILE_MESSAGE);
+  });
+
+  it("rewrites what earlier versions saved in forms that no longer work", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const first = new AppStorage(dir);
+    await first.init();
+    await first.importProxyProfiles({
+      text: "vless://11111111-1111-4111-8111-111111111111@xn--e1afmkfd.xn--p1ai:443?type=ws&security=tls#idn",
+      source: "clipboard"
+    });
+    const storePath = path.join(dir, "app-store.v1.json");
+    const saved = JSON.parse(await readFile(storePath, "utf8")) as ReturnType<typeof createDefaultStore>;
+    // An internationalised host as the parser used to store it, and an IP
+    // rule with the zero-padded prefix the rules form used to accept.
+    saved.proxyProfiles = saved.proxyProfiles.map((profile) => ({ ...profile, host: "%d0%bf%d1%80%d0%b8%d0%bc%d0%b5%d1%80.%d1%80%d1%84" }));
+    saved.routingRules = [{ id: "r", type: "ip", value: "91.108.4.0/022", enabled: true, createdAt: "a", updatedAt: "a" }];
+    await writeFile(storePath, `${JSON.stringify(saved, null, 2)}\n`, "utf8");
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    const store = reopened.getStore();
+    expect(store.proxyProfiles[0]?.host).toBe("xn--e1afmkfd.xn--p1ai");
+    expect(store.routingRules[0]?.value).toBe("91.108.4.0/22");
+  });
+
+  it("relabels a trojan profile saved as plaintext when its link names no security, since it connects over TLS", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const first = new AppStorage(dir);
+    await first.init();
+    await first.importProxyProfiles({
+      text: ["trojan://pw@gfw.example.com:443?sni=gfw.example.com#gfw", "trojan://pw@plain.example.com:80?security=none#plain"].join("\n"),
+      source: "clipboard"
+    });
+    // As builds before the trojan-gfw fix saved both.
+    const storePath = path.join(dir, "app-store.v1.json");
+    const saved = JSON.parse(await readFile(storePath, "utf8")) as ReturnType<typeof createDefaultStore>;
+    saved.proxyProfiles = saved.proxyProfiles.map((profile) => ({ ...profile, security: "none" }));
+    await writeFile(storePath, `${JSON.stringify(saved, null, 2)}\n`, "utf8");
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    const security = Object.fromEntries(reopened.getStore().proxyProfiles.map((profile) => [profile.name, profile.security]));
+    expect(security).toEqual({ gfw: "tls", plain: "none" });
+    // Written back, so the next start reads it as it is.
+    const written = JSON.parse(await readFile(storePath, "utf8")) as ReturnType<typeof createDefaultStore>;
+    expect(written.proxyProfiles.find((profile) => profile.name === "gfw")?.security).toBe("tls");
   });
 
   it("moves profiles from the former public list URL to the current one, so a refresh marks the gone ones stale", async () => {
@@ -1218,6 +1324,457 @@ describe("AppStorage proxy profile rename", () => {
   });
 });
 
+describe("AppStorage durable writes", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanupDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  type WriterSeam = { writeAtomic: (filePath: string, serialized: string) => Promise<void> };
+  /** Makes the next `count` writes of one file fail, as a full disk or a locked file would. */
+  function failWrites(storage: InstanceType<typeof AppStorage>, file: "storeWriter" | "secretsWriter", count = Number.POSITIVE_INFINITY): void {
+    const writer = (storage as unknown as Record<string, WriterSeam>)[file]!;
+    const original = writer.writeAtomic;
+    let failures = 0;
+    writer.writeAtomic = async (filePath, serialized) => {
+      if (failures < count) {
+        failures += 1;
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      await original(filePath, serialized);
+    };
+  }
+
+  async function readStoreFile(dir: string): Promise<ReturnType<typeof createDefaultStore>> {
+    return JSON.parse(await readFile(path.join(dir, "app-store.v1.json"), "utf8")) as ReturnType<typeof createDefaultStore>;
+  }
+
+  it("keeps no change in memory whose save failed", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    failWrites(storage, "storeWriter");
+
+    await expect(storage.updateSettings({ theme: "dark" })).rejects.toThrow("no space left");
+    await expect(storage.updateRoutingMode("selected-rules")).rejects.toThrow("no space left");
+    await expect(
+      storage.updateRoutingRules([{ id: "r", type: "domain", value: "example.com", enabled: true, createdAt: "a", updatedAt: "a" }])
+    ).rejects.toThrow("no space left");
+
+    const store = storage.getStore();
+    expect(store.settings.theme).toBe("system");
+    expect(store.routingMode).toBe("proxy-all");
+    expect(store.routingRules).toEqual([]);
+    expect(await readStoreFile(dir)).toEqual(store);
+  });
+
+  it("runs changes one at a time, so a failed save never takes another change with it", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    failWrites(storage, "storeWriter", 1);
+
+    const [first, second] = await Promise.allSettled([
+      storage.updateSettings({ theme: "dark" }),
+      storage.updateSettings({ sidebarCollapsed: true })
+    ]);
+
+    expect(first.status).toBe("rejected");
+    expect(second.status).toBe("fulfilled");
+    const settings = storage.getSettings();
+    expect(settings.theme).toBe("system");
+    expect(settings.sidebarCollapsed).toBe(true);
+    expect((await readStoreFile(dir)).settings).toEqual(settings);
+  });
+
+  it("saves imported links before any profile that needs them appears", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    failWrites(storage, "secretsWriter", 1);
+
+    await expect(
+      storage.importProxyProfiles({ text: "vless://id@proxy.example.com:443?type=tcp&security=tls#a", source: "clipboard" })
+    ).rejects.toThrow("no space left");
+    expect(storage.getStore().proxyProfiles).toEqual([]);
+    expect(Object.keys((storage as unknown as { secrets: { secrets: Record<string, unknown> } }).secrets.secrets)).toEqual([]);
+
+    const { store } = await storage.importProxyProfiles({ text: "vless://id@proxy.example.com:443?type=tcp&security=tls#a", source: "clipboard" });
+    expect(store.proxyProfiles).toHaveLength(1);
+    expect(storage.resolveProxySecrets(store.proxyProfiles[0]!).rawUri).toContain("proxy.example.com");
+  });
+
+  it("takes a key or password saved over its record back with a store write that failed", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    const original = generatePrivateKeyPem().trim();
+    const withKey = await storage.upsertKey({ name: "work", privateKey: original });
+    const key = withKey.sshKeys[0]!;
+    const withServer = await storage.upsertConfig({
+      name: "srv",
+      host: "old.example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      password: "old-pass",
+      expectedServerFingerprint: "",
+      keepaliveIntervalSec: 120,
+      note: ""
+    });
+    const server = withServer.sshConfigs[0]!;
+
+    // The secrets file takes the new key; the store, with its fingerprint and
+    // type, does not.
+    failWrites(storage, "storeWriter", 1);
+    await expect(storage.upsertKey({ id: key.id, name: "work", privateKey: SSH_KEY_FIXTURES.rsa.privateKey })).rejects.toThrow("no space left");
+    expect(storage.getStore().sshKeys[0]).toMatchObject({ fingerprint: key.fingerprint, keyType: key.keyType });
+    expect(storage.readPrivateKeyText(key.id)).toBe(original);
+
+    failWrites(storage, "storeWriter", 1);
+    await expect(storage.upsertConfig({ ...server, host: "new.example.com", password: "new-pass" })).rejects.toThrow("no space left");
+    expect(storage.getStore().sshConfigs[0]?.host).toBe("old.example.com");
+    expect(storage.resolveServiceSecrets(storage.getStore().sshConfigs[0]!).password).toBe("old-pass");
+
+    // And the files agree after a restart.
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    expect(reopened.readPrivateKeyText(key.id)).toBe(original);
+    expect(reopened.getStore().sshKeys[0]?.fingerprint).toBe(key.fingerprint);
+    expect(reopened.resolveServiceSecrets(reopened.getStore().sshConfigs[0]!).password).toBe("old-pass");
+  });
+
+  it("writes the secrets file back on the next save when putting it back failed too", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    const original = generatePrivateKeyPem().trim();
+    const key = (await storage.upsertKey({ name: "work", privateKey: original })).sshKeys[0]!;
+
+    // The new key reaches the secrets file, the store write fails, and so
+    // does the write that should have put the old key back.
+    failWrites(storage, "storeWriter", 1);
+    const secretsWriter = (storage as unknown as Record<string, WriterSeam>).secretsWriter!;
+    const writeAtomic = secretsWriter.writeAtomic;
+    let secretWrites = 0;
+    secretsWriter.writeAtomic = async (filePath, serialized) => {
+      secretWrites += 1;
+      if (secretWrites === 2) {
+        throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+      }
+      await writeAtomic(filePath, serialized);
+    };
+    await expect(storage.upsertKey({ id: key.id, name: "work", privateKey: SSH_KEY_FIXTURES.rsa.privateKey })).rejects.toThrow("no space left");
+    expect(storage.readPrivateKeyText(key.id)).toBe(original);
+
+    // A save that touches only the store still puts the secrets file right.
+    await storage.updateSettings({ theme: "dark" });
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    expect(reopened.readPrivateKeyText(key.id)).toBe(original);
+    expect(reopened.getStore().sshKeys[0]).toMatchObject({ fingerprint: key.fingerprint, keyType: key.keyType });
+    expect(reopened.getSettings().theme).toBe("dark");
+  });
+
+  it("puts a deleted server back when its deletion could not be saved", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    const created = await storage.upsertConfig({
+      name: "server",
+      host: "ssh.example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      password: "secret",
+      expectedServerFingerprint: "",
+      keepaliveIntervalSec: 120,
+      note: ""
+    });
+    failWrites(storage, "storeWriter", 1);
+
+    await expect(storage.deleteConfig(created.sshConfigs[0]!.id)).rejects.toThrow("no space left");
+
+    expect(storage.getStore().sshConfigs).toEqual(created.sshConfigs);
+    expect(storage.getStore().selectedConfigId).toBe(created.selectedConfigId);
+  });
+
+  it("refuses a server that names a key that no longer exists, and an unknown routing mode", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+
+    await expect(
+      storage.upsertConfig({
+        name: "server",
+        host: "ssh.example.com",
+        port: 22,
+        username: "root",
+        authType: "private-key",
+        privateKeyId: "deleted-key",
+        expectedServerFingerprint: "",
+        keepaliveIntervalSec: 120,
+        note: ""
+      })
+    ).rejects.toThrow("The selected SSH key no longer exists.");
+    await expect(storage.updateRoutingMode("bogus" as never)).rejects.toThrow("Routing mode is invalid.");
+    expect(storage.getStore().sshConfigs).toEqual([]);
+  });
+
+  it("keeps the list switch a refresh did not ask to change, and the domains a switch did not touch", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    const list = createDefaultStore().routingProxyList;
+
+    await storage.updateRoutingProxyList({ ...list, enabled: true, domains: ["a.example"] });
+    await storage.setRoutingProxyListEnabled(false);
+    // A refresh that started before the switch finishes now: its domains land, the switch stays off.
+    await storage.updateRoutingProxyList({ sourceUrl: list.sourceUrl, domains: ["a.example", "b.example"], updatedAt: "2026-10-01T00:00:00.000Z" });
+
+    expect(storage.getStore().routingProxyList).toMatchObject({ enabled: false, domains: ["a.example", "b.example"] });
+    await storage.setRoutingProxyListEnabled(true);
+    expect(storage.getStore().routingProxyList).toMatchObject({ enabled: true, domains: ["a.example", "b.example"] });
+
+    await storage.updateRoutingDirectList({ ...createDefaultStore().routingDirectList, domains: ["c.example"] });
+    await storage.setRoutingDirectListEnabled(true);
+    await storage.updateRoutingDirectList({ sourceUrl: createDefaultStore().routingDirectList.sourceUrl, domains: ["d.example"] });
+    expect(storage.getStore().routingDirectList).toMatchObject({ enabled: true, domains: ["d.example"] });
+  });
+
+  it("retries a rename Windows refuses while a scanner holds the file", async () => {
+    const attempts: string[] = [];
+    const sleeps: number[] = [];
+    const busy = (code: string) => Object.assign(new Error(code), { code });
+    const rename = async (): Promise<void> => {
+      attempts.push("rename");
+      if (attempts.length <= 2) {
+        throw busy(attempts.length === 1 ? "EPERM" : "EBUSY");
+      }
+    };
+
+    await renameWithRetry("a.tmp", "a.json", { platform: "win32", rename, sleep: async (ms) => void sleeps.push(ms) });
+
+    expect(attempts).toHaveLength(3);
+    expect(sleeps).toEqual([10, 25]);
+  });
+
+  it("gives up after the last retry, and never retries other errors or other systems", async () => {
+    const failing = (code: string) => async (): Promise<void> => {
+      throw Object.assign(new Error(code), { code });
+    };
+    const sleep = async (): Promise<void> => undefined;
+
+    await expect(renameWithRetry("a", "b", { platform: "win32", rename: failing("EACCES"), sleep, delaysMs: [1, 1] })).rejects.toThrow("EACCES");
+    const once = vi.fn(failing("ENOENT"));
+    await expect(renameWithRetry("a", "b", { platform: "win32", rename: once, sleep })).rejects.toThrow("ENOENT");
+    expect(once).toHaveBeenCalledTimes(1);
+    const posix = vi.fn(failing("EPERM"));
+    await expect(renameWithRetry("a", "b", { platform: "linux", rename: posix, sleep })).rejects.toThrow("EPERM");
+    expect(posix).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes the file through to disk and leaves no temp file", async () => {
+    const dir = await makeTempDir(cleanupDirs);
+    const filePath = path.join(dir, "nested", "store.json");
+
+    await writeJsonAtomic(filePath, { durable: true });
+
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toEqual({ durable: true });
+    expect((await readdir(path.dirname(filePath))).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+});
+
+describe("AppStorage SSH host key trust on first use", () => {
+  const cleanupDirs: string[] = [];
+  const KEY_A = `SHA256:${"A".repeat(43)}`;
+  const KEY_B = `SHA256:${"B".repeat(43)}`;
+
+  afterEach(async () => {
+    await Promise.all(cleanupDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  async function storageWithServer(fingerprint = ""): Promise<{
+    storage: InstanceType<typeof AppStorage>;
+    dir: string;
+    id: string;
+  }> {
+    const dir = await makeTempDir(cleanupDirs);
+    const storage = new AppStorage(dir);
+    await storage.init();
+    const store = await storage.upsertConfig(serverInput({ expectedServerFingerprint: fingerprint }));
+    const id = store.sshConfigs[0]?.id ?? "";
+    return { storage, dir, id };
+  }
+
+  function serverInput(overrides: Partial<Parameters<InstanceType<typeof AppStorage>["upsertConfig"]>[0]> = {}): Parameters<InstanceType<typeof AppStorage>["upsertConfig"]>[0] {
+    return {
+      name: "server",
+      host: "ssh.example.com",
+      port: 22,
+      username: "root",
+      authType: "password",
+      password: "secret",
+      expectedServerFingerprint: "",
+      keepaliveIntervalSec: 120,
+      note: "",
+      ...overrides
+    };
+  }
+
+  it("saves the first key of an unpinned server, once, and keeps it on disk", async () => {
+    const { storage, dir, id } = await storageWithServer();
+
+    await expect(storage.trustHostKeyOnFirstUse({ configId: id, host: "SSH.example.com", port: 22, fingerprint: KEY_A })).resolves.toBe(true);
+    // Only the user replaces a trusted key.
+    await expect(storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_B })).resolves.toBe(false);
+
+    const config = storage.getStore().sshConfigs[0];
+    expect(config?.trustedHostKeyFingerprint).toBe(KEY_A);
+    expect(Number.isFinite(Date.parse(config?.trustedHostKeyAt ?? ""))).toBe(true);
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    expect(reopened.getStore().sshConfigs[0]?.trustedHostKeyFingerprint).toBe(KEY_A);
+  });
+
+  it("saves the key's type with it, keeps it through an edit, and drops one it cannot read", async () => {
+    const { storage, dir, id } = await storageWithServer();
+    await storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_A, keyType: "ssh-ed25519" });
+    expect(storage.getStore().sshConfigs[0]).toMatchObject({ trustedHostKeyFingerprint: KEY_A, trustedHostKeyType: "ssh-ed25519" });
+
+    const store = await storage.upsertConfig(serverInput({ id, name: "renamed" }));
+    expect(store.sshConfigs[0]).toMatchObject({ trustedHostKeyFingerprint: KEY_A, trustedHostKeyType: "ssh-ed25519" });
+
+    const storePath = path.join(dir, "app-store.v1.json");
+    const saved = JSON.parse(await readFile(storePath, "utf8")) as ReturnType<typeof createDefaultStore>;
+    saved.sshConfigs = saved.sshConfigs.map((config) => ({ ...config, trustedHostKeyType: "ecdsa-sha2-nistp256" }));
+    await writeFile(storePath, `${JSON.stringify(saved, null, 2)}\n`, "utf8");
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    const config = reopened.getStore().sshConfigs[0];
+    expect(config?.trustedHostKeyFingerprint).toBe(KEY_A);
+    expect(config).not.toHaveProperty("trustedHostKeyType");
+
+    // A type that is not one the client verifies is not saved at all.
+    const other = await storageWithServer();
+    await other.storage.trustHostKeyOnFirstUse({ configId: other.id, host: "ssh.example.com", port: 22, fingerprint: KEY_A, keyType: "x" });
+    expect(other.storage.getStore().sshConfigs[0]).not.toHaveProperty("trustedHostKeyType");
+  });
+
+  it("saves nothing for a pinned server, another address, or something that is not a fingerprint", async () => {
+    const pinned = await storageWithServer(KEY_B);
+    await expect(pinned.storage.trustHostKeyOnFirstUse({ configId: pinned.id, host: "ssh.example.com", port: 22, fingerprint: KEY_A })).resolves.toBe(false);
+
+    const { storage, id } = await storageWithServer();
+    // The session ran against the address the server had before an edit.
+    await expect(storage.trustHostKeyOnFirstUse({ configId: id, host: "old.example.com", port: 22, fingerprint: KEY_A })).resolves.toBe(false);
+    await expect(storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 2222, fingerprint: KEY_A })).resolves.toBe(false);
+    await expect(storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: "not-a-fingerprint" })).resolves.toBe(false);
+    await expect(storage.trustHostKeyOnFirstUse({ configId: "missing", host: "ssh.example.com", port: 22, fingerprint: KEY_A })).resolves.toBe(false);
+    expect(storage.getStore().sshConfigs[0]?.trustedHostKeyFingerprint).toBeUndefined();
+  });
+
+  it("keeps the trusted key through an edit that leaves the address and the pin alone", async () => {
+    const { storage, id } = await storageWithServer();
+    await storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_A });
+
+    const store = await storage.upsertConfig(serverInput({ id, name: "renamed", note: "moved racks", host: "SSH.EXAMPLE.COM " }));
+    expect(store.sshConfigs[0]).toMatchObject({ name: "renamed", trustedHostKeyFingerprint: KEY_A });
+  });
+
+  it("forgets the trusted key when the host or the port changes", async () => {
+    for (const change of [{ host: "other.example.com" }, { port: 2222 }]) {
+      const { storage, id } = await storageWithServer();
+      await storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_A });
+      const store = await storage.upsertConfig(serverInput({ id, ...change }));
+      expect(store.sshConfigs[0]?.trustedHostKeyFingerprint, JSON.stringify(change)).toBeUndefined();
+      expect(store.sshConfigs[0]?.trustedHostKeyAt).toBeUndefined();
+    }
+  });
+
+  it("forgets the trusted key when a fingerprint is pinned, and does not bring it back when the pin is cleared", async () => {
+    const { storage, id } = await storageWithServer();
+    await storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_A });
+
+    let store = await storage.upsertConfig(serverInput({ id, expectedServerFingerprint: KEY_B }));
+    expect(store.sshConfigs[0]).toMatchObject({ expectedServerFingerprint: KEY_B });
+    expect(store.sshConfigs[0]?.trustedHostKeyFingerprint).toBeUndefined();
+
+    // Clearing the pin means: learn the next key afresh.
+    store = await storage.upsertConfig(serverInput({ id, expectedServerFingerprint: "" }));
+    expect(store.sshConfigs[0]?.trustedHostKeyFingerprint).toBeUndefined();
+    await expect(storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_B })).resolves.toBe(true);
+  });
+
+  it("saves a pinned key's type once a session verified the pin, and keeps it only as long as the pin", async () => {
+    const { storage, dir, id } = await storageWithServer(KEY_B);
+    // Another key than the pin, or a type the client does not verify, saves nothing.
+    await expect(storage.rememberPinnedHostKeyType({ configId: id, fingerprint: KEY_A, keyType: "ssh-rsa" })).resolves.toBe(false);
+    await expect(storage.rememberPinnedHostKeyType({ configId: id, fingerprint: KEY_B, keyType: "x" })).resolves.toBe(false);
+    await expect(storage.rememberPinnedHostKeyType({ configId: "missing", fingerprint: KEY_B, keyType: "ssh-rsa" })).resolves.toBe(false);
+    expect(storage.getStore().sshConfigs[0]).not.toHaveProperty("pinnedHostKeyType");
+
+    await expect(storage.rememberPinnedHostKeyType({ configId: id, fingerprint: KEY_B, keyType: "ssh-rsa" })).resolves.toBe(true);
+    await expect(storage.rememberPinnedHostKeyType({ configId: id, fingerprint: KEY_B, keyType: "ssh-rsa" })).resolves.toBe(false);
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    expect(reopened.getStore().sshConfigs[0]?.pinnedHostKeyType).toBe("ssh-rsa");
+
+    // A fingerprint names one key, so the type stays with the pin through any edit.
+    let store = await storage.upsertConfig(serverInput({ id, name: "renamed", host: "other.example.com", expectedServerFingerprint: KEY_B }));
+    expect(store.sshConfigs[0]?.pinnedHostKeyType).toBe("ssh-rsa");
+    // Another pin, or none, starts without one.
+    store = await storage.upsertConfig(serverInput({ id, expectedServerFingerprint: KEY_A }));
+    expect(store.sshConfigs[0]).not.toHaveProperty("pinnedHostKeyType");
+    await storage.rememberPinnedHostKeyType({ configId: id, fingerprint: KEY_A, keyType: "ssh-ed25519" });
+    store = await storage.upsertConfig(serverInput({ id, expectedServerFingerprint: "" }));
+    expect(store.sshConfigs[0]).not.toHaveProperty("pinnedHostKeyType");
+  });
+
+  it("takes the trusted key's type when the user pins that key", async () => {
+    const { storage, id } = await storageWithServer();
+    await storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_A, keyType: "ssh-ed25519" });
+
+    const store = await storage.upsertConfig(serverInput({ id, expectedServerFingerprint: KEY_A }));
+    expect(store.sshConfigs[0]).toMatchObject({ expectedServerFingerprint: KEY_A, pinnedHostKeyType: "ssh-ed25519" });
+    expect(store.sshConfigs[0]?.trustedHostKeyFingerprint).toBeUndefined();
+  });
+
+  it("drops a pinned key's type it cannot read, or one left without a pin, when it loads the store", async () => {
+    const { storage, dir } = await storageWithServer(KEY_B);
+    await storage.upsertConfig(serverInput({ name: "unpinned" }));
+    const storePath = path.join(dir, "app-store.v1.json");
+    const saved = JSON.parse(await readFile(storePath, "utf8")) as ReturnType<typeof createDefaultStore>;
+    saved.sshConfigs = saved.sshConfigs.map((config) => ({ ...config, pinnedHostKeyType: config.expectedServerFingerprint ? "ecdsa-sha2-nistp256" : "ssh-rsa" }));
+    await writeFile(storePath, `${JSON.stringify(saved, null, 2)}\n`, "utf8");
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    for (const config of reopened.getStore().sshConfigs) {
+      expect(config, config.name).not.toHaveProperty("pinnedHostKeyType");
+    }
+  });
+
+  it("drops a saved trusted key that is not a fingerprint when it loads the store", async () => {
+    const { storage, dir, id } = await storageWithServer();
+    await storage.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_A });
+    const storePath = path.join(dir, "app-store.v1.json");
+    const saved = JSON.parse(await readFile(storePath, "utf8")) as ReturnType<typeof createDefaultStore>;
+    saved.sshConfigs = saved.sshConfigs.map((config) => ({ ...config, trustedHostKeyFingerprint: "garbage", trustedHostKeyAt: "2026-01-01T00:00:00.000Z" }));
+    await writeFile(storePath, `${JSON.stringify(saved, null, 2)}\n`, "utf8");
+
+    const reopened = new AppStorage(dir);
+    await reopened.init();
+    const config = reopened.getStore().sshConfigs[0];
+    expect(config).not.toHaveProperty("trustedHostKeyFingerprint");
+    expect(config).not.toHaveProperty("trustedHostKeyAt");
+    // Learned again on the next connection.
+    await expect(reopened.trustHostKeyOnFirstUse({ configId: id, host: "ssh.example.com", port: 22, fingerprint: KEY_A })).resolves.toBe(true);
+  });
+});
+
 async function makeTempDir(cleanupDirs: string[]): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-storage-"));
   cleanupDirs.push(dir);
@@ -1227,4 +1784,19 @@ async function makeTempDir(cleanupDirs: string[]): Promise<string> {
 function generatePrivateKeyPem(): string {
   const { privateKey } = generateKeyPairSync("ed25519");
   return privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+}
+
+function securityKeyText(): string {
+  const envelope = Buffer.concat([
+    Buffer.from("openssh-key-v1\0", "utf8"),
+    new SshBinaryWriter()
+      .string("none")
+      .string("none")
+      .string(Buffer.alloc(0))
+      .uint32(1)
+      .string(new SshBinaryWriter().string("sk-ecdsa-sha2-nistp256@openssh.com").string("nistp256").string(Buffer.alloc(65, 4)).string("ssh:").toBuffer())
+      .string(Buffer.alloc(64, 2))
+      .toBuffer()
+  ]);
+  return `-----BEGIN OPENSSH PRIVATE KEY-----\n${envelope.toString("base64").match(/.{1,70}/gu)?.join("\n") ?? ""}\n-----END OPENSSH PRIVATE KEY-----`;
 }

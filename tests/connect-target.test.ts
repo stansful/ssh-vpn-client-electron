@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  fullTunnelDescription,
+  fullTunnelRulesNotice,
+  hasEnabledAppRules,
   hasRoutingTargets,
   profileInitials,
   resolveTarget,
@@ -167,6 +170,41 @@ describe("Connect target", () => {
   });
 });
 
+describe("Full tunnel rules notice", () => {
+  it("names what the mode card keeps direct as what a rule can still change", () => {
+    // With the Russian services list on, a rule for a site on it pulls that
+    // site into the tunnel; saying only local-network rules matter
+    // contradicted the mode card right above.
+    expect(fullTunnelDescription(true, true)).toContain("Russian services");
+    expect(fullTunnelRulesNotice(true, true)).toContain("sites on the Russian services list");
+    expect(fullTunnelRulesNotice(true, false)).not.toContain("Russian services");
+    expect(fullTunnelRulesNotice(true, false)).toContain("10.0.0.0/8");
+    expect(fullTunnelRulesNotice(false, false)).toContain("don’t change anything");
+  });
+
+  it("says that with the TUN adapter an app rule takes that app's list sites into the tunnel", () => {
+    // The adapter ranks an app rule ahead of the Russian services list in
+    // Full tunnel too; the copy said only rules naming a site or the local
+    // network changed anything.
+    expect(fullTunnelRulesNotice(true, true, true)).toContain("with the TUN adapter, app rules");
+    expect(fullTunnelDescription(true, true, true)).toContain("with the TUN adapter an app you added a rule for");
+    // Without the list there is nothing an app rule could still pull in.
+    expect(fullTunnelRulesNotice(true, false, true)).toBe(fullTunnelRulesNotice(true, false));
+    expect(fullTunnelDescription(true, false, true)).toBe(fullTunnelDescription(true, false));
+    expect(fullTunnelRulesNotice(true, true)).not.toContain("app rules");
+
+    expect(hasEnabledAppRules([rule("process.name", "telegram.exe")])).toBe(true);
+    expect(hasEnabledAppRules([rule("process.name", "telegram.exe", false), rule("domain", "example.org")])).toBe(false);
+    const listOn = store({
+      routingMode: "proxy-all",
+      routingRules: [rule("process.name", "telegram.exe")],
+      routingDirectList: { ...createDefaultStore().routingDirectList, enabled: true, domains: ["yandex.ru"] }
+    });
+    expect(summarizeRouting({ ...listOn, settings: { ...listOn.settings, tunDataplaneEnabled: true } }, "windows").sub).toContain("TUN adapter");
+    expect(summarizeRouting({ ...listOn, settings: { ...listOn.settings, tunDataplaneEnabled: false } }, "windows").sub).not.toContain("TUN adapter");
+  });
+});
+
 describe("Routing summary", () => {
   it("counts only enabled, valid rules by type and names the list", () => {
     const summary = summarizeRouting(
@@ -209,6 +247,27 @@ describe("Routing summary", () => {
     const full = summarizeRouting(store({ routingMode: "proxy-all", routingDirectList: { enabled: true, sourceUrl: "", domains: ["vk.com"] } }));
     expect(full).toMatchObject({ title: "Full tunnel", blocked: false, badges: ["All traffic", "Russian services stay direct"] });
     expect(full.hint).toBe("Full tunnel: all your traffic uses it, except the Russian services list.");
+    // The direct list applies on every path (system proxy, PAC, local enforcement and TUN), not only the system proxy.
+    expect(full.sub).toBe("All traffic goes through the tunnel. Your local network and sites on the Russian services list stay direct.");
     expect(summarizeRouting(store({ routingMode: "proxy-all" })).hint).toBe("Full tunnel: all your traffic uses it.");
+    // A list that is off, or empty, keeps nothing direct.
+    for (const routingDirectList of [
+      { enabled: false, sourceUrl: "", domains: ["vk.com"] },
+      { enabled: true, sourceUrl: "", domains: [] }
+    ]) {
+      expect(summarizeRouting(store({ routingMode: "proxy-all", routingDirectList }), "windows").sub).toBe(
+        "All traffic goes through the tunnel. Your local network stays direct."
+      );
+    }
+  });
+
+  it("does not claim the Russian services list where nothing applies it", () => {
+    // Off Windows apps send the local proxy everything; no path reads the list.
+    for (const platform of ["macos", "linux"] as const) {
+      const full = summarizeRouting(store({ routingMode: "proxy-all", routingDirectList: { enabled: true, sourceUrl: "", domains: ["vk.com"] } }), platform);
+      expect(full.sub).toBe("All traffic sent to the local proxy goes through the tunnel.");
+      expect(full.badges).toEqual(["All traffic"]);
+      expect(full.hint).toBe("Full tunnel: all your traffic uses it.");
+    }
   });
 });

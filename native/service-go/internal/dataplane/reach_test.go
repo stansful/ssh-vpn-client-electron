@@ -25,7 +25,12 @@ type probeTunnel struct {
 	serve  farEnd
 }
 
-func (p *probeTunnel) DialTCP(ctx context.Context, destination netip.AddrPort) (net.Conn, error) {
+func (p *probeTunnel) DialTCP(ctx context.Context, destination netip.AddrPort, name string) (net.Conn, error) {
+	if name != "" {
+		// The probe asks about addresses; a name would let the far end pick
+		// another one.
+		return nil, errors.New("the probe dialled by name")
+	}
 	p.mu.Lock()
 	p.asked = append(p.asked, destination)
 	p.mu.Unlock()

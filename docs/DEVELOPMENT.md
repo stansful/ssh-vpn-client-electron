@@ -19,15 +19,34 @@ Upgrading from Shadow SSH 2.4.0 or earlier:
   `/opt/Shadow`. An AppImage is replaced like any other update.
 
 The default app path uses the built-in live SSH service in the Electron main process. It performs real TCP SSH
-connection setup, KEX, host-key fingerprint verification, password/private-key auth, keepalive, direct-tcpip checks,
+connection setup, KEX, host-key verification, password/private-key auth, keepalive, direct-tcpip checks,
 and shell channel terminal IO through the custom SSH core.
 
-An OpenSSH `SHA256:...` server fingerprint can be pinned optionally. Leaving it blank connects immediately after the
-SSH key-exchange signature is verified, matching the default connection workflow.
+Host and user keys:
 
-A native service binary also exists for Windows/macOS/Linux x64/arm64 packaging and Windows Service Control Manager
-tests. Use `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1` when you explicitly want Electron to start that native service
-binary instead of the built-in live SSH service.
+- Host-key algorithms, most preferred first: `ssh-ed25519`, `rsa-sha2-512`, `rsa-sha2-256`.
+- A server's Fingerprint field takes an OpenSSH `SHA256:...` value and wins over everything below. If the key the
+  server presents doesn't match and the server also offers another key type the client supports, the client
+  reconnects, before authenticating, restricted to the next key type it hasn't tried, until one matches. Otherwise
+  the connect fails with a fingerprint mismatch and reconnecting stops. When the expected key's type is known - the
+  fingerprint was verified earlier in this run, or the type was saved with the server (`trustedHostKeyType` with a
+  trusted key, `pinnedHostKeyType` the first time a pinned fingerprint is verified; it stays as long as the pin does)
+  - a non-matching key of that type is final at once: a retry could not match, and a server that drops it must not
+  turn the mismatch into a retried network error. While the type is not known yet, a retry that fails for another
+  reason stays retryable, and Activity gets a warning naming the key that did not match.
+- Without a pinned fingerprint the server is trusted on first use: after the first connect that authenticates, the
+  host key's fingerprint is saved with the server (`trustedHostKeyFingerprint`, `trustedHostKeyType`,
+  `trustedHostKeyAt`). Every later
+  connect and reconnect must present that key. A different key stops with a "host key" error that says to paste
+  the new fingerprint into the server's Fingerprint field if the change is expected. Changing the host or port, or
+  setting or clearing the pinned fingerprint, forgets the saved key. Within one session the key is required on
+  every reconnect even if saving it failed.
+- User keys: RSA, Ed25519 and ECDSA, in OpenSSH format (passphrase-protected too) or PEM.
+
+The Go helper `shadow-ssh-service` (`native/service-go`) is a `--stdio` child process that Electron starts on Windows
+for process attribution and the TUN dataplane. It carries no SSH traffic: its own `connect` command fails closed
+(`sshCoreLinked: false`), so `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1` and `SHADOW_SSH_SERVICE_ENDPOINT` (below) only
+exercise the IPC boundary and the Windows Service Control Manager scripts.
 
 ## Requirements
 
@@ -35,8 +54,9 @@ binary instead of the built-in live SSH service.
 - PowerShell 5.1+ or PowerShell 7+.
 - Node.js 22.12+ or 24+ (matching the Electron 42 build-tool requirement).
 - npm 10+.
-- Go 1.23+ for production packaging, because native service binaries are rebuilt for Windows/macOS/Linux x64/arm64
-  before packaged artifacts are produced.
+- Go 1.24.7 or newer for production packaging, because the helper binaries are rebuilt for Windows/macOS/Linux
+  x64/arm64 before packaged artifacts are produced. `native/service-go/go.mod` says `go 1.24.1` with
+  `toolchain go1.24.7` (an older Go fetches 1.24.7 itself); CI and the committed helper binaries use Go 1.25.
 
 Run an environment check:
 
@@ -68,7 +88,18 @@ or:
 npm run dev
 ```
 
-The renderer runs through Vite. Electron loads the local Vite URL in development.
+The renderer runs through Vite. Electron loads the local Vite URL in development. `npm run dev` runs as "Shadow SSH",
+with the same data folder, safe-storage key and single-instance lock as an installed Shadow: quit the installed app
+first, or the dev instance exits in its favour. To keep them apart, set `SHADOW_SSH_BUILD_CHANNEL=development` before
+`npm run dev`; it then runs as "Shadow SSH Dev" with its own folder, key and lock. Packaged dev builds
+(`build:dev-exe`) always run as "Shadow SSH Dev", whatever the environment says.
+
+Separate folders and locks do not make two copies independent once they connect. On Windows both write the same
+per-user proxy settings (HKCU Internet Settings), and both name their TUN adapter "Shadow SSH". Do not connect
+"Shadow SSH Dev" while the installed Shadow is connected, or the other way round: the copy that connects second
+takes the other's proxy for a leftover of its own, and when it disconnects it restores the settings from before
+either of them - the first copy then still reads Connected while the traffic its rules select goes direct. Two TUN
+helpers also compete for one adapter name and one set of routes. Disconnect one copy before connecting the other.
 
 ## Local IPC service simulator
 
@@ -103,8 +134,9 @@ Production build without packaging:
 npm run build
 ```
 
-Production package preparation rebuilds the native service binaries first, then builds Electron renderer/main, then
-runs Electron Builder. Platform artifacts are written to `release/`.
+Production package preparation checks the committed Xray binaries against their recorded checksums (see
+[Xray runtime](#xray-runtime)), rebuilds the Go helper binaries, then builds Electron renderer/main, then runs
+Electron Builder. Platform artifacts are written to `release/`.
 
 Portable/package scripts use prepared Electron runtime folders in `.cache/electron-<platform>-<arch>` when present, so
 packaging can run without downloading Electron during the build. If a local runtime folder is missing, the wrapper lets
@@ -227,8 +259,12 @@ npm run build:package-mac
 npm run build:package-linux
 ```
 
-Producing fully signed/notarized macOS artifacts must be done on macOS, Windows artifact validation should be done on
-Windows, and Linux package validation should be done on Linux. Cross-platform native service binaries are still
+Every macOS bundle - signed or not, folder, DMG or portable - must be packed on macOS: the `afterPack` hook re-signs
+Electron Framework with `codesign` after flipping its fuses (see [Electron fuses](#electron-fuses)) and stops the build
+on any other host. On Linux or Windows, `build:portable-mac`, `build:portable`, `build:portable-all`,
+`scripts/build-portable-mac.sh` and `scripts/build-portable-all.sh` therefore fail at the macOS step, before the Linux
+one; build the other platforms with their own commands there (`build:portable-win`, `build:portable-linux`). Windows
+artifact validation should be done on Windows, and Linux package validation on Linux. Cross-platform native service binaries are still
 generated by `npm run native:build-service`.
 
 Portable and opt-in package commands keep all builder output. Artifact names include platform and architecture, for
@@ -263,6 +299,48 @@ Development EXE:
 .\scripts\build-dev-exe.ps1
 ```
 
+### Xray runtime
+
+The Xray binaries are committed under `resources/xray/<platform>/<arch>/` and pinned to Xray-core v26.3.27.
+`npm run xray:download` (this machine's platform), `xray:download-win` and `xray:download-all` fetch exactly that
+release and refuse an archive or executable whose SHA-256 differs from `scripts/xray-checksums.json`.
+`npm run xray:ensure -- --all`, which `package:prepare` runs, checks the committed executables the same way. To move
+to a newer release, change `pinnedVersion` in `scripts/download-xray-runtime.mjs`, run
+`npm run xray:download-all -- --trust-download`, compare the recorded archive hashes with the `.dgst` files published
+with the release, and commit the binaries together with the checksum file.
+
+The `geoip.dat` and `geosite.dat` files next to the binaries are not packaged (the packaging filter ships only
+`xray`/`xray.exe`), so the generated Xray config must not use `geoip:` or `geosite:` matchers.
+
+### Electron fuses
+
+Packaged builds flip Electron's fuses (`build.electronFuses` in `package.json`): `ELECTRON_RUN_AS_NODE`,
+`NODE_OPTIONS` and the `--inspect` flags are ignored, the app loads only from `app.asar`, and the `app.asar` header is
+checked against the hash embedded at packaging time (macOS and Windows; Electron has no such check on Linux). The app
+therefore cannot start its own executable as Node: `process.fork` and `ELECTRON_RUN_AS_NODE` don't work in a packaged
+build. On macOS the fuse wire lives in Electron Framework, which is re-signed ad hoc after the flip, because an arm64
+binary whose signature no longer matches is killed at launch. Read a bundle's fuses with
+`npx @electron/fuses read --app release/mac-arm64/Shadow.app`.
+
+electron-builder takes `electronFuses` only at the top level, so every platform gets the same settings. It writes the
+`app.asar` hash into `Info.plist` on macOS and into an `INTEGRITY`/`ELECTRONASAR` resource of the exe on Windows, before
+it flips the fuses and edits the exe's version and icon (that edit keeps the resource). Portable and NSIS wrap the
+same exe. On Linux nothing is embedded and the integrity fuse has no effect.
+
+Only that framework is re-signed (`scripts/mac-fuses.mjs`, from the `afterPack` hook; `resetAdHocDarwinSignature` stays
+off). The re-sign needs `codesign`, so the hook refuses to pack a macOS bundle on any other host rather than produce
+one that is killed at launch. @electron/fuses' own reset re-signs the whole bundle with `codesign --deep`, which seals `app.asar` and
+`Info.plist` into the main executable's signature, so its code hash would change with every release. The macOS builds
+aren't signed with a Developer ID, so the "Shadow SSH Safe Storage" Keychain entry's access list names that hash: macOS
+would ask for the entry again after every update, and the window doesn't open until the prompt is answered (main waits
+in `safeStorage.isEncryptionAvailable()`). Left alone, the main executable keeps Electron's own linker signature, the
+same for every release on one Electron version, so an update that keeps the Electron version asks nothing. A new
+Electron version still changes it once; only a Developer ID signature removes that. The hook flips the fuses before
+electron-builder does; electron-builder's own flip then writes the same bytes, and the framework's signature holds.
+Electron ships its x64 macOS build unsigned (only the arm64 linker signs ad hoc), so the x64 framework is flipped and
+left unsigned like the rest of that bundle; only the arm64 framework is re-signed. To start a test bundle without touching the real Keychain entry, pass Chromium's `--use-mock-keychain` and point
+`SHADOW_SSH_USER_DATA_DIR` at a scratch folder.
+
 ## Test and lint
 
 ```powershell
@@ -273,9 +351,16 @@ Development EXE:
 or:
 
 ```powershell
+npm run typecheck
 npm run test
 npm run lint
+npm run native:test-service   # go test ./... in native/service-go
 ```
+
+Every push to `master` runs the same checks in the Release workflow's `quality` job: typecheck, lint, Vitest,
+`go test ./...` and Windows x64/arm64 builds of the helper, with Go 1.25. A release is built only after they pass.
+`tests/build-assets.test.ts` also fails when the version in `package-lock.json` differs from `package.json`, so a
+release commit bumps both (`npm install --package-lock-only`).
 
 ## Clean
 
@@ -305,8 +390,9 @@ Check code signing variables:
 
 ## Diagnostics
 
-Diagnostics are available from the main screen under the Diagnostics panel. The expanded/collapsed preference is
-persisted. Logs are reset on a new user Connect action and can be copied with Copy logs.
+The Activity page shows the live event feed, with important events pinned on top until they are dismissed, and the
+tail of `main.log`; either can be copied. Settings → Diagnostics turns activity history, live events and the log
+file on or off.
 
 If the initial state cannot be loaded, the startup screen shows the IPC/preload error and a Retry button instead of
 remaining on `Loading Shadow...`. On Windows, the startup log is `%APPDATA%\Shadow SSH\logs\main.log`; successful
@@ -392,9 +478,11 @@ The live SSH service treats the connection as a desired state and keeps it there
   credentials; once a session has been established, a rejection during an *automatic* reconnect is retried once
   before stopping, because the credentials worked before and one rejection is usually a server still coming up. A
   user Connect always starts fresh: routing is cleared and re-applied, while the listener keeps its port.
-- If the configured host name stops resolving during a reconnect and a server fingerprint is pinned, the address of
-  the last successful session is tried before backing off; a different host answering there is treated as a stale
-  address, not as a configuration error.
+- If the configured host name stops resolving during a reconnect and the server's host key is known - pinned, trusted
+  on first use, or verified earlier in this session - the address of the last successful session is tried before
+  backing off; a different host answering there is treated as a stale address, not as a configuration error. The same
+  goes for the protected address a reconnect with TUN held dials: another key there means the address is stale, it is
+  forgotten, TUN is released and the next attempt resolves the name, where a changed key still stops everything.
 - Every failure path ends in either a scheduled retry or an explicit halt. A 10-second watchdog checks that invariant
   (session wanted, not halted, but no client, no attempt in progress and no timer armed) and, if it ever fails, logs
   it as a supervisor bug and schedules the reconnect itself. An attempt that runs for more than five minutes is
@@ -468,6 +556,32 @@ setting in `fm` (`bbr` or `reno`) overrides this.
 
 Hysteria 2 `auth` and obfuscation passwords are redacted from diagnostics; certificate pins stay visible.
 
+### Xray runtime lifecycle
+
+- **Config:** passed on stdin (`xray run -config stdin:`), so profile credentials never reach the disk. A
+  `xray/xray-config.json` (and its `*.tmp` files) left by an earlier version is deleted when the Xray bridge starts.
+- **Local ports:** Xray's SOCKS and HTTP inbounds, which the app advertises as the local proxy, reuse the ports of the
+  previous run for the lifetime of the app. A port that has been taken since gets an ephemeral one, and the local
+  routing listener's port is never used for them.
+- **Unexpected exit:** Xray is restarted with a backoff of 1 s doubling to 256 s, plus up to 5 s of jitter. A failed
+  restart is rescheduled rather than ending in Error, a wake or network change brings the pending attempt forward, and
+  Disconnect stops the cycle. A connect the user started that fails still ends in Error, and so does a restart that
+  cannot work however often it is tried: the Xray runtime is missing (deleted or quarantined while it ran) or the
+  config is refused. Routing held for it is then given back, and nothing more is scheduled.
+- **Routing hold:** while Xray restarts, routing (adapter, local routing listener, system proxy) stays pointed at its
+  ports for 30 s, as the SSH transport holds it while reconnecting. A restart within the hold takes it over in place;
+  after the hold the machine is returned to direct routing until Xray is back. Dismissing the error releases it too.
+- **Routing edits:** the local routing listener keeps running and its open connections stay up. The rules, and Xray's
+  inbound after a restart, are swapped in place. The exception is a change to the rules for the local network on
+  Windows (see the routing order below), which Xray reads only at start, while the Windows proxy points at Xray's
+  HTTP inbound (the PAC or static path): Xray restarts, with routing held, and every connection it was carrying
+  drops; only the direct ones stay up. What process discovery learned for the PAC is kept across that restart. Under
+  the adapter or the routing listener, which reach Xray through its SOCKS inbound, the change is applied in place and
+  Xray picks it up at its next start - or at once, when a later apply falls back to the proxy path.
+- **TUN:** the adapter is told to send Xray's own process direct (`directProcesses`, by process ID), so Xray reaching
+  its server on an address that was never protected cannot loop back into its own inbound. Another program called
+  `xray.exe` - another client's own core - is routed like any other application.
+
 ## Storage
 
 Normal data is stored in Electron `userData` under `storage/app-store.v1.json`.
@@ -480,7 +594,9 @@ The store has a schema version so future migrations can be added without changin
 
 ## Native service and platform targets
 
-Future privileged service binaries are resolved by platform and architecture:
+The Go helper binaries are committed per platform and architecture. `npm run native:build-service` (part of
+`package:prepare`) rebuilds them in place; `npm run dev` runs whatever is committed, so Go changes need a rebuild
+before the app sees them:
 
 ```text
 native/windows/x64/shadow-ssh-service.exe
@@ -503,6 +619,11 @@ The Electron main process talks to a service abstraction. Resolution order:
 2. `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1`: start the packaged native binary over stdio.
 3. Default: use the built-in live SSH service in Electron main.
 
+Packaged builds ignore the developer switches listed in `PACKAGED_IGNORED_ENVIRONMENT_VARIABLES`
+(`src/main/app/packaged-runtime.ts`): `VITE_DEV_SERVER_URL`, `SHADOW_SSH_BUILD_CHANNEL`, `SHADOW_SSH_XRAY_PATH`,
+`SHADOW_SSH_SERVICE_ENDPOINT`, `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE`, `SHADOW_SSH_SERVICE_TOKEN` and
+`SHADOW_SSH_ALLOW_INSECURE_SECRET_FALLBACK`. `SHADOW_SSH_USER_DATA_DIR` still applies.
+
 The native binary supports `--stdio`, local endpoint mode, and Windows `--service` mode. Windows service install script
 uses:
 
@@ -510,15 +631,108 @@ uses:
 shadow-ssh-service.exe --service --endpoint "\\.\pipe\shadow-ssh-service"
 ```
 
+### Helper protocol
+
+Electron talks to the `--stdio` helper in NDJSON (`src/service/local-ipc-protocol.ts`,
+`native/service-go/internal/protocol`) and uses `get-capabilities`, `list-process-connections`, `start-dataplane`,
+`stop-dataplane` and `recover-routes`. The Go side ignores JSON fields it doesn't know, so optional fields can be added
+without breaking older binaries.
+
+- `start-dataplane` takes an optional `directProcesses`: `[{"pid": <process ID>, "name": "<executable base name>"}]`,
+  processes whose flows always go direct, right after the protected-endpoint check. A flow matches when its owner has
+  that ID and, when a name is given, that name (compared case-insensitively). Only the Xray bridge sends it, for its
+  running Xray child, so Xray's own connections to its server never loop back into its inbound; every Xray start
+  applies routing again, so a restarted child's ID is sent too. Matching the ID, not the file name, keeps any other
+  `xray.exe` on the machine under the user's rules.
+- `recover-routes` (payload `{"journalPath": "…"}`, reply `{"recovered": <journal entries undone>}`) runs the same
+  validated route-journal recovery a TUN start runs, without starting a dataplane, so routes left by a killed helper
+  don't wait for the next TUN start. It needs elevation and fails on non-Windows builds. `get-capabilities` reports
+  `routeRecovery: true` where the command exists; Electron checks it first, because older helper binaries lack it.
+- When the TUN packet pump stops with a terminal error, the helper tears the dataplane down itself (route watcher,
+  WFP guard, routes, adapter), writes one stderr line starting with `dataplane fatal:` and exits with status 3.
+  Electron treats any unexpected helper exit while TUN is active as "TUN stopped unexpectedly". Both bridges then
+  apply routing again at once (a fresh helper brings the adapter back, or the Windows proxy path takes over); after
+  three such stops within ten minutes the session stays on the proxy path until the next Connect. If the session
+  (or Xray) is down at that moment, routing is applied again only when it is back, and until then apps connect
+  directly: the Windows proxy setting went when the adapter came up, so the routing hold has nothing left to hold.
+
 ## Routing
 
 Routing modes:
 
-- Proxy all.
-- Selected rules.
+- Full tunnel (`proxy-all`): all traffic goes through the tunnel. On Windows the local network (step 3 below) and
+  sites on the Russian services list stay direct; elsewhere nothing reads the list or steers the system's traffic, and
+  the local proxy tunnels everything apps send it.
+- Split tunnel (`selected-rules`): only what the rules and the Blocked in Russia list select goes through the tunnel.
 
-Selected rules requires at least one enabled domain, IP/CIDR, or process name rule. The UI and main process both block
-Connect without enabled rules.
+Split tunnel needs at least one enabled domain, IP/CIDR or process name rule, or the Blocked in Russia list. The
+Russian services list alone doesn't count, because it only keeps sites direct. A rule for the local network - a private
+range such as `10.0.0.0/8` or a `.local` name - counts like any other: it is how a user reaches the network behind the
+server (step 2 below). The UI and main process both block Connect without a target.
+
+Every path decides a connection in the same order: the TUN dataplane (`dataplane.Policy`), the local listener
+(`LocalRoutingEnforcer.decide`), the generated PAC (`buildProxyPac`) and the TypeScript matchers. The first match
+wins:
+
+1. the transport's own server endpoint: direct, since routing it into its own tunnel would deadlock the transport;
+2. an enabled domain or IP/CIDR rule: tunnel. An explicit rule wins, for the local network too: `10.0.0.0/8` or
+   `corp.local` sends those destinations through the tunnel, to the network behind the server. Loopback is the
+   exception on Windows: `localhost`, `127.0.0.0/8` and `::1` stay on this machine whatever a rule says - the static
+   proxy's bypass always keeps `localhost` and `[::1]`, browsers and WinINet normally bypass loopback before the PAC is asked,
+   loopback traffic never reaches the TUN adapter, and no domain rule can name `localhost` (a single label);
+3. a local or private destination no rule named: direct. That is an IP literal in 127.0.0.0/8, ::1, 10.0.0.0/8,
+   172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, fe80::/10, fc00::/7 or 0.0.0.0/8 (IPv4-mapped IPv6
+   forms included), `localhost`, a single-label name without dots, or a name ending in `.local`;
+4. an enabled `process.name` rule matching the process that owns the connection: tunnel. It comes after step 3: a
+   process rule selects what an application sends to the internet, not its LAN traffic;
+5. a destination on the Russian services list: direct;
+6. Full tunnel: tunnel;
+7. a destination on the Blocked in Russia list: tunnel;
+8. anything else: direct.
+
+A user rule therefore beats the local network and the Russian services list, and the list beats Full tunnel. An IP rule
+matches a hostname through the addresses it resolves to on the PAC and listener paths; both look the name up only when
+the answer would otherwise be direct. On the TUN path the list matches by the name a flow was learned or sniffed under
+(see `native/TUN_DATAPLANE.md`) - a flow known only by learned names is released only when the list covers all of them,
+and step 3 takes a name into account only when the flow named it itself - and flows of Shadow's running Xray process go
+direct right after step 1 (`directProcesses`, matched by process ID). On the Windows proxy path (PAC or static proxy) the SSH listener
+applies steps 2 and 3 itself, so a local destination a rule sent it is tunnelled and any other leaves directly. Anything
+the TUN adapter hands it is tunnelled: the adapter has applied the whole order, and a private address a domain rule
+picked through a learned name arrives as a bare address no rule can match there - sending it direct would take it out
+of the tunnel and back into the adapter. On macOS and Linux, where apps are pointed at the listener by hand, it tunnels
+everything too, as `ssh -D` does: the server's own network and its `localhost` are reached through it. The PAC-guessing
+fallback for process rules never turns a learned local destination into a PAC rule, where it would rank with step 2.
+
+Step 4 is the one the PAC cannot hold: it cannot tell which application asks. What process discovery learned for a
+process rule is checked there after the direct list (step 5), so on that fallback a selected application's Russian
+services sites stay direct, and process rules act in Split tunnel only. The TUN adapter and the local listener keep
+step 4 where it is - and the TUN adapter applies it in Full tunnel too, so there an app rule sends that app's sites on
+the Russian services list through the tunnel.
+
+Xray's own routing keeps the local network direct as well, on Windows and only for its HTTP inbound - the one the
+Windows proxy points at, for the static Full tunnel proxy whose bypass list names no address range. The SOCKS inbound,
+which the TUN adapter and the routing listener use after applying the order themselves, and every inbound on macOS and
+Linux, tunnel everything. The user's IP rules that overlap a local range and domain rules for `.local` names are put
+ahead of that direct rule, to the tunnel (`xrayLocalRuleOverrides`), because everything that reaches Xray in Split
+tunnel was already chosen upstream. Xray reads its config only at start, so on Windows a routing update that changes
+that set, while the Windows proxy points at the HTTP inbound, restarts Xray through the same path as an unexpected
+stop: routing stays pointed at its ports, which refuse connections meanwhile, and is taken over by the new process on
+the same ports. Under the adapter or the routing listener the restart waits for the next Xray start, or for the first
+apply that ends on the proxy path. Any other routing change is applied without a restart. With such an IP rule Xray resolves single-label and `.local` names, and only them, so the rule
+selects them by the address they resolve to as the PAC and the SSH listener do (`domainStrategy` `IPOnDemand`; a name
+rule ahead of every IP rule sends every other name to the tunnel by name, unresolved). Without one Xray stays on `AsIs`
+and resolves nothing.
+
+The static proxy (below) writes a `ProxyOverride` bypass - `<local>`, `localhost`, `*.local`, `[::1]` - which WinINet
+applies before the proxy sees a connection, so a user rule for such a name could not win there. While a rule names
+the local network the entries it needs are left out (`staticProxyOverride`): an IP rule that overlaps a local range
+takes out `<local>` and `*.local`, a domain rule for a `.local` name takes out `*.local`. Those names then reach the
+listener or Xray, which keep the ones no rule names direct themselves. Without such a rule the full bypass stays, so
+intranet names take no detour through the loopback listener and stay in Windows' Local intranet zone. One gap is left
+on that path: a single-label or `.local` name that only an IP rule for a public range selects still goes direct. IP
+rules for literal addresses are not affected: the override names no address range.
+
+The order is encoded in several places; change them together.
 
 The default live SSH service starts a local HTTP/SOCKS listener after SSH auth succeeds. Traffic accepted by that
 listener is forwarded through SSH `direct-tcpip` channels.
@@ -531,7 +745,14 @@ requires a privileged WFP dataplane, which is not bundled here.
 On Windows, the app applies user-level system proxy settings while connected and restores the previous settings on
 Disconnect/app quit:
 
-- Proxy all: sets Windows HTTP/HTTPS/SOCKS proxy entries pointing at the local HTTP/SOCKS listener.
+- Full tunnel: with the Russian services list off, sets Windows HTTP/HTTPS/SOCKS proxy entries pointing at the
+  local HTTP/SOCKS listener, with `ProxyOverride` set to `<local>`, `localhost`, `*.local` and `[::1]` alone (fewer
+  while a rule names the local network, see above) - the
+  user's own entries are put back on disconnect, but not kept meanwhile: the PAC ignores them, so a leftover `10.*` of
+  another proxy tool would send hosts direct on one path that the other tunnels; with the list on, uses the PAC below
+  so listed sites can stay direct. Private address ranges are not written as override
+  wildcards, which WinINet would also match against public names such as `10.cdn.example.com`: the SSH listener and
+  Xray's routing send those addresses direct themselves unless a user rule names them.
 - Selected domain/IP rules: writes a PAC file under the app data directory, serves it through a loopback HTTP PAC
   endpoint, and sets `AutoConfigURL` for enabled domain, exact IP, and IPv4 CIDR rules. The PAC resolves hostnames
   before CIDR checks so IP rules can match destinations reached by domain name. A plain domain rule such as
@@ -545,18 +766,24 @@ Disconnect/app quit:
   directly, exactly as it would with the tunnel off. A `process.name` rule means *every* TCP destination that
   application reaches, so it is evaluated ahead of the curated direct list and the direct list is applied on the
   listener rather than in the PAC - a PAC entry would run before the listener and silently carve holes in the selected
-  application's traffic. Only the transport's own server endpoint stays excluded, because routing it into the tunnel it
-  carries would deadlock the transport. Domain and process rules therefore apply simultaneously, and a
-  selected application is covered completely - including hosts no rule names, DoH clients that never populate the
-  Windows DNS cache, and destinations discovered after connect. The helper is read-only and never carries traffic.
+  application's traffic. Only the transport's own server endpoint and the local network no user rule names (steps 1 and
+  3 of the shared order: loopback, private, link-local and CGNAT addresses, `localhost`, single-label and `.local`
+  names) stay excluded - the first because routing it into the tunnel it carries would deadlock the transport, the
+  second because a process rule is about the application's internet traffic. Domain and process rules therefore apply
+  simultaneously, and a selected application is covered completely - including hosts no rule names, DoH clients that
+  never populate the Windows DNS cache, and destinations discovered after connect. The helper is read-only and never
+  carries traffic.
 - Process-name rules (fallback when the native helper is unavailable): Windows PAC/system proxy has no process context, so the portable backend watches Windows TCP
   connections for enabled process names, adds matched public remote IPs as temporary rules, and converts local DNS-cache
   matches into exact-domain rules. Learned IP and hostname routes are held for the connected session and refreshed on
   every discovery cycle rather than expiring with the DNS record TTL, because a destination stops being observable as
   soon as it is routed through the loopback proxy. An unambiguous tuple is additionally retained as an exact session
-  route, so short-lived sockets cannot leave the PAC without a route.
+  route, so short-lived sockets cannot leave the PAC without a route. Both transports run the same learning
+  (`src/service/process-route-learning.ts`); each decides when to publish what it learned.
   Shared IPs, multiple aliases, private/special-use addresses, and direct-list conflicts stay on conservative bounded
-  fallbacks.
+  fallbacks. A learned address stands for the process rule (step 4), so the PAC matches a name that resolves to it
+  only after the local network and the direct list: a direct-list site on that address stays direct for every
+  application, while the address as written, and any other name on it, is still tunnelled.
   Reviewed bootstrap host families are included for applications such as Discord whose critical API/CDN/WebSocket
   sockets otherwise disappear behind the loopback proxy. Other destinations remain `DIRECT`; already-open target
   sockets may need reconnect, and strict per-process enforcement still requires WFP/TUN.
@@ -599,7 +826,7 @@ src/preload/     Context-isolated bridge exposed to the renderer.
 src/service/     Service abstractions, live SSH service, native process client, and simulator.
 src/service/service-host.ts  Standalone local IPC simulator host.
 src/renderer/    React UI screens.
-native/          Future privileged service binaries by OS and architecture.
+native/          Go helper source (service-go), its committed binaries by OS and architecture, TUN notes.
 scripts/         PowerShell and POSIX workflow scripts.
 tests/           Focused validation tests.
 ```

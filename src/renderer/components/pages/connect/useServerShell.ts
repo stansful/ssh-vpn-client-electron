@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../../api.js";
 import { useAppData } from "../../../hooks/useAppData.js";
 import { describeError } from "../../../lib/errors.js";
+import { isOpenPending, nextShellRecord, shellNeedsClose, type ShellRecordEvent } from "./shell-record.js";
 import { terminalState, type ShellRecord, type TerminalState } from "./terminal-view.js";
 
 export interface ServerShell {
@@ -36,32 +37,33 @@ export function useServerShell(): ServerShell {
   const [expanded, setExpandedState] = useState(savedExpanded);
   const [record, setRecord] = useState<ShellRecord>();
   const [closing, setClosing] = useState(false);
-  const opening = useRef<string>();
+  // The record as of the last event, ahead of the re-render: a collapse and
+  // re-expand can both land while an open is still on its way.
+  const recordRef = useRef<ShellRecord>();
+  const attempts = useRef(0);
   const historyRef = useRef(snapshot.terminal);
   historyRef.current = snapshot.terminal;
 
   useEffect(() => setExpandedState(savedExpanded), [savedExpanded]);
 
+  const apply = useCallback((event: ShellRecordEvent): void => {
+    recordRef.current = nextShellRecord(recordRef.current, event);
+    setRecord(recordRef.current);
+  }, []);
+
   const open = useCallback(async (): Promise<void> => {
-    if (!session || opening.current === session) {
+    if (!session || isOpenPending(recordRef.current, session)) {
       return;
     }
-    opening.current = session;
-    const afterId = historyRef.current.at(-1)?.id;
-    setRecord({ session, phase: "opening", afterId });
+    const attempt = ++attempts.current;
+    apply({ type: "open", session, attempt, afterId: historyRef.current.at(-1)?.id });
     try {
-      const next = await api.openTerminal();
-      setSnapshot(next);
-      setRecord((current) => (current?.session === session ? { session, phase: "open", afterId } : current));
+      setSnapshot(await api.openTerminal());
+      apply({ type: "opened", session, attempt });
     } catch (error) {
-      const message = describeError(error).message;
-      setRecord((current) => (current?.session === session ? { session, phase: "failed", afterId, error: message } : current));
-    } finally {
-      if (opening.current === session) {
-        opening.current = undefined;
-      }
+      apply({ type: "open-failed", session, attempt, error: describeError(error).message });
     }
-  }, [session, setSnapshot]);
+  }, [apply, session, setSnapshot]);
 
   // Expanded while connected means a shell should exist for this session.
   const hasRecord = record?.session === session;
@@ -72,8 +74,9 @@ export function useServerShell(): ServerShell {
   }, [expanded, hasRecord, live, open]);
 
   const close = useCallback(async (): Promise<void> => {
-    const hadShell = record?.session === session && record.phase !== "failed";
-    setRecord(undefined);
+    const hadShell = shellNeedsClose(recordRef.current, session);
+    // Also drops an open still on its way: its answer no longer counts.
+    apply({ type: "close" });
     if (!hadShell || !live) {
       return;
     }
@@ -86,7 +89,7 @@ export function useServerShell(): ServerShell {
     } finally {
       setClosing(false);
     }
-  }, [live, record, session, setSnapshot, toast]);
+  }, [apply, live, session, setSnapshot, toast]);
 
   const setExpanded = useCallback(
     (next: boolean): void => {

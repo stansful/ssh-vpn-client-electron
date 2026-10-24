@@ -39,18 +39,55 @@ the UI rather than decided silently.
 
 All six are implemented. What each one ended up doing, and where:
 
-1. **Adapter** — `internal/tun/adapter_windows.go`. Loads `wintun.dll` by bare name, creates
-   the adapter, runs a packet session. `tun.Available()` resolves the DLL without creating an
-   adapter, so capability reporting can tell "no DLL" apart from "no privileges".
+1. **Adapter** — `internal/tun/adapter_windows.go`. Loads `wintun.dll` from the absolute paths
+   in `internal/tun/search.go`, creates the adapter, runs a packet session. Every folder searched
+   is writable by the user (the portable build runs from `%TEMP%`), and the helper may be
+   elevated, so a candidate is loaded only if it is the WireGuard 0.14.1 build: it is opened
+   without write or delete sharing, its SHA-256 is compared with the digests pinned in
+   `internal/tun/verify.go`, and the same file is loaded by its resolved path with
+   `LOAD_LIBRARY_SEARCH_SYSTEM32`. `tun.Available()` resolves the DLL the same way without
+   creating an adapter, so capability reporting can tell "no DLL" apart from "no privileges".
 2. **Routing and kill-switch** — `internal/winroute`. **Nothing existing is modified.** The
    capture is `0.0.0.0/1` + `128.0.0.0/1` (and `::/1` + `8000::/1`) on the adapter, which beat
    the machine's default route on prefix length alone; the default route is never touched, so
    recovery is only ever deleting routes this process added and there is no window without a
    default route. Every operation carries its own undo command and is journalled to disk
    *before* it is applied, so a hard kill is undone by the next run
-   (`Manager.Recover`) — the same discipline `WindowsSystemProxyManager` uses for registry
-   state. Changes are made through `netsh ... store=active`: slower than `iphlpapi`, but the
-   structs that API needs are union-bearing and cannot be validated without a Windows machine.
+   (`Manager.Recover`, or the `recover-routes` command at application start) — the same
+   discipline `WindowsSystemProxyManager` uses for registry state. Changes are made through
+   `netsh ... store=active`: slower than `iphlpapi`, but the structs that API needs are
+   union-bearing and cannot be validated without a Windows machine. `netsh.exe` is run from
+   the system directory, never looked up through `PATH`, and without a console of its own
+   (`CREATE_NO_WINDOW`): the app starts the helper detached so it outlives Electron while it
+   takes its routes down, a detached process has no console for `netsh` to share, and Windows
+   would otherwise open a visible one for every route.
+
+   The journal sits in the user's data folder and is replayed elevated, so it is untrusted
+   input: only the exact `netsh` forms `plan.go` renders are accepted (`command.go`), and a
+   journal with anything else is not run at all but moved aside to
+   `<name>.rejected-<unix seconds>`. An elevated helper writes it owned by Administrators with
+   a protected DACL (SYSTEM and Administrators full control, everyone else read), and refuses -
+   moves aside unrun - a journal anyone else could have written, so a program the user runs
+   cannot list well-formed undo commands for another VPN's routes or a network card's address
+   and have them run elevated (`journal_acl_windows.go`). A journal written by a release before
+   this is refused the same way; what it described stays until reboot, and a host route it
+   left that the next plan needs again is taken as already in place - not added a second
+   time, which would fail and roll the plan back, and not deleted with the plan. Each entry records its
+   interface LUID; an undo keyed by index runs only while that index still names the same
+   interface, and an entry whose interface no longer exists, or was created again under
+   another index, is dropped as gone - an active-store change does not outlive its interface.
+   A delete whose route is no longer in the routing table counts as done. Anything else that
+   could not be undone is kept (for up to three recoveries). A failed rollback or restore never
+   clears the journal. The file is still version 1, which older helpers read: `entries` holds
+   only the host routes, which a downgraded helper can replay safely, and the adapter's
+   changes go in `adapterEntries`, which it ignores.
+
+   Every helper - the one the app runs at startup to recover, and each transport's dataplane
+   helper - shares the journal, so they take an exclusive lock on `<journal>.lock` while they
+   recover it and for as long as a plan is applied (`journal_lock.go`). A start waits up to
+   two and a half minutes for a recovery in progress; the startup recovery does not wait, and
+   leaves a journal another helper holds alone. The operating system drops the lock with the
+   process that held it, which is exactly when its routes become leftovers.
 3. **Userspace network stack** — `internal/dataplane/stack.go`, on
    `github.com/sagernet/gvisor` (the sing-box fork; upstream `gvisor.dev/gvisor` is the same
    code but its vanity import path resolves through a host that is not always reachable, and
@@ -61,11 +98,22 @@ All six are implemented. What each one ended up doing, and where:
    `GetExtendedTcpTable` **and** `GetExtendedUdpTable` (a UDP socket appears in neither the TCP
    table nor anywhere else), with the toolhelp fallback for elevated processes. One snapshot
    serves a burst of flows; a miss - which is what a socket newer than the snapshot looks like -
-   forces exactly one refresh. The rule order mirrors `LocalRoutingEnforcer.decide` in
-   `src/service/local-routing-enforcement.ts` line for line: protected endpoint, then process
-   rule, then domain/IP, then proxy list, then direct list. `policy_test.go` pins each step.
-   The protected endpoint also covers a Hysteria 2 server's hop ports, which the TypeScript
-   never has to: see "Keeping the transport out of its own tunnel" below.
+   waits for exactly one snapshot begun after it, sitting out the 50 ms refresh cooldown if it
+   has to (a whole burst shares that one snapshot) rather than giving up and letting a selected
+   application's new connections out directly. The owner is only looked up for a flow whose
+   verdict it can change. The rule order is the one every routing path shares (see "Routing"
+   in `docs/DEVELOPMENT.md`; `LocalRoutingEnforcer.decide` in
+   `src/service/local-routing-enforcement.ts` and the PAC mirror it):
+   protected endpoint, the transport's own process, domain/IP rule, local and private
+   destinations, process rule, direct list, proxy-all, proxy list, otherwise direct. An
+   explicit rule wins: a rule for a private range (`10.0.0.0/8`) or a `.local` name sends it
+   through the tunnel, to the network behind the server, while the rest of the local network
+   stays direct - for a selected application too, since a process rule comes after it. So
+   the "Russian services" direct list applies in full tunnel too, and a user rule beats it.
+   `policy_test.go` pins each step. The protected endpoint also covers a Hysteria 2 server's
+   hop ports, which the TypeScript never has to: see "Keeping the transport out of its own
+   tunnel" below. An enabled rule that cannot be compiled (say `10.0.0.0/08`) is skipped with a
+   warning; only a selected-rules revision with nothing valid left is refused.
 5. **Forwarding** — matched TCP and UDP go to a loopback SOCKS5 inbound
    (`internal/dataplane/socks5.go`); unmatched flows are dialled through
    `internal/winnet`'s interface-pinned dialer. The pinning is not an optimisation: with the
@@ -75,28 +123,53 @@ All six are implemented. What each one ended up doing, and where:
    machine was already using, out through the physical interface, and the answers are parsed
    to learn which name produced which address so domain rules and the curated lists still
    match a flow that only carries an IP. DNS is handled *before* the UDP drop rule, or a
-   selected application on the SSH transport would lose name resolution entirely.
+   selected application on the SSH transport would lose name resolution entirely; UDP/53
+   stays direct in every mode by design. Only the resolver's own answer to the outstanding
+   query - same source, same ID, same question - is handed back and learned from; anything
+   else that reaches the relay's port is dropped. Only a flow to port 53 that opens with a DNS
+   query, to an address that is not the transport's own server, is relayed this way; anything
+   else on that port - DNSCrypt, a VPN run there to get past a firewall, the transport itself -
+   is routed like any other datagram flow. What keeps a poisoned local answer for a
+   blocked site from steering tunnelled traffic is the CONNECT: a tunnelled flow whose hello
+   names a site the rules select by name asks the transport for that name (see the end of
+   "When the server has no IPv6").
 7. **Names read from the flow itself** — `internal/dataplane/sniff.go` and `quic.go`. DNS
    learning has a gap that shows up exactly when someone tests a domain rule: a browser that
    resolved the name before the tunnel came up (Windows and Chromium both cache for the record
    TTL), or one that resolves over DNS-over-HTTPS, never sends a query the adapter can see, so
    its connections arrive as bare addresses and the domain rule does not match. Process rules
    are unaffected, which is why this read as "domain routing is broken in browsers while
-   applications work". When a rule could turn on the name and the flow carries none, the
-   dataplane now holds it for its first bytes (at most 250 ms, paid in full only by a
-   server-speaks-first protocol) and reads the TLS ClientHello SNI, the HTTP/1 `Host`, or -
+   applications work". When a rule or list could turn on the name - in full tunnel, only the
+   direct list can, and for a flow to the local network only a domain rule - the dataplane
+   holds the flow for its first bytes (at most 250 ms, paid in full only by a
+   server-speaks-first protocol). A flow to the local network is held on any port a client
+   names its host on - a host behind the server that a domain rule reaches serves HTTPS on
+   8006, 5001 or 8443 as often as on 443 - but not on the well-known server-speaks-first
+   ports (FTP, SSH, Telnet, SMTP, POP3, IMAP, MySQL, VNC), whose client sends no name. A TCP flow to 443 or 80 that would be tunnelled anyway -
+   full tunnel, or a process or address rule - is held as well, since its name still matters
+   twice: a single-label name (`http://wiki/`, resolved by a DNS suffix search to an address
+   outside the private ranges) keeps it on the local network unless an address rule selected
+   it, as the system-proxy paths judge the same name, and a name the rules select is what it
+   is dialled by (see the end of "When the server has no IPv6"). A held flow is read for the TLS
+   ClientHello SNI, the HTTP/1 `Host`, or -
    for UDP 443 - the ClientHello inside the QUIC Initial packet, whose protection keys are
    derived from the packet itself (RFC 9001 §5.2). The bytes are forwarded untouched. A flow
    that carries a hello is always judged by its own hello, never by the names its address was
    learned under: one CDN address serves many sites, and the last name learned for it says
-   nothing about the next connection. Learned names - from DNS answers and from hellos, kept
+   nothing about the next connection. Learned names - from DNS answers and from hellos (a
+   single-label or `.local` name excepted: it describes only the flow that carried it), kept
    together per address (newest first, at most eight) for ten minutes - remain the fallback for
-   a flow without a hello, and any selected name among them selects such a flow, so the error
-   that remains is over-inclusion rather than a leak. That fallback is what makes a QUIC
+   a flow without a hello, and any selected name among them selects such a flow - a flow to a
+   private address that a domain rule names included - so the error that remains is
+   over-inclusion rather than a leak. Releasing a flow takes more than one
+   learned name: the direct list must cover every name its address is known by, and a
+   local-only name (`.local`, a single label) sends a public address direct only when the flow
+   named it itself - a CNAME a hostile resolver planted, or another flow's SNI, cannot pull
+   every flow to that address out of the tunnel. The learned-name fallback is what makes a QUIC
    attempt to a site whose name was only ever seen in a TCP hello still refused on the SSH
    transport instead of slipping out directly while its TCP twin is tunnelled. Flows a process
-   or address rule already selects are never held; a hello with Encrypted Client Hello shows
-   only the public name, which is a limitation. `sniff_test.go`, `quic_test.go` (including the
+   or address rule already selects are held only on 443 and 80, for the two reasons above; a
+   hello with Encrypted Client Hello shows only the public name, which is a limitation. `sniff_test.go`, `quic_test.go` (including the
    RFC 9001 Appendix A client Initial) and the packet-level `stack_test.go` (a second gVisor
    stack standing in for the application) cover it.
 
@@ -168,10 +241,22 @@ names, whose own DNS answer was never seen, is still accepted and then fails. An
 retries a refused SYN before failing the connect, a browser waits out its 300 ms Happy Eyeballs
 delay on a new connection rather than switching at once.
 
-Destinations are never rewritten. Connecting by the name in the hello instead would send
+A destination is rewritten only for a name the rules select by name. A tunnelled TCP flow whose
+hello or `Host` names a site on the proxy list or under a user domain rule is dialled through
+the tunnel by that name (SOCKS5 `ATYP=domain`), so the server resolves it and a poisoned local
+answer for a blocked site is not followed - which is what the system-proxy paths already do for
+those sites. That holds whatever tunnelled the flow, full tunnel and process rules included, on
+443 and 80, and on any port where the name could change the route and was read for that (in
+split tunnel, every flow the proxy list or a domain rule could select); on another port a flow
+nothing else needed the name of is not held to read it, and goes to the address it was given.
+Only the connected server's own name counts: the TLS server name, or the `Host` of an
+origin-form request. A `CONNECT` or an absolute-form request (`GET http://site/`) is addressed
+to an HTTP proxy the application chose, and the site it names may route the flow but is never
+what it is dialled by - that would reach the site on the proxy's port and never the proxy.
+Every other flow keeps its address: connecting by any name in the hello would send
 applications that put a borrowed name in their SNI (REALITY, fake-TLS proxies, domain fronting)
-to the wrong host, make the server resolve names a page chose, and stall an OpenSSH session
-on its synchronous resolver.
+to the wrong host, make the server resolve names a page chose, and stall an OpenSSH session on
+its synchronous resolver.
 
 ## Traffic that does not ask the routing table
 
@@ -249,7 +334,7 @@ an 8 KiB buffer and, on Windows, ends its receive loop for every association on 
 ## Keeping the transport out of its own tunnel
 
 A flow from the transport to its own server that ends up in the adapter is a loop: it is
-proxied back into the transport it belongs to. Two layers prevent it.
+proxied back into the transport it belongs to. Three layers prevent it.
 
 - **A host route per server address** — `/32` via the physical next hop, planned by
   `protectedRoutePlan` and applied by `winroute` before the capture routes. A route matches
@@ -265,6 +350,13 @@ proxied back into the transport it belongs to. Two layers prevent it.
   itself on-link (some PPP connections) breaks. The guard matches the address on
   `protectedPort` and, when the `start-dataplane` payload carries `protectedPorts`, on any
   port in that list.
+- **The transport's own process** — `directProcesses` in the `start-dataplane` payload,
+  checked right after the protected endpoint. The Xray bridge sends the process ID and name of
+  its Xray child: Xray resolves its server itself, and a server behind a CDN or rotating DNS can
+  answer with an address none of the host routes covers. Its flows go direct whatever the rules
+  say. The match is on the owner's process ID (and name), as the owner tables report it, so any
+  other program called `xray.exe` is routed like any other application. The owner is looked up
+  for this only when the flow would otherwise be tunnelled.
 
 `protectedPorts` is a string of ports and inclusive ranges, `"443,20000-30000"`, in the form
 `hysteria2-link.ts` normalises a link's hop list to: sorted, with overlapping and adjacent
@@ -294,8 +386,8 @@ carry privileges:
 - `wintun.dll` is a signed WireGuard component. It goes next to the service binary in
   `native/windows/<arch>/`, which is already packaged wholesale, so no `package.json` change is
   needed. See `native/windows/README.md`.
-- `go.mod` currently has no dependencies. Layer 3 adds gVisor, which is substantial. Vendoring
-  and licence review happen on a machine with a Go toolchain.
+- Layer 3 makes `go.mod` depend on `github.com/sagernet/gvisor` (with `golang.org/x/sys`).
+  Nothing is vendored: `go build` fetches the modules, and `go.sum` pins them.
 
 ## UDP policy
 
@@ -370,11 +462,47 @@ each of which was a bug first:
   and the diagnostic says what it costs: the tunnel keeps working for domain and
   IP rules, so nothing looks wrong until someone notices that process rules
   stopped reaching the applications that ignore the Windows proxy setting.
+- **A dataplane that stops on its own takes itself down and says so.** When the
+  adapter stops delivering packets and nobody asked for a teardown (a ring error,
+  or the adapter removed under it), the runner removes the route watcher, the
+  traffic guard and the routes, closes the adapter, and the helper writes one
+  `dataplane fatal: ...` line to stderr and exits with status 3. Left running, it
+  black-holed every captured packet - or, with the interface gone, sent
+  everything direct - while the app still showed the tunnel up.
 
 The same shape applies one level up: `NativeProcessAttribution` pauses for
 twenty seconds after repeated helper failures instead of disabling itself for
 the life of the application, which used to mean process rules stayed dead until
 the app was quit entirely.
+
+## When the dataplane dies
+
+If the adapter's packet pump stops with a terminal error and the runner is not
+already closing, the helper tears the dataplane down itself, in the usual order
+(route watcher, WFP guard, routes, adapter), writes one stderr line starting with
+`dataplane fatal:` and exits with status 3. Left up, the capture routes would
+black-hole every captured flow, or, once Windows drops them with the adapter,
+let that traffic leave directly while the app still reported Connected. Electron treats
+any unexpected helper exit while TUN is active as "TUN stopped unexpectedly". Both
+transports then apply routing again at once: a fresh helper brings the adapter back,
+or the Windows proxy path takes over. If the session (or Xray) is down at that
+moment, routing is applied again only when it is back, and apps connect directly
+until then: the Windows proxy setting went when the adapter came up, so the
+routing hold has nothing left to hold. After three such stops within ten minutes the
+session stays on the proxy path until the next Connect, so a failing adapter cannot
+turn into a loop of adapters coming and going.
+
+Routes a killed helper leaves behind stay in `tun-routing-journal.json`. Besides
+the recovery every TUN start runs first, Electron can send `recover-routes` with
+the journal path: an elevated Windows helper runs the same validated recovery
+without starting a dataplane and answers with the number of entries undone.
+`get-capabilities` reports `routeRecovery: true` where the command exists, and
+Electron checks that first, since older helper binaries lack it. Both commands
+accept only a path to a file called `tun-routing-journal.json`. A data folder
+moved to another drive and linked back (a junction or a directory symlink) is
+followed once, when the command arrives, to the folder it really is, and the
+journal is used there; a link found in its place later, or a journal file that
+is itself a link, is refused.
 
 ## What has been executed, and where
 
@@ -398,7 +526,9 @@ To repeat it: `wine64 native/windows/x64/shadow-ssh-service.exe --print-capabili
 ## What still needs a real Windows machine
 
 Wine has no WinTun driver and no useful `netsh`, so everything past adapter creation is still
-unobserved. Each of the following is a considered guess rather than a fact:
+unobserved, and so are the Windows-only checks that run before it - the journal's protection
+and the verified `wintun.dll` load - which were written after the Wine runs above. Each of the
+following is a considered guess rather than a fact:
 
 - **`netsh` argument forms.** Whether `name=<index>` and `interface=<index>` are accepted in
   every position used, and whether `delete route` without `nexthop=` removes what was added.
@@ -422,6 +552,20 @@ unobserved. Each of the following is a considered guess rather than a fact:
   discovery keep working. Check in `chrome://webrtc-internals` that the selected pair's local
   address is the adapter's (`10.253.7.2`), and `netsh wfp show filters` while connected and
   after a crash of the helper.
+- **The journal's protection.** `journal_acl_windows.go` and `journal_lock_windows.go` have
+  only ever been compiled for Windows: on macOS `go test` runs the stubs, which accept every
+  journal and lock with `flock`. Unchecked: that an elevated helper's journal really ends up
+  owned by Administrators with the protected DACL whatever admin token wrote it, so the next
+  start accepts it rather than moving it aside to `.rejected-*` (which would silently turn
+  crash recovery into "routes stay until reboot"); and that two helpers serialize on
+  `<journal>.lock` through `LockFileEx`.
+- **The verified `wintun.dll` load.** `load_windows.go` opens the candidate without write or
+  delete sharing, hashes it, resolves its final path (`GetFinalPathNameByHandle`, a `\\?\`
+  path) and loads that with `LOAD_LIBRARY_SEARCH_SYSTEM32`. None of it has run on Windows; a
+  mistake shows up only as "TUN unavailable".
+- **`netsh` without a console.** The detached helper starts each `netsh` with
+  `CREATE_NO_WINDOW`; if a console window still flashes up on connect or disconnect, that is
+  where to look.
 - **IPv6.** Capture is disabled automatically when the transport's server is reachable only
   over IPv6, or when no IPv6 route exists to pin direct traffic to. Both cases are logged. On a
   dual-stack network with capture off, a selected application's IPv6 traffic is not captured.
@@ -429,7 +573,13 @@ unobserved. Each of the following is a considered guess rather than a fact:
   server has no IPv6"). Whether Windows retries a refused SYN before failing the connect, and so
   how long a browser takes to switch, has not been measured.
 
-A first run should be checked in this order: the adapter appears in network settings, `route
-print` shows the two `/1` routes and the transport's host route, a selected application's TCP
-reaches the internet, an unselected one still does, and `route print` is clean again after
-disconnect.
+A first run should be checked in this order: the adapter appears in network settings, no console
+window flashes up while it does, `route print` shows the two `/1` routes and the transport's
+host route, a selected application's TCP reaches the internet, an unselected one still does,
+and `route print` is clean again after disconnect. Then the recovery path: while connected,
+`icacls "%APPDATA%\Shadow SSH\tun-routing-journal.json"` shows Administrators as owner and
+only SYSTEM and Administrators with write access; ending the helper in Task Manager and starting
+the app again removes the leftover routes, with no `tun-routing-journal.json.rejected-*` file
+next to the journal; and a copy of `wintun.dll` with one byte changed, put in place of the
+bundled one, is refused with "it is not the signed WireGuard wintun.dll" while the original
+loads.

@@ -52,7 +52,7 @@ func newSilentRelayTunnel(t *testing.T) *relayTunnel {
 	return newRelayTunnel(t, false)
 }
 
-func (r *relayTunnel) DialTCP(context.Context, netip.AddrPort) (net.Conn, error) {
+func (r *relayTunnel) DialTCP(context.Context, netip.AddrPort, string) (net.Conn, error) {
 	return nil, net.ErrClosed
 }
 

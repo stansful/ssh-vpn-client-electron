@@ -70,14 +70,19 @@ export async function createMainWindow(options: CreateMainWindowOptions): Promis
       preload: options.preloadPath,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      // The renderer keeps the Chromium OS sandbox even when the app runs as
+      // administrator for TUN. The preload is a self-contained CommonJS
+      // script for this (src/preload/preload.cts).
+      sandbox: true
     }
   });
   // Register the WebContents before loadFile/loadURL can execute preload code
   // and issue the initial snapshot IPC request.
   options.onCreated(window);
 
-  const rendererUrl = options.devServerUrl ?? pathToFileURL(path.join(options.rendererDist, "index.html")).href;
+  // A packaged build only ever shows the renderer it shipped with.
+  const devServerUrl = options.packaged ? undefined : options.devServerUrl;
+  const rendererUrl = devServerUrl ?? pathToFileURL(path.join(options.rendererDist, "index.html")).href;
   const navigationPolicy = new RendererNavigationPolicy([rendererUrl]);
   const consoleMessageRateLimiter = new FixedWindowRateLimiter(
     MAX_RENDERER_CONSOLE_MESSAGES_PER_WINDOW,
@@ -102,8 +107,8 @@ export async function createMainWindow(options: CreateMainWindowOptions): Promis
   const loadRenderer = async (): Promise<void> => {
     crashPageShown = false;
     leftDownAfterCrash = false;
-    if (options.devServerUrl) {
-      await window.loadURL(options.devServerUrl);
+    if (devServerUrl) {
+      await window.loadURL(devServerUrl);
       return;
     }
     try {
@@ -240,7 +245,7 @@ export async function createMainWindow(options: CreateMainWindowOptions): Promis
   });
 
   await loadRenderer();
-  if (options.devServerUrl && !options.startHidden) {
+  if (devServerUrl && !options.startHidden) {
     window.webContents.openDevTools({ mode: "detach" });
   }
 

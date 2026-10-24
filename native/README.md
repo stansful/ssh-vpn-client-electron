@@ -15,13 +15,16 @@ native/
     arm64/shadow-ssh-service
 ```
 
-Building requires a one-off dependency fetch, because the TUN dataplane pulls in a userspace
-network stack:
+The binaries are committed, and `npm run dev` runs them as they are. Rebuild them after a Go change:
 
 ```bash
-cd native/service-go && go mod download
 npm run native:build-service
 ```
+
+That needs Go 1.24.7 or newer (`go.mod`: `go 1.24.1`, `toolchain go1.24.7`); CI and the committed binaries use
+Go 1.25. The TUN dataplane depends on external modules (a userspace network stack, `github.com/sagernet/gvisor`, and
+`golang.org/x/sys`; see `service-go/go.mod`). `go build` fetches them on first use; run
+`go mod download` in `native/service-go` beforehand to build offline later.
 
 The Electron main process resolves the active platform and architecture through `src/main/platform/targets.ts`.
 By default Electron uses the built-in live SSH service. Set `SHADOW_SSH_USE_NATIVE_PROCESS_SERVICE=1` to force Electron
@@ -30,10 +33,14 @@ to start the matching native binary over `--stdio`.
 Service contract:
 
 - local-only IPC endpoint;
-- commands: connect, disconnect, status, update config, update routing rules, check tunnel, open terminal, terminal input, list process connections, start dataplane, stop dataplane;
+- commands: connect, disconnect, status, update config, update routing rules, check tunnel, open terminal, terminal input, list process connections, start dataplane, stop dataplane, recover routes;
 - events: status changed, diagnostics appended, tunnel check result, terminal output, error;
 - privileged routing/core implementation per platform;
 - reusable custom SSH core shared by platform-specific service shells.
+
+In practice the tunnel runs in Electron main, and the helper's own `connect` fails closed (`sshCoreLinked: false`).
+Electron starts the helper over `--stdio` on Windows for process attribution, the TUN dataplane and route recovery;
+the protocol additions are listed in `docs/DEVELOPMENT.md` ("Helper protocol") and `native/TUN_DATAPLANE.md`.
 
 Development IPC simulator:
 
@@ -51,7 +58,7 @@ npm run native:test-service
 npm run native:build-service
 ```
 
-The Go service host builds without external modules for:
+The Go service host builds for:
 
 - `windows/x64` and `windows/arm64`
 - `macos/x64` and `macos/arm64`

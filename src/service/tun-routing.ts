@@ -120,8 +120,17 @@ export const TUN_START_ATTEMPTS = 2;
 /** Spacing between attempts. Windows needs a moment, not a long one. */
 export const TUN_START_RETRY_DELAY_MS = 1_500;
 
+/**
+ * How many times the TUN adapter may stop on its own within the window below
+ * before a session stops bringing it back. Each stop is answered by starting
+ * it again; an adapter that keeps dying would otherwise turn that into a
+ * loop of adapters coming and going, with traffic leaking between them.
+ */
+export const MAXIMUM_TUN_UNEXPECTED_STOPS = 3;
+export const TUN_UNEXPECTED_STOP_WINDOW_MS = 10 * 60 * 1000;
+
 export interface DataplaneStarter {
-  start(request: DataplaneStartRequest): Promise<void>;
+  start(request: DataplaneStartRequest, signal?: AbortSignal): Promise<void>;
 }
 
 export interface TunStartRetryOptions {
@@ -131,6 +140,15 @@ export interface TunStartRetryOptions {
   onRetry?: (attempt: number, attempts: number, error: unknown) => void;
   /** Injection seam for tests. */
   sleep?: (milliseconds: number) => Promise<void>;
+  /**
+   * Stops waiting: the attempt under way is given up on and none follows.
+   * The helper still finishes that attempt - it serves one command at a time
+   * and cannot be interrupted - and the stop owed for it is sent as for any
+   * start this side gave up on (see NativeDataplaneController.stop). For a
+   * session the user disconnected, which would otherwise read Disconnecting
+   * for as long as a slow helper takes over two attempts.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -145,18 +163,23 @@ export async function startDataplaneWithRetry(
 ): Promise<void> {
   const attempts = Math.max(1, options.attempts ?? TUN_START_ATTEMPTS);
   const delayMs = options.delayMs ?? TUN_START_RETRY_DELAY_MS;
-  const sleep = options.sleep ?? ((milliseconds: number) => delay(milliseconds));
+  const signal = options.signal;
+  const sleep =
+    options.sleep ?? ((milliseconds: number) => delay(milliseconds, undefined, signal ? { signal } : {}).catch(() => undefined));
 
   for (let attempt = 1; ; attempt += 1) {
     try {
-      await dataplane.start(request);
+      await dataplane.start(request, signal);
       return;
     } catch (error) {
-      if (attempt >= attempts) {
+      if (attempt >= attempts || signal?.aborted) {
         throw error;
       }
       options.onRetry?.(attempt, attempts, error);
       await sleep(delayMs);
+      if (signal?.aborted) {
+        throw error;
+      }
     }
   }
 }

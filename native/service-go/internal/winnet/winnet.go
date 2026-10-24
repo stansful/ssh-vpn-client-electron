@@ -19,6 +19,10 @@ import (
 // implementation.
 var ErrUnsupportedPlatform = errors.New("windows networking primitives are unavailable on this OS")
 
+// ErrInterfaceNotFound is wrapped by InterfaceIndex and InterfaceLUID when no
+// interface has that LUID or index, as opposed to the lookup itself failing.
+var ErrInterfaceNotFound = errors.New("no such interface")
+
 // Egress describes the physical path to a destination as it was before the
 // dataplane changed the routing table.
 type Egress struct {
@@ -41,9 +45,12 @@ type InterfaceDialer interface {
 	ListenUDP(ctx context.Context, destination netip.AddrPort) (net.PacketConn, error)
 }
 
-// Route is one entry of the routing table: a destination prefix and the
-// interface it leaves by.
+// Route is one entry of the routing table: a destination prefix, the
+// interface it leaves by and the gateway it is sent to.
 type Route struct {
-	Destination   netip.Prefix
-	InterfaceLUID uint64
+	Destination    netip.Prefix
+	InterfaceLUID  uint64
+	InterfaceIndex uint32
+	// NextHop is the unspecified address for an on-link route.
+	NextHop netip.Addr
 }

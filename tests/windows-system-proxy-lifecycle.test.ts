@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, RequestListener, Server, ServerResponse } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,15 +14,25 @@ const childProcessMocks = vi.hoisted(() => ({
     args: string[],
     options: { timeout?: number; maxBuffer?: number; windowsHide?: boolean },
     callback: ExecCallback
-  ) => void>()
+  ) => void>(),
+  execFileSync: vi.fn<(command: string, args: string[], options: object) => null>()
 }));
 
-vi.mock("node:child_process", () => ({ execFile: childProcessMocks.execFile }));
+vi.mock("node:child_process", () => ({ execFile: childProcessMocks.execFile, execFileSync: childProcessMocks.execFileSync }));
 
-import { WindowsSystemProxyManager } from "../src/core/network/windows-system-proxy.js";
+import {
+  recoverWindowsSystemProxy,
+  restoreWindowsSystemProxyBeforeQuit,
+  restoreWindowsSystemProxyNow,
+  STATIC_PROXY_OVERRIDE,
+  staticProxyOverride,
+  WindowsSystemProxyManager
+} from "../src/core/network/windows-system-proxy.js";
 
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 let registry = new Map<string, string>();
+/** Value types other than the defaults (REG_DWORD for the two flags, REG_SZ otherwise). */
+let registryTypes = new Map<string, string>();
 let failCommand: ((command: string, args: string[]) => boolean) | undefined;
 
 describe("WindowsSystemProxyManager lifecycle", () => {
@@ -35,9 +45,21 @@ describe("WindowsSystemProxyManager lifecycle", () => {
       ["AutoConfigURL", "https://corp.example/proxy.pac"],
       ["AutoDetect", "1"]
     ]);
+    registryTypes = new Map();
     failCommand = undefined;
     childProcessMocks.execFile.mockReset();
     childProcessMocks.execFile.mockImplementation(runFakeWindowsCommand);
+    childProcessMocks.execFileSync.mockReset();
+    childProcessMocks.execFileSync.mockImplementation((command, args) => {
+      let failure: NodeJS.ErrnoException | null = null;
+      runFakeWindowsCommand(command, args, {}, (error) => {
+        failure = error;
+      });
+      if (failure) {
+        throw failure;
+      }
+      return null;
+    });
   });
 
   afterAll(() => {
@@ -491,11 +513,21 @@ describe("WindowsSystemProxyManager lifecycle", () => {
     }
   });
 
+  // Static proxy-all used to delete the user's ProxyOverride, so LAN and
+  // intranet traffic went into the tunnel. Its own entries are not kept
+  // beside Shadow's either: the PAC ignores them, so a leftover such as
+  // `10.*` would send hosts direct here that the PAC tunnels.
   it.each([
-    "<local>",
-    "*;<local>;legacy-corporate.example"
-  ])("clears inherited ProxyOverride %s during static proxy-all and restores it exactly", async (proxyOverride) => {
-    registry.set("ProxyOverride", proxyOverride);
+    ["<local>"],
+    ["*;<local>;legacy-corporate.example"],
+    ["localhost;127.*;10.*;172.16.*;192.168.*;*.corp.example"],
+    [undefined]
+  ])("writes only the local names over the user's ProxyOverride %s during static proxy-all and restores it exactly", async (proxyOverride) => {
+    if (proxyOverride === undefined) {
+      registry.delete("ProxyOverride");
+    } else {
+      registry.set("ProxyOverride", proxyOverride);
+    }
     const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-static-override-"));
     const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
     try {
@@ -503,7 +535,11 @@ describe("WindowsSystemProxyManager lifecycle", () => {
 
       expect(registry.get("ProxyEnable")).toBe("1");
       expect(registry.get("ProxyServer")).toBe("http=127.0.0.1:1080;https=127.0.0.1:1080");
-      expect(registry.has("ProxyOverride")).toBe(false);
+      // Address ranges are left to the proxy, which sends them direct itself:
+      // as WinINet wildcards they would also match public names such as
+      // 10.cdn.example.com and take those out of the tunnel.
+      expect(registry.get("ProxyOverride")).toBe("<local>;localhost;*.local;[::1]");
+      expect(registry.get("ProxyOverride")).toBe(STATIC_PROXY_OVERRIDE);
 
       await manager.restore();
 
@@ -512,6 +548,48 @@ describe("WindowsSystemProxyManager lifecycle", () => {
       expect(registry.get("AutoConfigURL")).toBe("https://corp.example/proxy.pac");
     } finally {
       await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the local-name bypass out while a rule names the local network, so the rule wins there too", async () => {
+    // WinINet applies the override before the listener sees a connection:
+    // with `*.local` in it, a domain rule `corp.local` sent wiki.corp.local
+    // direct on this path, and `<local>` did the same to a single-label name
+    // an IP rule for the network behind the server selects.
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-local-rules-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply({ ...staticRequest(), rules: [routingRule("corp.local")] });
+      expect(registry.get("ProxyOverride")).toBe("<local>;localhost;[::1]");
+
+      await manager.apply({ ...staticRequest(), rules: [{ ...routingRule("10.0.0.0/8"), type: "ip" }] });
+      expect(registry.get("ProxyOverride")).toBe("localhost;[::1]");
+
+      // Rules that do not name the local network leave it as it is.
+      await manager.apply({ ...staticRequest(), rules: [routingRule("example.com"), { ...routingRule("91.108.4.0/22"), type: "ip" }] });
+      expect(registry.get("ProxyOverride")).toBe(STATIC_PROXY_OVERRIDE);
+      expect(staticProxyOverride([{ ...routingRule("corp.local"), enabled: false }])).toBe(STATIC_PROXY_OVERRIDE);
+      expect(staticProxyOverride([{ ...routingRule("0.0.0.0/0"), type: "ip" }])).toBe("localhost;[::1]");
+
+      await manager.restore();
+      expect(registry.get("ProxyOverride")).toBe("<local>");
+    } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recognises the shorter override as Shadow's when a journal is lost", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-local-rules-leftover-"));
+    try {
+      registry.set("ProxyEnable", "1");
+      registry.set("ProxyServer", "http=127.0.0.1:50001;https=127.0.0.1:50001");
+      registry.set("ProxyOverride", "localhost;[::1]");
+      expect(await restoreWindowsSystemProxyBeforeQuit([directory])).toBe(true);
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.has("ProxyServer")).toBe(false);
+    } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -590,19 +668,296 @@ describe("WindowsSystemProxyManager lifecycle", () => {
     }
   });
 
-  it("refuses a malformed recovery journal instead of deleting user proxy values", async () => {
+  // An unreadable journal used to fail every apply, restore and startup
+  // recovery until the file was deleted by hand.
+  it.each([
+    ["an invalid field", JSON.stringify({ journalVersion: 1, proxyEnable: "not-a-dword" }), /not a DWORD/u],
+    ["a newer journal version", JSON.stringify({ journalVersion: 2, proxyServer: "lost.example:8080" }), /version 2/u],
+    ["broken JSON", "{\"journalVersion\": 1,", /invalid/u],
+    ["unknown legacy fields", JSON.stringify({ proxyServer: "lost.example:8080", extra: true }), /unknown fields/u]
+  ])("sets aside a recovery journal with %s instead of blocking every apply", async (_label, content, reason) => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-journal-"));
-    await writeFile(
-      path.join(directory, "windows-proxy-snapshot.json"),
-      JSON.stringify({ journalVersion: 1, proxyEnable: "not-a-dword" }),
-      "utf8"
-    );
+    const journalPath = path.join(directory, "windows-proxy-snapshot.json");
+    await writeFile(journalPath, content, "utf8");
     const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
     try {
-      await expect(manager.apply(staticRequest())).rejects.toThrow(/DWORD/u);
+      const result = await manager.apply(staticRequest());
+
+      // The notice reaches the log through the apply result, once.
+      expect(result.applied).toBe(true);
+      expect(result.message).toMatch(reason);
+      expect(result.message).toMatch(/set aside as windows-proxy-snapshot\.unreadable-[0-9TZ-]+\.json/u);
+      const setAside = (await readdir(directory)).filter((file) => file.startsWith("windows-proxy-snapshot.unreadable-"));
+      expect(setAside).toHaveLength(1);
+      expect(await readFile(path.join(directory, setAside[0]), "utf8")).toBe(content);
+      // The fresh journal holds the user's current values, not the unreadable ones.
+      expect(await readFile(journalPath, "utf8")).toContain("corp.proxy:8080");
+      expect(registry.get("ProxyServer")).toBe("http=127.0.0.1:1080;https=127.0.0.1:1080");
+
+      const again = await manager.apply(staticRequest());
+      expect(again.message).not.toMatch(/set aside/u);
+
+      await manager.restore();
+      expect(registry.get("ProxyServer")).toBe("corp.proxy:8080");
+      expect(registry.get("AutoConfigURL")).toBe("https://corp.example/proxy.pac");
+    } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a set-aside notice for the next apply when this one fails", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-journal-retry-notice-"));
+    await writeFile(path.join(directory, "windows-proxy-snapshot.json"), JSON.stringify({ journalVersion: 3 }), "utf8");
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      failCommand = (_command, args) => isRegAdd(args, "ProxyEnable", "1");
+      await expect(manager.apply(staticRequest())).rejects.toThrow(/reg\.exe/u);
+
+      failCommand = undefined;
+      const result = await manager.apply(staticRequest());
+      expect(result.message).toMatch(/version 3.*set aside/u);
+    } finally {
+      failCommand = undefined;
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an unreadable journal once at startup recovery and then gets out of the way", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-recover-"));
+    await writeFile(path.join(directory, "windows-proxy-snapshot.json"), JSON.stringify({ journalVersion: 9 }), "utf8");
+    try {
+      await expect(recoverWindowsSystemProxy([directory])).rejects.toThrow(/version 9.*set aside/u);
+      // The registry is looked at for Shadow's own leftovers, and the user's
+      // settings found there are left alone.
+      expect(childProcessMocks.execFile.mock.calls.some(([, args]) => args[0] !== "query")).toBe(false);
+      await expect(recoverWindowsSystemProxy([directory])).resolves.toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("restores a readable journal at startup and reports an unreadable sibling", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-recover-both-"));
+    const readable = path.join(parent, "routing");
+    const unreadable = path.join(parent, "xray");
+    const notices: string[] = [];
+    try {
+      await new WindowsSystemProxyManager({ pacDirectory: readable }).apply(staticRequest());
+      await mkdir(unreadable, { recursive: true });
+      await writeFile(path.join(unreadable, "windows-proxy-snapshot.json"), "not json", "utf8");
+
+      await expect(
+        recoverWindowsSystemProxy([readable, unreadable], { onDiagnostic: (message) => notices.push(message) })
+      ).resolves.toBe(true);
+
+      expect(registry.get("ProxyServer")).toBe("corp.proxy:8080");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatch(/set aside/u);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps REG_EXPAND_SZ values and their type across apply and restore", async () => {
+    registry.set("AutoConfigURL", "%USERPROFILE%\\proxy.pac");
+    registryTypes.set("AutoConfigURL", "REG_EXPAND_SZ");
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-expand-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+      expect(registry.has("AutoConfigURL")).toBe(false);
+
+      await manager.restore();
+
+      expect(registry.get("AutoConfigURL")).toBe("%USERPROFILE%\\proxy.pac");
+      expect(registryTypes.get("AutoConfigURL")).toBe("REG_EXPAND_SZ");
+      expect(registryTypes.get("ProxyServer")).toBe("REG_SZ");
+    } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reads and restores an empty string value", async () => {
+    registry.set("ProxyOverride", "");
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-empty-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(pacRequest());
+      await manager.restore();
+      expect(registry.get("ProxyOverride")).toBe("");
+    } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("never takes Shadow's own leftover proxy as the settings to restore", async () => {
+    // A crash, or a journal set aside as unreadable, leaves Shadow's values in place.
+    registry.set("ProxyEnable", "1");
+    registry.set("ProxyServer", "http=127.0.0.1:1080;https=127.0.0.1:1080");
+    registry.set("AutoConfigURL", "http://127.0.0.1:31999/shadow-ssh-routing.pac?v=abc");
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-leftover-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+      await manager.restore();
+
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.has("ProxyServer")).toBe(false);
+      expect(registry.has("AutoConfigURL")).toBe(false);
+      expect(registry.get("ProxyOverride")).toBe("<local>");
+    } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("clears Shadow's own leftover proxy at startup when its journal had to be set aside", async () => {
+    // A crash under static proxy-all, then a journal from a newer version:
+    // the dead loopback proxy used to stay - and the next connect saved it as
+    // the user's own, to be put back at every disconnect.
+    registry.set("ProxyEnable", "1");
+    registry.set("ProxyServer", "http=127.0.0.1:50001;https=127.0.0.1:50001");
+    registry.set("ProxyOverride", `corp.local;${STATIC_PROXY_OVERRIDE}`);
+    registry.set("AutoConfigURL", "http://127.0.0.1:31999/shadow-ssh-routing.pac?v=abc");
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-leftover-startup-"));
+    await writeFile(path.join(directory, "windows-proxy-snapshot.json"), JSON.stringify({ journalVersion: 2 }), "utf8");
+    const notices: string[] = [];
+    try {
+      await expect(recoverWindowsSystemProxy([directory], { onDiagnostic: (message) => notices.push(message) })).resolves.toBe(true);
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.has("ProxyServer")).toBe(false);
+      expect(registry.has("AutoConfigURL")).toBe(false);
+      expect(registry.get("ProxyOverride")).toBe("corp.local");
+      expect(notices.join(" ")).toMatch(/set aside.*leftover proxy settings were removed/su);
+
+      // And the next connect does not take it for the user's setting either.
+      registry.set("ProxyEnable", "1");
+      registry.set("ProxyServer", "http=127.0.0.1:50001;https=127.0.0.1:50001");
+      registry.set("ProxyOverride", `corp.local;${STATIC_PROXY_OVERRIDE}`);
+      const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+      await manager.apply(staticRequest());
+      await manager.restore();
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.has("ProxyServer")).toBe(false);
+      expect(registry.get("ProxyOverride")).toBe("corp.local");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the proxy back synchronously when the session ends", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-session-end-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+      expect(registry.get("ProxyServer")).toContain("127.0.0.1:1080");
+      childProcessMocks.execFile.mockClear();
+
+      expect(restoreWindowsSystemProxyNow([directory, path.join(directory, "missing")])).toBe(true);
+
+      // No asynchronous child process: Windows may end Shadow once the
+      // handler returns.
       expect(childProcessMocks.execFile).not.toHaveBeenCalled();
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.get("ProxyServer")).toBe("corp.proxy:8080");
+      expect(registry.get("ProxyOverride")).toBe("<local>");
+      expect(registry.get("AutoConfigURL")).toBe("https://corp.example/proxy.pac");
+      expect(registry.get("AutoDetect")).toBe("1");
+
+      // It runs outside the manager's queue, so an apply already under way
+      // can still write Shadow's values after it. The journal stays, and is
+      // what puts the user's settings back if Windows ends Shadow now.
+      expect(await readdir(directory)).toContain("windows-proxy-snapshot.json");
+      registry.set("ProxyEnable", "1");
+      registry.set("ProxyServer", "http=127.0.0.1:1080;https=127.0.0.1:1080");
+      expect(await recoverWindowsSystemProxy([directory])).toBe(true);
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.get("ProxyServer")).toBe("corp.proxy:8080");
+      expect(await readdir(directory)).not.toContain("windows-proxy-snapshot.json");
+    } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the proxy back for a quit that gave up on a transport change, and keeps the journal for it", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-quit-deadline-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+      childProcessMocks.execFile.mockClear();
+
+      expect(await restoreWindowsSystemProxyBeforeQuit([directory, path.join(directory, "missing")])).toBe(true);
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.get("ProxyServer")).toBe("corp.proxy:8080");
+      expect(registry.get("AutoConfigURL")).toBe("https://corp.example/proxy.pac");
+      // The user's session goes on, so WinINet is told.
+      expect(childProcessMocks.execFile.mock.calls.some(([command]) => String(command).toLowerCase() === "powershell.exe")).toBe(true);
+
+      // The change the quit gave up on lands after it, and the app exits. The
+      // journal it no longer writes is still there, so the next start puts
+      // the user's settings back.
+      expect(await readdir(directory)).toContain("windows-proxy-snapshot.json");
+      registry.set("ProxyEnable", "1");
+      registry.set("ProxyServer", "http=127.0.0.1:1080;https=127.0.0.1:1080");
+      expect(await recoverWindowsSystemProxy([directory])).toBe(true);
+      expect(registry.get("ProxyEnable")).toBe("0");
       expect(registry.get("ProxyServer")).toBe("corp.proxy:8080");
     } finally {
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("removes only Shadow's own leftovers before quit when there is no journal to read", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-quit-nojournal-"));
+    try {
+      registry.set("ProxyEnable", "1");
+      registry.set("ProxyServer", "http=127.0.0.1:50001;https=127.0.0.1:50001");
+      registry.set("ProxyOverride", STATIC_PROXY_OVERRIDE);
+      expect(await restoreWindowsSystemProxyBeforeQuit([directory])).toBe(true);
+      expect(registry.get("ProxyEnable")).toBe("0");
+      expect(registry.has("ProxyServer")).toBe(false);
+      // The user's own settings are not Shadow's to remove.
+      expect(registry.get("AutoConfigURL")).toBe("https://corp.example/proxy.pac");
+      expect(await restoreWindowsSystemProxyBeforeQuit([directory])).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the journal when the session-end restore could not write everything", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-session-end-fail-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+      failCommand = (_command, args) => isRegAdd(args, "ProxyServer", "corp.proxy:8080");
+      expect(restoreWindowsSystemProxyNow([directory])).toBe(false);
+      expect(await readdir(directory)).toContain("windows-proxy-snapshot.json");
+    } finally {
+      failCommand = undefined;
+      await manager.restore().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a user's own local proxy that Shadow is not about to register", async () => {
+    registry.set("ProxyEnable", "1");
+    registry.set("ProxyServer", "http=127.0.0.1:8888;https=127.0.0.1:8888");
+    const directory = await mkdtemp(path.join(os.tmpdir(), "shadow-ssh-pac-user-local-"));
+    const manager = new WindowsSystemProxyManager({ pacDirectory: directory });
+    try {
+      await manager.apply(staticRequest());
+      await manager.restore();
+
+      expect(registry.get("ProxyEnable")).toBe("1");
+      expect(registry.get("ProxyServer")).toBe("http=127.0.0.1:8888;https=127.0.0.1:8888");
+    } finally {
+      await manager.restore().catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -660,18 +1015,22 @@ function runFakeWindowsCommand(
       callback(Object.assign(new Error("value not found"), { code: "ENOENT" }), "", "Value not found.");
       return;
     }
-    const type = valueName === "ProxyEnable" || valueName === "AutoDetect" ? "REG_DWORD" : "REG_SZ";
-    callback(null, `    ${valueName}    ${type}    ${value}\n`, "");
+    const type = registryTypes.get(valueName) ??
+      (valueName === "ProxyEnable" || valueName === "AutoDetect" ? "REG_DWORD" : "REG_SZ");
+    // reg.exe prints nothing after the type of an empty string value.
+    callback(null, value ? `    ${valueName}    ${type}    ${value}\r\n` : `    ${valueName}    ${type}\r\n`, "");
     return;
   }
   if (action === "add" && valueName) {
     const dataIndex = args.indexOf("/d");
     registry.set(valueName, args[dataIndex + 1] ?? "");
+    registryTypes.set(valueName, valueAfter(args, "/t") ?? "REG_SZ");
     callback(null, "The operation completed successfully.\n", "");
     return;
   }
   if (action === "delete" && valueName) {
     registry.delete(valueName);
+    registryTypes.delete(valueName);
     callback(null, "The operation completed successfully.\n", "");
     return;
   }

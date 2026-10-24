@@ -7,30 +7,30 @@ import { RoutingMatcher, type RoutingMatcherSummary } from "../core/routing/rout
 import { Socks5Proxy } from "../core/network/socks5-proxy.js";
 import { ProxyActivityHeartbeat, PROXY_HEARTBEAT_INTERVAL_MS } from "../core/network/proxy-activity-heartbeat.js";
 import { WindowsSystemProxyManager, type SystemProxyApplyResult } from "../core/network/windows-system-proxy.js";
-import {
-  isAutoLearnableRemoteAddress,
-  listWindowsProcessConnections,
-  normalizeWindowsProcessName,
-  type WindowsProcessConnection
-} from "../core/network/windows-process-connections.js";
+import { listWindowsProcessConnections, type WindowsProcessConnection } from "../core/network/windows-process-connections.js";
 import { listWindowsDnsCacheEntries, type WindowsDnsCacheEntry } from "../core/network/windows-dns-cache.js";
-import {
-  isDomainCoveredByDirectDomainSuffixes,
-  isDomainCoveredByRoutePatterns,
-  MAX_PROCESS_ROUTE_SESSION_LEASES,
-  normalizeProcessRouteDirectDomains,
-  processRouteDomainHints,
-  type ProcessRouteSessionEvidence
-} from "../core/routing/process-route-domains.js";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/local-tcp-proxy.js";
+import { openDirectEgressChannel } from "../core/network/direct-tcp-channel.js";
+import { isLocalDestinationHost } from "../core/routing/ip-address.js";
 import { parseEndpoint } from "../core/network/socks5-check.js";
 import { passedTunnelCheck, probeTunnelEndpoint } from "../core/network/tunnel-probe.js";
 import { LocalRoutingEnforcer, RoutingDecisionLog, type LocalRoutingContext } from "./local-routing-enforcement.js";
 import { preferredLocalProxyPort, rememberLocalProxyPort } from "./local-proxy-port.js";
 import { NativeProcessAttribution, type ProcessAttribution } from "./process-attribution.js";
 import { NativeDataplaneController, type DataplaneController } from "./native-dataplane.js";
-import { errorText, resolveProtectedAddresses, startDataplaneWithRetry, TUN_ADAPTER_NAME, TUN_ROUTING_JOURNAL_FILE } from "./tun-routing.js";
-import { LIVENESS_PROBE_TIMEOUT_MS, SshAuthenticationError, SshLiveClient, type SshLiveClientEvent } from "../core/ssh/live-client.js";
+import { buildSelectedRulesWithProcessIps, ProcessRouteLearner, supportsDynamicProcessRouting } from "./process-route-learning.js";
+import {
+  errorText,
+  MAXIMUM_TUN_UNEXPECTED_STOPS,
+  resolveProtectedAddresses,
+  startDataplaneWithRetry,
+  TUN_ADAPTER_NAME,
+  TUN_ROUTING_JOURNAL_FILE,
+  TUN_UNEXPECTED_STOP_WINDOW_MS
+} from "./tun-routing.js";
+import { LIVENESS_PROBE_TIMEOUT_MS, SshAuthenticationError, SshLiveClient, hostKeysPresentedBeforeFailure, type SshLiveClientEvent } from "../core/ssh/live-client.js";
+import { SshHostKeyMismatchError } from "../core/ssh/session-state.js";
+import { forgetOpenedPrivateKeys } from "../core/ssh/private-key.js";
 import { SystemWakeDetector, type SystemWakeDetectorOptions, type SystemWakeEvent } from "./system-wake-detector.js";
 import type { ServiceEvent } from "../shared/ipc.js";
 import type {
@@ -44,7 +44,6 @@ import type {
   TerminalLine,
   TunnelCheckResult
 } from "../shared/types.js";
-import { normalizeRuleValue, validateRoutingRuleValue } from "../shared/validation.js";
 import type { ServiceBridge } from "./service-bridge.js";
 
 export interface LiveSshServiceBridgeOptions {
@@ -140,12 +139,8 @@ const ROUTING_HOLD_TIMEOUT_MS = 30_000;
  * answered by trying again at once. Only repeated failures slow down.
  */
 const RECONNECT_BACKOFF_STEPS_MS = [0, 1_000, 2_000, 4_000, 8_000, 16_000, MAXIMUM_RECONNECT_DELAY_MS] as const;
-const PROCESS_ROUTE_TTL_MS = 5 * 60 * 1000;
-const PROCESS_ROUTE_REFRESH_INTERVAL_MS = 10 * 1000;
-const PROCESS_ROUTE_DISCOVERY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
-const PROCESS_ROUTE_DNS_REFRESH_MS = 5 * 60 * 1000;
-const PROCESS_ROUTE_DNS_MIN_REFRESH_MS = 1_000;
-const PROCESS_ROUTE_DNS_RETRY_BASE_MS = 10_000;
+/** How many host keys' types the bridge remembers (see LiveSshServiceBridge.hostKeyTypes). */
+const MAX_REMEMBERED_HOST_KEY_TYPES = 32;
 
 export class LiveSshServiceBridge implements ServiceBridge {
   private readonly events = new EventEmitter();
@@ -172,6 +167,24 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private sessionEstablished = false;
   /** The address the last successful session used, keyed by the config host it stood for. */
   private lastServerAddress: { host: string; address: string } | undefined;
+  /**
+   * The host key this session's server proved it holds. Every reconnect of
+   * the session must find the same key, whether or not main managed to save
+   * it as the server's trusted key; a user Connect starts over.
+   */
+  private sessionHostKey: { host: string; port: number; fingerprint: string } | undefined;
+  /**
+   * The type of each host key a server proved it holds, by fingerprint. A
+   * fingerprint names one key and so one type; asking for it first spares a
+   * pin of the server's RSA key the throw-away connection it costs on every
+   * connect and reconnect while the client asks for Ed25519 first. Unlike
+   * sessionHostKey this decides nothing about trust, so it outlives a session.
+   */
+  private readonly hostKeyTypes = new Map<string, string>();
+  /** Cancels the SSH connect in flight, so a disconnect does not wait out its timeouts. */
+  private connectAbort: AbortController | undefined;
+  /** Lets a disconnect stop waiting for a TUN start in flight; see abandonTunStart. */
+  private tunStartAbort: AbortController | undefined;
   private mutationsInFlight = 0;
   private mutationInFlightSince = 0;
   private supervisorWatchdog: NodeJS.Timeout | undefined;
@@ -192,13 +205,16 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private systemRoutingApplied = false;
   private routingHoldTimer: NodeJS.Timeout | undefined;
   private routingHoldGeneration = 0;
+  /**
+   * The hold expired and its return to direct routing waits in the mutation
+   * queue (behind an attempt still in flight). The outage it belongs to has
+   * used up its window: nothing may arm a new hold over it until it has run.
+   */
+  private routingHoldStopQueued = false;
   /** Rules or mode changed while the session was down; held TUN routing must be rebuilt. */
   private routingChangedWhileDown = false;
   private tunnelInterruptedAt: number | undefined;
   private readonly systemProxy: WindowsSystemProxyManager;
-  private readonly processRoutingRefreshIntervalMs: () => number;
-  private readonly processConnectionsProvider: (processNames: Iterable<string>) => Promise<WindowsProcessConnection[]>;
-  private readonly processDnsEntriesProvider: (addresses: Iterable<string>) => Promise<WindowsDnsCacheEntry[]>;
   private proxyInfoDiagnostics = 0;
   private proxyWarningDiagnostics = 0;
   /**
@@ -209,26 +225,21 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private readonly routingDecisions = new RoutingDecisionLog((message) => this.appendDiagnostic("info", message));
   private processRoutingMonitor: NodeJS.Timeout | undefined;
   private processRoutingGeneration = 0;
-  private processRoutingIps = new Map<string, number>();
-  private processRoutingHintDomains = new Set<string>();
-  private processRoutingDomains = new Map<string, number>();
-  private processRoutingDnsLookupAt = new Map<string, number>();
-  private processRoutingDnsLookupFailures = new Map<string, number>();
-  private processRoutingProfileCoveredAddresses = new Map<string, number>();
-  private processRoutingSessionLeases = new Map<string, ProcessRouteSessionEvidence>();
-  private processRoutingLastSignature = "";
-  private processRoutingAppliedSignature = "";
-  private processRoutingTargetSignature = "";
-  private processRoutingApplyPending = false;
-  private processRoutingLastMatchedConnections = 0;
-  private processRoutingWarningEmitted = false;
-  private processRoutingDnsWarningEmitted = false;
-  private processRoutingDiscoveryStep = 0;
+  private readonly processRoutes: ProcessRouteLearner;
   private readonly processAttribution: ProcessAttribution | undefined;
   private readonly dataplane: DataplaneController | undefined;
   private readonly dataplaneJournalPath: string;
   private readonly protectedAddressResolver: (host: string) => Promise<string[]>;
   private tunRoutingActive = false;
+  /**
+   * A dataplane start was sent and no stop has followed. A start that failed
+   * here may still have succeeded in the helper, so a stop is owed for it.
+   */
+  private tunStartAttempted = false;
+  /** When the adapter stopped on its own during this session, for {@link MAXIMUM_TUN_UNEXPECTED_STOPS}. */
+  private tunUnexpectedStops: number[] = [];
+  /** Set once the adapter kept stopping; the session then stays on the proxy path. */
+  private tunSuspendedReason: string | undefined;
   private readonly localRoutingEnforcer: LocalRoutingEnforcer;
   private localProcessEnforcement = false;
   private localRoutingContext: LocalRoutingContext | undefined;
@@ -240,10 +251,13 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
   constructor(initialStatus: RuntimeStatus, options: LiveSshServiceBridgeOptions = {}) {
     this.systemProxy = options.systemProxy ?? new WindowsSystemProxyManager({ pacDirectory: options.pacDirectory });
-    this.processRoutingRefreshIntervalMs = options.processRoutingRefreshIntervalMs ?? (() => PROCESS_ROUTE_REFRESH_INTERVAL_MS);
-    this.processConnectionsProvider = options.processConnectionsProvider ?? listWindowsProcessConnections;
-    this.processDnsEntriesProvider = options.processDnsEntriesProvider ??
-      (options.processConnectionsProvider ? async () => [] : listWindowsDnsCacheEntries);
+    this.processRoutes = new ProcessRouteLearner({
+      connectionsProvider: options.processConnectionsProvider ?? listWindowsProcessConnections,
+      dnsEntriesProvider: options.processDnsEntriesProvider ??
+        (options.processConnectionsProvider ? async () => [] : listWindowsDnsCacheEntries),
+      refreshIntervalMs: options.processRoutingRefreshIntervalMs,
+      onWarning: (message) => this.appendDiagnostic("warning", message)
+    });
     this.processAttribution = options.processAttribution ?? (options.nativeServiceExecutablePath
       ? new NativeProcessAttribution({
           executablePath: options.nativeServiceExecutablePath,
@@ -261,6 +275,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
           onActiveChange: () => this.syncDerivedStatus()
         })
       : undefined);
+    this.dataplane?.onUnexpectedStop?.((reason) => this.handleDataplaneUnexpectedStop(reason));
     this.dataplaneJournalPath = path.join(options.userDataDirectory ?? options.pacDirectory ?? os.tmpdir(), TUN_ROUTING_JOURNAL_FILE);
     this.protectedAddressResolver = options.protectedAddressResolver ?? resolveProtectedAddresses;
     this.localRoutingEnforcer = new LocalRoutingEnforcer(this.processAttribution);
@@ -353,17 +368,6 @@ export class LiveSshServiceBridge implements ServiceBridge {
       const request = this.lastRequest;
       const socksEndpoint = this.socksEndpoint;
       if (this.status.state === "Connected" && request && socksEndpoint) {
-        const unsupportedRouting = describeUnsupportedSelectedRouting(request);
-        if (unsupportedRouting) {
-          this.setStatus({
-            state: "Error",
-            activeConfigId: request.config.id,
-            realTunnelAvailable: false,
-            message: unsupportedRouting
-          });
-          this.appendDiagnostic("error", unsupportedRouting);
-          return;
-        }
         this.appendDiagnostic(
           "info",
           `Routing mode changed while connected: mode=${update.routingMode}, enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}. Re-applying routing without SSH reconnect.`
@@ -396,6 +400,11 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.consecutiveAuthFailures = 0;
     this.sessionEstablished = false;
     this.pendingWakeReason = undefined;
+    // A new session: the host key it must keep presenting is learned (or
+    // read from the saved server) anew, and the adapter gets another chance.
+    this.sessionHostKey = undefined;
+    this.tunUnexpectedStops = [];
+    this.tunSuspendedReason = undefined;
     if (this.lastServerAddress && this.lastServerAddress.host !== request.config.host) {
       this.lastServerAddress = undefined;
     }
@@ -461,6 +470,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
   private startConnect(request: ConnectRequest, trigger: ConnectTrigger): Promise<void> {
     this.clearReconnectTimer();
+    // An attempt still dialling belongs to the lifecycle this one replaces.
+    this.abortPendingConnect();
     this.lastRequest = request;
     this.disconnectRequested = false;
     this.routingRules = request.routingRules;
@@ -473,7 +484,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
       activeTarget: formatServiceTarget(request.config.host, request.config.port),
       // A user Connect may reach a different server; the key this session
       // verifies is reported once it is up.
-      ...(trigger === "user" ? { observedHostKeyFingerprint: undefined } : {}),
+      ...(trigger === "user" ? { observedHostKeyFingerprint: undefined, observedHostKeyType: undefined } : {}),
       message: trigger === "user"
         ? `Connecting to ${request.config.host}:${request.config.port} over live SSH.`
         : `Reconnecting to ${request.config.host}:${request.config.port} (attempt ${this.status.reconnectAttempt}).`,
@@ -501,8 +512,14 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // because the configuration may have changed.
     const holdRouting = trigger !== "user" && this.systemRoutingApplied && this.socksProxy !== undefined;
     // Held TUN capture keeps the rules it was started with; a change made
-    // while the session was down means the adapter has to be rebuilt.
-    const holdTunRouting = holdRouting && this.tunRoutingActive && !this.routingChangedWhileDown;
+    // while the session was down means the adapter has to be rebuilt. And
+    // only an adapter that is still up can be held: one whose helper died
+    // while the session was down captures nothing, and keeping it would
+    // report Connected with no routing at all.
+    const holdTunRouting = holdRouting &&
+      this.tunRoutingActive &&
+      this.dataplane?.isActive === true &&
+      !this.routingChangedWhileDown;
     try {
       // Everything below sits inside one try: a failure while tearing the
       // previous session down is still a failed attempt, and a failed attempt
@@ -510,7 +527,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
       // may leave the status at Connecting/Reconnecting with no one working.
       if (!holdRouting) {
         await this.stopSystemRouting();
-        this.processRoutingWarningEmitted = false;
+        this.processRoutes.warningEmitted = false;
         if (!this.isCurrentLifecycle(generation)) {
           return;
         }
@@ -529,19 +546,6 @@ export class LiveSshServiceBridge implements ServiceBridge {
         `${trigger === "user" ? "Connect requested" : `Reconnect attempt ${this.status.reconnectAttempt} (${trigger})`} for ${request.config.username}@${request.config.host}:${request.config.port}, auth=${request.config.authType}, routing=${request.routingMode}, privateKey=${Boolean(request.secrets?.privateKey)}, passphraseProvided=${Boolean(request.secrets?.privateKeyPassphrase)}${holdRouting ? ", routing held" : ""}.`
       );
 
-      const unsupportedRouting = describeUnsupportedSelectedRouting(request);
-      if (unsupportedRouting) {
-        this.setStatus({
-          state: "Error",
-          activeConfigId: request.config.id,
-          realTunnelAvailable: false,
-          message: unsupportedRouting
-        });
-        this.appendDiagnostic("error", unsupportedRouting);
-        this.haltReconnect("Reconnect stopped. Update the routing configuration, then connect again.");
-        return;
-      }
-
       // While the TUN adapter captures the machine's traffic, the only way
       // out is the server address it was told to leave alone; a fresh lookup
       // could answer with another address and route the transport into its
@@ -550,7 +554,16 @@ export class LiveSshServiceBridge implements ServiceBridge {
       const protectedAddress = holdTunRouting && this.lastServerAddress?.host === request.config.host
         ? this.lastServerAddress.address
         : undefined;
-      const client = await this.connectClient(request, protectedAddress);
+      const abort = new AbortController();
+      this.connectAbort = abort;
+      let client: SshLiveClient;
+      try {
+        client = await this.connectClient(request, protectedAddress, abort.signal);
+      } finally {
+        if (this.connectAbort === abort) {
+          this.connectAbort = undefined;
+        }
+      }
       acquiredClient = client;
       if (!this.isCurrentLifecycle(generation)) {
         await this.disconnectClient(client, "SSH connection was superseded.");
@@ -560,6 +573,12 @@ export class LiveSshServiceBridge implements ServiceBridge {
       this.consecutiveAuthFailures = 0;
       if (client.serverAddress) {
         this.lastServerAddress = { host: request.config.host, address: client.serverAddress };
+      }
+      if (client.hostKeyFingerprint) {
+        // The server authenticated with this key; the rest of the session
+        // holds it to that, whatever becomes of saving it.
+        this.sessionHostKey = { host: request.config.host, port: request.config.port, fingerprint: client.hostKeyFingerprint };
+        this.rememberHostKeyType(client.hostKeyFingerprint, client.hostKeyAlgorithm);
       }
       client.onEvent((event) => this.handleClientEvent(client, generation, event));
       const socksEndpoint = await this.ensureLocalListener();
@@ -599,6 +618,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         activeConfigName: effectiveRequest.config.name,
         activeTarget: formatServiceTarget(effectiveRequest.config.host, effectiveRequest.config.port),
         observedHostKeyFingerprint: client.hostKeyFingerprint,
+        observedHostKeyType: client.hostKeyAlgorithm,
         connectedAt: new Date().toISOString(),
         reconnectAttempt: 0,
         realTunnelAvailable: true,
@@ -630,6 +650,15 @@ export class LiveSshServiceBridge implements ServiceBridge {
       if (!this.isCurrentLifecycle(generation)) {
         return;
       }
+      if (this.systemRoutingApplied) {
+        // Routing went in (perhaps only partly) before the attempt failed. It
+        // gets the same deadline as routing held across a dropped session:
+        // the retry that follows may restore the session, and if none does in
+        // time the machine goes back to direct routing. A halt below takes it
+        // down at once instead. A hold already running, or one that expired
+        // during this attempt and queued its stop, is left as it is.
+        this.suspendTunnel();
+      }
       const message = errorMessage(error);
       this.setStatus({
         state: trigger === "user" ? "Error" : "Reconnecting",
@@ -653,12 +682,87 @@ export class LiveSshServiceBridge implements ServiceBridge {
    * backoff step on it. The pinned fingerprint still decides whether the host
    * at that address is the right one.
    */
-  private async connectClient(request: ConnectRequest, protectedAddress?: string): Promise<SshLiveClient> {
+  private async connectClient(request: ConnectRequest, protectedAddress?: string, signal?: AbortSignal): Promise<SshLiveClient> {
+    const hostKey = this.expectedHostKey(request.config);
+    if (hostKey.source === "trusted" && hostKey.fingerprint) {
+      // Saved with the key, so even the first connect of a run knows which
+      // type it is, and a key of that type that does not match stops it.
+      this.rememberHostKeyType(hostKey.fingerprint, request.config.trustedHostKeyType);
+    } else if (hostKey.source === "pinned" && hostKey.fingerprint) {
+      // Saved by main the first time a session verified the pin; the same
+      // holds for it.
+      this.rememberHostKeyType(hostKey.fingerprint, request.config.pinnedHostKeyType);
+    }
+    try {
+      return await this.openSshSession(request, hostKey.fingerprint, protectedAddress, signal);
+    } catch (error) {
+      const unmatched = hostKeysPresentedBeforeFailure(error);
+      if (unmatched.length > 0 && hostKey.fingerprint && !signal?.aborted) {
+        // The failure itself stays retryable - a server whose other key type
+        // is the expected one may simply have dropped that connection - but
+        // the key that did not match is not left unsaid: an impostor that
+        // drops it on purpose would otherwise only ever show as timeouts.
+        const reason = errorMessage(error).trim();
+        this.appendDiagnostic(
+          "warning",
+          `${request.config.host} presented ${unmatched.map((key) => `${key.fingerprint} (${key.keyType})`).join(", ")}, not the expected host key ${hostKey.fingerprint}, and the connection that asked for its other key type then failed: ${/[.!?]$/u.test(reason) ? reason : `${reason}.`} If this keeps happening, the server answering may not be yours.`
+        );
+      }
+      if (protectedAddress !== undefined && isHostKeyMismatch(error) && !signal?.aborted) {
+        // The address kept from the last session answered with another key.
+        // As at a cached address after a DNS failure (openSshSession), that
+        // says the address is stale - the server moved, someone else has it
+        // now - not that the server changed its key: it is forgotten, and the
+        // retry that follows resolves the name, where a changed key still
+        // stops everything. The wording stays clear of "host key" and
+        // "fingerprint", which would halt reconnecting.
+        if (this.lastServerAddress?.address === protectedAddress) {
+          this.lastServerAddress = undefined;
+        }
+        this.appendDiagnostic(
+          "warning",
+          `A different SSH server answers at ${protectedAddress}, the address kept for ${request.config.host}: ${errorMessage(error)}`
+        );
+        throw new Error(`The address ${protectedAddress} kept for ${request.config.host} now belongs to a different server; the name is looked up again.`);
+      }
+      throw hostKeyTrustError(error, hostKey, request.config) ?? error;
+    }
+  }
+
+  /**
+   * The host key this server must present, in order of authority: the
+   * fingerprint the user pinned, the key saved when Shadow first connected
+   * to it, and the key this session already verified. Without any of them
+   * the first key the server proves it holds is accepted - and then held.
+   */
+  private expectedHostKey(config: SshConfig): ExpectedHostKey {
+    const pinned = config.expectedServerFingerprint?.trim();
+    if (pinned) {
+      return { fingerprint: pinned, source: "pinned" };
+    }
+    const trusted = config.trustedHostKeyFingerprint?.trim();
+    if (trusted) {
+      return { fingerprint: trusted, source: "trusted" };
+    }
+    const session = this.sessionHostKey;
+    if (session && session.host === config.host && session.port === config.port) {
+      return { fingerprint: session.fingerprint, source: "session" };
+    }
+    return {};
+  }
+
+  private async openSshSession(
+    request: ConnectRequest,
+    expectedServerFingerprint: string | undefined,
+    protectedAddress: string | undefined,
+    signal: AbortSignal | undefined
+  ): Promise<SshLiveClient> {
     const options = {
       host: protectedAddress ?? request.config.host,
       port: request.config.port,
       username: request.config.username,
-      expectedServerFingerprint: request.config.expectedServerFingerprint,
+      expectedServerFingerprint,
+      preferredHostKeyType: expectedServerFingerprint ? this.hostKeyTypes.get(expectedServerFingerprint) : undefined,
       password: request.config.authType === "password" ? requiredSecret(request.secrets?.password, "SSH password") : undefined,
       privateKey: request.config.authType === "private-key" ? requiredSecret(request.secrets?.privateKey, "SSH private key") : undefined,
       privateKeyPassphrase: request.secrets?.privateKeyPassphrase,
@@ -668,7 +772,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
       directTcpIpOpenTimeoutMs: 12000
     };
     try {
-      return await SshLiveClient.connect(options);
+      return await SshLiveClient.connect(options, signal);
     } catch (error) {
       const fallback = this.lastServerAddress;
       if (
@@ -677,18 +781,19 @@ export class LiveSshServiceBridge implements ServiceBridge {
         fallback.host === request.config.host &&
         fallback.address !== request.config.host &&
         net.isIP(request.config.host) === 0 &&
-        // Without a pinned fingerprint nothing would tell a reassigned address
+        // Without a known host key nothing would tell a reassigned address
         // from the real server, and the credentials would go to whoever owns
         // it now; the resolver stays the only authority in that case.
-        Boolean(request.config.expectedServerFingerprint?.trim()) &&
-        isDnsFailure(error)
+        Boolean(expectedServerFingerprint) &&
+        isDnsFailure(error) &&
+        !signal?.aborted
       ) {
         this.appendDiagnostic(
           "warning",
           `DNS lookup for ${request.config.host} failed (${errorMessage(error)}); retrying with the last known address ${fallback.address}.`
         );
         try {
-          return await SshLiveClient.connect({ ...options, host: fallback.address });
+          return await SshLiveClient.connect({ ...options, host: fallback.address }, signal);
         } catch (fallbackError) {
           if (isNonRetryableConnectError(fallbackError) && !isAuthenticationFailure(fallbackError)) {
             // A different host answered at the cached address. That says the
@@ -702,6 +807,22 @@ export class LiveSshServiceBridge implements ServiceBridge {
         }
       }
       throw error;
+    }
+  }
+
+  private rememberHostKeyType(fingerprint: string, keyType: string | undefined): void {
+    if (!keyType) {
+      return;
+    }
+    this.hostKeyTypes.delete(fingerprint);
+    this.hostKeyTypes.set(fingerprint, keyType);
+    // A handful of servers is all one install talks to; the bound only stops
+    // a long session of edits from growing the map without end.
+    if (this.hostKeyTypes.size > MAX_REMEMBERED_HOST_KEY_TYPES) {
+      const oldest = this.hostKeyTypes.keys().next().value;
+      if (oldest !== undefined) {
+        this.hostKeyTypes.delete(oldest);
+      }
     }
   }
 
@@ -721,6 +842,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
         return;
       }
       this.haltReconnect("Reconnect stopped. Update the SSH configuration or key, then connect again.");
+      return;
+    }
+    if (isHostKeyFailure(error)) {
+      this.haltReconnect("Reconnect stopped because SSH host trust or credentials require user action.");
       return;
     }
     if (isNonRetryableConnectError(error)) {
@@ -754,16 +879,40 @@ export class LiveSshServiceBridge implements ServiceBridge {
     if (this.disposed) {
       return this.mutationTail;
     }
+    this.endSessionNow();
+    const generation = this.lifecycleGeneration;
+    return this.enqueueMutation(() => this.disconnectInternal(generation, "User disconnected."));
+  }
+
+  /** See ServiceBridge.beginDisconnect. */
+  beginDisconnect(): void {
+    const state = this.status.state;
+    if (this.disposed || (state !== "Connecting" && state !== "Reconnecting" && state !== "Connected")) {
+      return;
+    }
+    this.endSessionNow();
+  }
+
+  /**
+   * Everything a disconnect does before its teardown's turn comes: whatever
+   * is in flight belongs to a lifecycle that ends here, and reads as
+   * overtaken from now on.
+   */
+  private endSessionNow(): void {
     this.disconnectRequested = true;
     this.clearReconnectTimer();
     this.stopSupervisor();
-    const generation = ++this.lifecycleGeneration;
+    // A connect still dialling would otherwise hold the teardown queued
+    // behind it for as long as its own timeouts allow; so would one waiting
+    // for the TUN adapter.
+    this.abortPendingConnect();
+    this.abandonTunStart();
+    this.lifecycleGeneration += 1;
     this.setStatus({
       state: "Disconnecting",
       realTunnelAvailable: false,
       message: "Disconnecting SSH session."
     });
-    return this.enqueueMutation(() => this.disconnectInternal(generation, "User disconnected."));
   }
 
   private async disconnectInternal(generation: number, reason: string): Promise<void> {
@@ -774,6 +923,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.client = undefined;
     this.shellOpen = false;
     this.tunnelInterruptedAt = undefined;
+    // A key opened with bcrypt is kept for the reconnects of one session only.
+    forgetOpenedPrivateKeys();
     await this.stopRouting();
     if (client) {
       await this.disconnectClient(client, reason);
@@ -802,6 +953,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.disconnectRequested = true;
     this.clearReconnectTimer();
     this.stopSupervisor();
+    this.abortPendingConnect();
+    this.abandonTunStart();
     this.lifecycleGeneration += 1;
     this.setStatus({
       state: "Disconnected",
@@ -908,6 +1061,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.disconnectRequested = true;
     this.clearReconnectTimer();
     this.stopSupervisor();
+    this.abortPendingConnect();
+    this.abandonTunStart();
     const generation = ++this.lifecycleGeneration;
     this.setStatus({
       state: "Disconnecting",
@@ -1004,7 +1159,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // Process discovery has nothing to learn while the tunnel is down; the
     // next successful attempt restarts it with routing.
     this.stopProcessRoutingMonitor();
-    if (!this.systemRoutingApplied || this.routingHoldTimer) {
+    // An expired hold whose stop is still queued is not re-armed: a failing
+    // attempt would otherwise restart the window over and over, and a long
+    // outage would keep the machine routed into a dead tunnel for minutes.
+    if (!this.systemRoutingApplied || this.routingHoldTimer || this.routingHoldStopQueued) {
       return;
     }
     const holdGeneration = ++this.routingHoldGeneration;
@@ -1017,10 +1175,15 @@ export class LiveSshServiceBridge implements ServiceBridge {
         "warning",
         `The tunnel has been down for ${Math.round(ROUTING_HOLD_TIMEOUT_MS / 1000)} s; returning the machine to direct routing until the session is back.`
       );
+      this.routingHoldStopQueued = true;
       void this.enqueueMutation(async () => {
         // A session may have come and gone again while this waited its turn;
         // that outage has a hold of its own and must not lose it to this one.
-        if (holdGeneration !== this.routingHoldGeneration || this.client || this.disposed || this.disconnectRequested) {
+        if (holdGeneration !== this.routingHoldGeneration) {
+          return;
+        }
+        this.routingHoldStopQueued = false;
+        if (this.client || this.disposed || this.disconnectRequested) {
           return;
         }
         await this.stopSystemRouting();
@@ -1031,6 +1194,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
   private clearRoutingHold(): void {
     this.routingHoldGeneration += 1;
+    this.routingHoldStopQueued = false;
     if (this.routingHoldTimer) {
       clearTimeout(this.routingHoldTimer);
       this.routingHoldTimer = undefined;
@@ -1182,6 +1346,27 @@ export class LiveSshServiceBridge implements ServiceBridge {
   }
 
   /**
+   * Ends the SSH connect in flight, if any. Its attempt belongs to a
+   * lifecycle that has just been replaced, so it then returns quietly.
+   */
+  private abortPendingConnect(): void {
+    const abort = this.connectAbort;
+    this.connectAbort = undefined;
+    abort?.abort();
+  }
+
+  /**
+   * Stops waiting for a TUN start in flight, for a session the user ended:
+   * no further attempt is made, and the start reads as overtaken. The helper
+   * still finishes it, and the stop the teardown sends waits behind it.
+   */
+  private abandonTunStart(): void {
+    const abort = this.tunStartAbort;
+    this.tunStartAbort = undefined;
+    abort?.abort();
+  }
+
+  /**
    * Runs while a connection is wanted: the wake detector that notices sleep
    * and network changes, and the watchdog below.
    */
@@ -1316,8 +1501,10 @@ export class LiveSshServiceBridge implements ServiceBridge {
    * process.name rules together, matching traffic enters the SSH tunnel, and
    * everything else leaves the machine directly and unchanged.
    *
-   * When enforcement is inactive the system proxy has already selected the
-   * traffic, so every accepted connection is tunnelled as before.
+   * When enforcement is inactive the system proxy, the TUN adapter or the
+   * user has already selected the traffic, so every accepted connection is
+   * tunnelled as before - except, on the Windows proxy path, a local
+   * destination no user rule names, which leaves directly.
    *
    * The session is acquired lazily, and only for traffic that is going into
    * the tunnel: while a reconnect is in progress that acquisition waits for
@@ -1332,6 +1519,28 @@ export class LiveSshServiceBridge implements ServiceBridge {
     const acquire = typeof client === "function" ? client : () => Promise.resolve(client);
     const request = this.lastRequest;
     if (!this.localProcessEnforcement || !request) {
+      // On the Windows proxy path the machine itself and the networks around
+      // it stay out of the tunnel unless a user rule names them (step 3 of
+      // the shared order, which the enforcer below applies too): a private
+      // address the WinINet override leaves to this listener, or a client
+      // that ignores the bypass list. A domain or IP rule for them (step 2) -
+      // `10.0.0.0/8` for the network behind the server - is what the PAC sent
+      // them here for, so it is honoured.
+      //
+      // Nowhere else. The TUN adapter has applied the whole order already,
+      // and a private address it sends here was picked by a rule - by a
+      // domain rule, through a name it learned, it arrives as a bare address
+      // no rule here can match - so going direct would take it out of the
+      // tunnel, and back into the adapter. An app pointed at the listener by
+      // hand - the only kind on macOS and Linux - asked for the tunnel:
+      // `ssh -D` reaches the server's own network and localhost.
+      if (
+        this.windowsProxyRouting() &&
+        isLocalDestinationHost(target.host) &&
+        !(request && (await this.localRoutingEnforcer.matchesUserRule(request.routingRules, target.host)))
+      ) {
+        return openDirectEgressChannel(target, { signal });
+      }
       return (await acquire()).openDirectTcpIpChannel(target, originator, signal);
     }
 
@@ -1345,6 +1554,15 @@ export class LiveSshServiceBridge implements ServiceBridge {
     );
     this.routingDecisions.record(target, decision);
     return channel;
+  }
+
+  /**
+   * Whether the Windows proxy - the PAC or the static proxy - is what sends
+   * system traffic to the listener: routing is applied on Windows, and not
+   * through the TUN adapter.
+   */
+  private windowsProxyRouting(): boolean {
+    return process.platform === "win32" && this.systemRoutingApplied && !this.tunRoutingActive;
   }
 
   /**
@@ -1411,22 +1629,6 @@ export class LiveSshServiceBridge implements ServiceBridge {
     return !this.disposed && this.isCurrentLifecycle(lifecycleGeneration) && routingGeneration === this.routingGeneration;
   }
 
-  private clearProcessRoutingState(): void {
-    this.processRoutingIps.clear();
-    this.processRoutingHintDomains.clear();
-    this.processRoutingDomains.clear();
-    this.processRoutingDnsLookupAt.clear();
-    this.processRoutingDnsLookupFailures.clear();
-    this.processRoutingProfileCoveredAddresses.clear();
-    this.processRoutingSessionLeases.clear();
-    this.processRoutingLastSignature = "";
-    this.processRoutingAppliedSignature = "";
-    this.processRoutingTargetSignature = "";
-    this.processRoutingApplyPending = false;
-    this.processRoutingLastMatchedConnections = 0;
-    this.processRoutingDnsWarningEmitted = false;
-  }
-
   /** Takes down system routing and the local listener; the full teardown. */
   private async stopRouting(): Promise<void> {
     await this.stopSystemRouting();
@@ -1447,7 +1649,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     await this.stopTunRouting();
     this.localProcessEnforcement = false;
     this.localRoutingContext = undefined;
-    this.clearProcessRoutingState();
+    this.processRoutes.clear();
     try {
       await this.systemProxy.restore();
     } catch (error) {
@@ -1484,7 +1686,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.stopProcessRoutingMonitor();
     const generation = this.processRoutingGeneration;
     const summary = new RoutingMatcher(request.routingMode, request.routingRules).summary();
-    const hasProcessRouting = supportsDynamicProcessRouting(request);
+    const hasProcessRouting = supportsDynamicProcessRouting(request.routingMode, request.routingRules);
 
     // A TUN adapter is the only path that can hold a `process.name` rule
     // against an application that ignores the Windows proxy setting, so it is
@@ -1499,10 +1701,17 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // application's destinations and feeding them to PAC.
     const context = buildLocalRoutingContext(request);
     const enforceability = await this.localRoutingEnforcer.describeEnforceability(context);
-    this.localProcessEnforcement = enforceability.enforceable;
+    // Checked before anything changes: an apply that was overtaken - the
+    // session dropped, or a newer update is on its way - leaves the proxy path
+    // to whoever overtook it. Above all it must not switch the listener to
+    // local enforcement under a TUN adapter applyTunRouting kept up: the
+    // adapter's flows reach it from the helper's own socket, often as bare
+    // addresses, and the enforcer would send a process rule's flows direct
+    // instead of letting them wait for the tunnel.
     if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
       return;
     }
+    this.localProcessEnforcement = enforceability.enforceable;
     if (this.localProcessEnforcement) {
       this.localRoutingContext = context;
       await this.applyLocallyEnforcedRouting(request, socksEndpoint, generation, allowConnecting, summary);
@@ -1539,7 +1748,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
           // A transient failure of the literal-IP fast path must not skip them.
           literalIpSnapshotFailed = true;
           literalIpSnapshotError = error;
-          this.processRoutingApplyPending = true;
+          this.processRoutes.applyPending = true;
         }
       });
       if (generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
@@ -1551,7 +1760,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
       );
       if (
         literalIpSnapshotFailed &&
-        literalIpSnapshotSignature === this.processRoutingLastSignature
+        literalIpSnapshotSignature === this.processRoutes.lastSignature
       ) {
         if (this.status.state === "Connected") {
           this.startProcessRoutingMonitor(request, socksEndpoint);
@@ -1559,14 +1768,14 @@ export class LiveSshServiceBridge implements ServiceBridge {
         throw literalIpSnapshotError;
       }
     } else {
-      this.clearProcessRoutingState();
+      this.processRoutes.clear();
     }
-    this.processRoutingApplyPending = hasProcessRouting;
+    this.processRoutes.applyPending = hasProcessRouting;
     let result: SystemProxyApplyResult;
     if (
       hasProcessRouting &&
       literalIpSnapshotResult &&
-      literalIpSnapshotSignature === this.processRoutingLastSignature
+      literalIpSnapshotSignature === this.processRoutes.lastSignature
     ) {
       result = literalIpSnapshotResult;
     } else {
@@ -1575,8 +1784,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
           mode: request.routingMode,
           rules: buildSelectedRulesWithProcessIps(
             request.routingRules,
-            this.currentProcessRoutingIps(),
-            this.currentProcessRoutingDomains()
+            this.processRoutes.currentIps(),
+            this.processRoutes.currentDomains()
           ),
           proxyDomains: request.routingProxyDomains,
           directDomains: request.routingDirectDomains,
@@ -1595,8 +1804,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
       return;
     }
     if (hasProcessRouting && result.applied) {
-      this.processRoutingAppliedSignature = this.processRoutingLastSignature;
-      this.processRoutingApplyPending = false;
+      this.processRoutes.appliedSignature = this.processRoutes.lastSignature;
+      this.processRoutes.applyPending = false;
     }
     this.appendDiagnostic(result.applied ? "info" : "warning", result.message);
     if (hasProcessRouting) {
@@ -1609,27 +1818,22 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
     this.appendDiagnostic(
       summary.enabledRules > 0 ? "info" : "warning",
-      `Selected routing prepared: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}, learnedProcessDomains=${this.currentProcessRoutingDomains().size}.`
+      `Selected routing prepared: enabled=${summary.enabledRules}, domains=${summary.domainRules}, ips=${summary.ipRules}, processes=${summary.processRules}, matchedProcessConnections=${this.processRoutes.lastMatchedConnections}, learnedProcessIps=${this.processRoutes.ips.size}, learnedProcessDomains=${this.processRoutes.currentDomains().size}.`
     );
   }
 
   /**
-   * Applies routing for the locally enforced path.
-   *
-   * The system proxy is pointed at the local listener for all proxy-aware TCP
-   * traffic, because a PAC file cannot tell which process opened a connection.
-   * That is not proxy-all routing: `openProxyChannel` evaluates every rule type
-   * per connection and gives non-matching traffic a direct egress, so only the
-   * selected domains, addresses and processes reach the tunnel. The configured
-   * direct list is still honoured by the PAC itself and never reaches us.
-   */
-  /**
    * Puts the TUN adapter in front of the machine's traffic.
    *
-   * Returns false, having changed nothing, whenever the adapter cannot be
-   * used. Falling back matters more than reporting: a machine that is not
-   * elevated still deserves the proxy path's partial protection rather than no
-   * routing at all.
+   * Returns false whenever the adapter cannot be used, for the caller to fall
+   * back to the proxy path - having first taken down any adapter this session
+   * still had up, so the old one is not left capturing traffic beneath it.
+   * Two ways out change nothing: TUN being off for the session or unsupported
+   * here, and an update overtaken while it ran (the session dropped or was
+   * ended, or a newer update is on its way), which leaves an adapter that is
+   * up to the reconnect or that update. Falling back matters more than reporting: a machine that is not elevated
+   * still deserves the proxy path's partial protection rather than no routing
+   * at all.
    */
   private async applyTunRouting(
     request: ConnectRequest,
@@ -1639,6 +1843,15 @@ export class LiveSshServiceBridge implements ServiceBridge {
   ): Promise<boolean> {
     const dataplane = this.dataplane;
     if (!dataplane || request.tunDataplaneEnabled !== true || process.platform !== "win32") {
+      return false;
+    }
+    // Every way out below that falls back to the proxy path first takes down
+    // an adapter this session may still have up: a routing update that cannot
+    // restart TUN must not leave the old adapter capturing traffic beneath
+    // the system proxy it then applies.
+    if (this.tunSuspendedReason) {
+      this.appendDiagnostic("warning", `TUN routing is unavailable, continuing on the Windows proxy path: ${this.tunSuspendedReason}.`);
+      await this.stopTunRouting();
       return false;
     }
 
@@ -1651,6 +1864,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         "warning",
         `TUN routing is unavailable, continuing on the Windows proxy path: ${availability.reason ?? "unknown reason"}`
       );
+      await this.stopTunRouting();
       return false;
     }
 
@@ -1674,6 +1888,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         "warning",
         `TUN routing is unavailable: no address could be resolved for ${request.config.host} to keep off the adapter. Continuing on the Windows proxy path.`
       );
+      await this.stopTunRouting();
       return false;
     }
 
@@ -1683,9 +1898,14 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // checks through this listener whether the server reaches IPv6 as soon as
     // it is up, and a listener still enforcing an earlier proxy-path policy
     // would send that check out directly - taking this machine's IPv6 for the
-    // server's. A failed start recomputes both in applySystemRouting.
+    // server's. A failed start recomputes both in applySystemRouting; an
+    // overtaken one puts them back (below).
+    const enforcementBeforeStart = { enforced: this.localProcessEnforcement, context: this.localRoutingContext };
     this.localProcessEnforcement = false;
     this.localRoutingContext = undefined;
+    this.tunStartAttempted = true;
+    const abort = new AbortController();
+    this.tunStartAbort = abort;
     try {
       await startDataplaneWithRetry(dataplane, {
         routingMode: request.routingMode,
@@ -1703,6 +1923,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         adapterName: TUN_ADAPTER_NAME,
         journalPath: this.dataplaneJournalPath
       }, {
+        signal: abort.signal,
         onRetry: (attempt, attempts, error) =>
           this.appendDiagnostic(
             "warning",
@@ -1710,6 +1931,30 @@ export class LiveSshServiceBridge implements ServiceBridge {
           )
       });
     } catch (error) {
+      if (abort.signal.aborted || generation !== this.processRoutingGeneration || !this.isRoutingStateActive(allowConnecting)) {
+        // Overtaken while it ran: the session dropped or was ended, or a
+        // newer update is on its way. An adapter still up (the helper keeps the old policy
+        // when a new one does not compile) is held for the reconnect, which
+        // keeps selected flows waiting at the listener instead of letting
+        // them out directly. It carries the old rules, so a reconnect is told
+        // to rebuild it rather than keep it; a newer update rebuilds it anyway.
+        if (this.tunRoutingActive && !this.isRoutingStateActive(allowConnecting)) {
+          this.noteRoutingChangedWhileDown();
+        }
+        if (!this.tunRoutingActive) {
+          // No adapter is up, so the proxy path the session was on is still in
+          // place, and with it a system proxy that may hand every connection
+          // to the listener. Whoever overtook this applies routing afresh;
+          // until then the listener goes on deciding as it did, rather than
+          // parking everything for the tunnel regardless of the rules.
+          this.localProcessEnforcement = enforcementBeforeStart.enforced;
+          this.localRoutingContext = enforcementBeforeStart.context;
+        }
+        // Not worded as "TUN routing could not start": that would report
+        // TUN as unavailable, and nothing here says it is.
+        this.appendDiagnostic("warning", `A routing update was overtaken before it reached the TUN adapter, which is left as it is for the reconnect or the next update: ${errorText(error)}`);
+        return false;
+      }
       // Worth spelling out: the fallback still routes domains and IP ranges, so
       // the tunnel looks healthy while process rules quietly stop reaching the
       // applications that ignore the Windows proxy setting.
@@ -1717,7 +1962,16 @@ export class LiveSshServiceBridge implements ServiceBridge {
         "warning",
         `TUN routing could not start, continuing on the Windows proxy path - process rules will not reach applications that ignore the Windows proxy setting: ${errorText(error)}`
       );
+      // The adapter of an earlier start may still be up (the helper keeps the
+      // old policy when a new one does not compile), and a start this side
+      // gave up on may yet finish in the helper. Either way it comes down
+      // before the proxy path goes on top of it.
+      await this.stopTunRouting();
       return false;
+    } finally {
+      if (this.tunStartAbort === abort) {
+        this.tunStartAbort = undefined;
+      }
     }
 
     // With the adapter carrying traffic the Windows proxy setting must go:
@@ -1734,7 +1988,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
     this.tunRoutingActive = true;
     this.syncDerivedStatus();
-    this.clearProcessRoutingState();
+    this.processRoutes.clear();
     this.appendDiagnostic(
       "info",
       "TUN routing is active: every selected application's traffic is captured at the adapter, including UDP, which this transport drops rather than leaks. Domain rules match on the name each connection opens (TLS SNI, HTTP Host, QUIC), so a browser that resolved before connecting or uses DNS-over-HTTPS is covered."
@@ -1743,10 +1997,11 @@ export class LiveSshServiceBridge implements ServiceBridge {
   }
 
   private async stopTunRouting(): Promise<void> {
-    if (!this.dataplane || !this.tunRoutingActive) {
+    if (!this.dataplane || (!this.tunRoutingActive && !this.tunStartAttempted)) {
       return;
     }
     this.tunRoutingActive = false;
+    this.tunStartAttempted = false;
     try {
       await this.dataplane.stop();
     } catch (error) {
@@ -1758,6 +2013,73 @@ export class LiveSshServiceBridge implements ServiceBridge {
     this.syncDerivedStatus();
   }
 
+  /**
+   * The adapter stopped under the session: its helper died, or found the
+   * adapter dead and took itself down. Nothing captures traffic any more, and
+   * the Windows proxy setting went when the adapter came up, so selected
+   * traffic is already leaving directly while the session still reads
+   * Connected. Routing is applied again at once, the ordinary way: a fresh
+   * helper brings the adapter back, or the proxy path takes over.
+   */
+  private handleDataplaneUnexpectedStop(reason: string): void {
+    if (this.disposed || (!this.tunRoutingActive && !this.tunStartAttempted)) {
+      return;
+    }
+    this.tunRoutingActive = false;
+    this.tunStartAttempted = false;
+    this.syncDerivedStatus();
+    const now = Date.now();
+    this.tunUnexpectedStops = [
+      ...this.tunUnexpectedStops.filter((at) => now - at >= 0 && now - at < TUN_UNEXPECTED_STOP_WINDOW_MS),
+      now
+    ];
+    if (this.tunUnexpectedStops.length >= MAXIMUM_TUN_UNEXPECTED_STOPS) {
+      this.tunSuspendedReason = `the TUN adapter stopped unexpectedly ${this.tunUnexpectedStops.length} times within ${Math.round(TUN_UNEXPECTED_STOP_WINDOW_MS / 60_000)} minutes, so it is not restarted again until the next Connect`;
+    }
+    // The wording is what the attention mapping matches on. While the
+    // session is down nothing is applied until it is back - the Windows proxy
+    // setting went when the adapter came up - so the routing hold no longer
+    // holds anything, and that is said rather than a re-apply promised.
+    const next = this.tunSuspendedReason
+      ? "Routing continues on the Windows proxy path for the rest of this session."
+      : this.status.state !== "Connected"
+        ? "Routing is applied again when the session is back: the adapter is restarted, or the Windows proxy path takes over. Until then apps connect directly."
+        : "Routing is being applied again: the adapter is restarted, or the Windows proxy path takes over.";
+    this.appendDiagnostic("warning", `TUN dataplane stopped unexpectedly: ${withFinalStop(reason)} ${next}`);
+    // Queued, so a connect or routing change in progress finishes first; a
+    // session that is not Connected by then applies routing afresh on its own
+    // when it is back.
+    const lifecycleGeneration = this.lifecycleGeneration;
+    void this.enqueueMutation(async () => {
+      const request = this.lastRequest;
+      const socksEndpoint = this.socksEndpoint;
+      if (
+        this.disposed ||
+        !this.isCurrentLifecycle(lifecycleGeneration) ||
+        this.status.state !== "Connected" ||
+        !this.systemRoutingApplied ||
+        !request ||
+        !socksEndpoint
+      ) {
+        return;
+      }
+      await this.applySystemRouting(request, socksEndpoint);
+    }).catch((error: unknown) => {
+      this.appendDiagnostic("warning", `Applying routing again after the TUN adapter stopped failed: ${errorMessage(error)}`);
+    });
+  }
+
+  /**
+   * Applies routing for the locally enforced path.
+   *
+   * The system proxy is pointed at the local listener for all proxy-aware TCP
+   * traffic, because a PAC file cannot tell which process opened a connection.
+   * That is not proxy-all routing: `openProxyChannel` evaluates every rule type
+   * per connection and gives non-matching traffic a direct egress, so only the
+   * selected domains, addresses and processes reach the tunnel. The configured
+   * direct list is kept out of the PAC here and applied by the listener per
+   * connection, after the process rule (see LocalRoutingContext).
+   */
   private async applyLocallyEnforcedRouting(
     request: ConnectRequest,
     socksEndpoint: { host: string; port: number },
@@ -1765,7 +2087,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     allowConnecting: boolean,
     summary: RoutingMatcherSummary
   ): Promise<void> {
-    this.clearProcessRoutingState();
+    this.processRoutes.clear();
     // The direct list is deliberately withheld from the PAC here: the PAC runs
     // before the listener and cannot see processes, so a direct-list entry
     // there would carve holes in a selected application's traffic. It is
@@ -1799,7 +2121,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
 
   private startProcessRoutingMonitor(request: ConnectRequest, socksEndpoint: { host: string; port: number }): void {
     this.stopProcessRoutingMonitor();
-    if (!supportsDynamicProcessRouting(request)) {
+    if (!supportsDynamicProcessRouting(request.routingMode, request.routingRules)) {
       return;
     }
 
@@ -1807,7 +2129,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     // Multi-endpoint applications often expose additional API/CDN/WebSocket
     // destinations only after the first connection succeeds. Always complete
     // one bounded discovery burst instead of stopping at the first learned IP.
-    this.processRoutingDiscoveryStep = 0;
+    this.processRoutes.beginDiscovery();
     this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
   }
 
@@ -1826,8 +2148,8 @@ export class LiveSshServiceBridge implements ServiceBridge {
       }
       void this.enqueueMutation(() => this.refreshProcessRouting(request, socksEndpoint, generation))
         .catch((error: unknown) => {
-          if (!this.processRoutingWarningEmitted) {
-            this.processRoutingWarningEmitted = true;
+          if (!this.processRoutes.warningEmitted) {
+            this.processRoutes.warningEmitted = true;
             this.appendDiagnostic(
               "warning",
               `Process-name routing refresh failed: ${error instanceof Error ? error.message : String(error)}`
@@ -1837,7 +2159,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
         .finally(() => {
           this.scheduleProcessRoutingRefresh(request, socksEndpoint, generation);
         });
-    }, this.nextProcessRoutingRefreshIntervalMs());
+    }, this.processRoutes.nextRefreshIntervalMs());
     this.processRoutingMonitor.unref();
   }
 
@@ -1875,12 +2197,12 @@ export class LiveSshServiceBridge implements ServiceBridge {
       } catch (error) {
         literalIpSnapshotFailed = true;
         literalIpSnapshotError = error;
-        this.processRoutingApplyPending = true;
+        this.processRoutes.applyPending = true;
       }
     });
     if (
       literalIpSnapshotFailed &&
-      literalIpSnapshotSignature === this.processRoutingLastSignature
+      literalIpSnapshotSignature === this.processRoutes.lastSignature
     ) {
       throw literalIpSnapshotError;
     }
@@ -1889,19 +2211,19 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
     if (
       literalIpSnapshotResult &&
-      literalIpSnapshotSignature === this.processRoutingLastSignature
+      literalIpSnapshotSignature === this.processRoutes.lastSignature
     ) {
       this.appendDiagnostic(
         literalIpSnapshotResult.applied ? "info" : "warning",
-        `Process-name literal-IP routing updated before DNS enrichment: matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}. ${literalIpSnapshotResult.message}`
+        `Process-name literal-IP routing updated before DNS enrichment: matchedProcessConnections=${this.processRoutes.lastMatchedConnections}, learnedProcessIps=${this.processRoutes.ips.size}. ${literalIpSnapshotResult.message}`
       );
       return;
     }
-    if (!this.processRoutingApplyPending && this.processRoutingLastSignature === this.processRoutingAppliedSignature) {
+    if (!this.processRoutes.applyPending && this.processRoutes.lastSignature === this.processRoutes.appliedSignature) {
       return;
     }
 
-    const observedSignature = this.processRoutingLastSignature;
+    const observedSignature = this.processRoutes.lastSignature;
     const result = await this.publishProcessRoutingSnapshot(
       request,
       socksEndpoint,
@@ -1914,7 +2236,7 @@ export class LiveSshServiceBridge implements ServiceBridge {
     }
     this.appendDiagnostic(
       result.applied ? "info" : "warning",
-      `Process-name routing updated: matchedProcessConnections=${this.processRoutingLastMatchedConnections}, learnedProcessIps=${this.processRoutingIps.size}, learnedProcessDomains=${this.currentProcessRoutingDomains().size}. ${result.message}`
+      `Process-name routing updated: matchedProcessConnections=${this.processRoutes.lastMatchedConnections}, learnedProcessIps=${this.processRoutes.ips.size}, learnedProcessDomains=${this.processRoutes.currentDomains().size}. ${result.message}`
     );
   }
 
@@ -1928,17 +2250,17 @@ export class LiveSshServiceBridge implements ServiceBridge {
     if (
       generation !== this.processRoutingGeneration ||
       !this.isRoutingStateActive(allowConnecting) ||
-      signature !== this.processRoutingLastSignature
+      signature !== this.processRoutes.lastSignature
     ) {
       return undefined;
     }
-    this.processRoutingApplyPending = true;
+    this.processRoutes.applyPending = true;
     const result = await this.systemProxy.apply({
       mode: request.routingMode,
       rules: buildSelectedRulesWithProcessIps(
         request.routingRules,
-        this.currentProcessRoutingIps(),
-        this.currentProcessRoutingDomains()
+        this.processRoutes.currentIps(),
+        this.processRoutes.currentDomains()
       ),
       proxyDomains: request.routingProxyDomains,
       directDomains: request.routingDirectDomains,
@@ -1950,363 +2272,28 @@ export class LiveSshServiceBridge implements ServiceBridge {
       result.applied &&
       generation === this.processRoutingGeneration &&
       this.isRoutingStateActive(allowConnecting) &&
-      this.processRoutingLastSignature === signature
+      this.processRoutes.lastSignature === signature
     ) {
-      this.processRoutingAppliedSignature = signature;
-      this.processRoutingApplyPending = false;
+      this.processRoutes.appliedSignature = signature;
+      this.processRoutes.applyPending = false;
     }
     return result;
   }
 
-  private async learnProcessRoutingIps(
+  private learnProcessRoutingIps(
     request: ConnectRequest,
     generation?: number,
     publishLiteralIpSnapshot?: (signature: string) => Promise<void>
   ): Promise<boolean> {
-    if (!supportsDynamicProcessRouting(request)) {
-      return false;
+    if (!supportsDynamicProcessRouting(request.routingMode, request.routingRules)) {
+      return Promise.resolve(false);
     }
-    if (generation !== undefined && generation !== this.processRoutingGeneration) {
-      return false;
-    }
-    const directDomainSuffixes = normalizeProcessRouteDirectDomains(request.routingDirectDomains);
-    const signatureBeforeLearning = this.processRoutingLastSignature;
-    const literalIpsBeforeLearning = new Set(this.processRoutingIps.keys());
-
-    try {
-      const processNames = enabledProcessRuleNames(request.routingRules);
-      this.resetProcessRoutingIpsForTargets(processNames);
-      const connections = await this.processConnectionsProvider(processNames);
-      if (generation !== undefined && generation !== this.processRoutingGeneration) {
-        return false;
-      }
-      const now = Date.now();
-      const routeTtlMs = this.currentProcessRoutingTtlMs();
-      const expiresBefore = now - routeTtlMs;
-      // A learned destination can never be observed a second time: as soon as it
-      // enters the PAC the application connects to the loopback proxy instead of
-      // the real remote address, so Get-NetTCPConnection stops reporting it and
-      // nothing re-populates its Windows DNS cache entry. Expiring such a route
-      // on its original TTL therefore dropped a destination the application was
-      // still actively using back to DIRECT, which is why process-name routing
-      // only ever covered part of an application's traffic. Renew every retained
-      // route on each successful discovery cycle instead: routes live for the
-      // connected session (bounded by the LRU caps, and cleared by stopRouting()
-      // or a routing-target change) and only decay once discovery itself has
-      // been failing for a full TTL.
-      const nextIps = new Map(
-        [...this.processRoutingIps]
-          .filter((entry) => entry[1] >= expiresBefore)
-          .map(([address]) => [address, now] as const)
-      );
-      const nextDomains = new Map(
-        [...this.processRoutingDomains]
-          .filter((entry) =>
-            entry[1] > now && !isDomainCoveredByDirectDomainSuffixes(entry[0], directDomainSuffixes)
-          )
-          .map(([domain]) => [domain, now + routeTtlMs] as const)
-      );
-      const activeProfileCoveredAddresses = new Map(
-        [...this.processRoutingProfileCoveredAddresses]
-          .filter((entry) => entry[1] > now)
-          .map(([address]) => [address, now + routeTtlMs] as const)
-      );
-      const nextSessionLeases = new Map(this.processRoutingSessionLeases);
-      const knownAddressesBeforeObservation = new Set([
-        ...nextIps.keys(),
-        ...activeProfileCoveredAddresses.keys(),
-        ...nextSessionLeases.keys()
-      ]);
-      const observedAddresses = new Set<string>();
-      const unprofiledAddresses = new Set<string>();
-      const processOwnersByAddress = new Map<string, Set<string>>();
-      const profilePatternsByAddress = new Map<string, Set<string>>();
-      const profilePatternsByProcess = new Map(
-        [...processNames].map((processName) => [processName, processRouteDomainHints([processName])] as const)
-      );
-      let matchedConnections = 0;
-      for (const connection of connections) {
-        const processName = normalizeWindowsProcessName(connection.processName);
-        if (processNames.has(processName)) {
-          matchedConnections += 1;
-          observedAddresses.add(connection.remoteAddress);
-          recordBoundedProcessRouteIp(nextIps, connection.remoteAddress, now);
-          const owners = processOwnersByAddress.get(connection.remoteAddress) ?? new Set<string>();
-          owners.add(processName);
-          processOwnersByAddress.set(connection.remoteAddress, owners);
-          const profilePatterns = profilePatternsByProcess.get(processName) ?? new Set<string>();
-          if (profilePatterns.size === 0) {
-            unprofiledAddresses.add(connection.remoteAddress);
-          } else {
-            const addressPatterns = profilePatternsByAddress.get(connection.remoteAddress) ?? new Set<string>();
-            for (const pattern of profilePatterns) {
-              addressPatterns.add(pattern);
-            }
-            profilePatternsByAddress.set(connection.remoteAddress, addressPatterns);
-          }
-        }
-      }
-      this.processRoutingLastMatchedConnections = matchedConnections;
-
-      for (const [address, lease] of [...nextSessionLeases]) {
-        if (isDomainCoveredByDirectDomainSuffixes(lease.domain, directDomainSuffixes)) {
-          nextSessionLeases.delete(address);
-        }
-      }
-
-      for (const address of [...activeProfileCoveredAddresses.keys()]) {
-        if (profilePatternsByAddress.has(address) && !unprofiledAddresses.has(address)) {
-          activeProfileCoveredAddresses.set(address, now + routeTtlMs);
-          nextIps.delete(address);
-        }
-      }
-
-      // Publish the literal-IP fallback before the optional DNS cache query.
-      // Dynamic process IPs intentionally do not resolve PAC hostnames, so this
-      // fast path only helps clients that give PAC an already-resolved IP. DNS
-      // enrichment below remains the required hostname-routing phase.
-      const literalIpSnapshotChanged = this.commitProcessRoutingSnapshot(
-        nextIps,
-        nextDomains,
-        activeProfileCoveredAddresses,
-        nextSessionLeases
-      );
-      const literalIpSetChanged =
-        literalIpsBeforeLearning.size !== nextIps.size ||
-        [...literalIpsBeforeLearning].some((address) => !nextIps.has(address));
-      if (
-        directDomainSuffixes.size === 0 &&
-        literalIpSnapshotChanged &&
-        literalIpSetChanged &&
-        publishLiteralIpSnapshot
-      ) {
-        await publishLiteralIpSnapshot(this.processRoutingLastSignature);
-        if (generation !== undefined && generation !== this.processRoutingGeneration) {
-          return false;
-        }
-      }
-
-      const dnsLookupAddresses = [...observedAddresses].filter((address) => {
-        const nextLookupAt = this.processRoutingDnsLookupAt.get(address);
-        return nextLookupAt === undefined || now >= nextLookupAt;
-      });
-      if (dnsLookupAddresses.length > 0) {
-        for (const address of dnsLookupAddresses) {
-          const failures = Math.min((this.processRoutingDnsLookupFailures.get(address) ?? 0) + 1, 16);
-          const retryDelay = Math.min(
-            PROCESS_ROUTE_DNS_REFRESH_MS,
-            PROCESS_ROUTE_DNS_RETRY_BASE_MS * 2 ** Math.min(failures - 1, 5)
-          );
-          recordBoundedProcessRouteIp(this.processRoutingDnsLookupFailures, address, failures);
-          recordBoundedProcessRouteIp(this.processRoutingDnsLookupAt, address, now + retryDelay);
-        }
-        try {
-          const dnsEntries = await this.processDnsEntriesProvider(dnsLookupAddresses);
-          if (generation !== undefined && generation !== this.processRoutingGeneration) {
-            return false;
-          }
-          const configuredDomainPatterns = request.routingRules
-            .filter((rule) => rule.enabled && rule.type === "domain" && validateRoutingRuleValue(rule.type, rule.value).ok)
-            .map((rule) => normalizeRuleValue("domain", rule.value));
-          const stableDomainPatterns = [...this.processRoutingHintDomains, ...configuredDomainPatterns];
-          const addressesWithDnsEntries = new Set<string>();
-          const profileCoveredAddresses = new Set<string>();
-          const validDnsEntriesByTuple = new Map<string, WindowsDnsCacheEntry>();
-          for (const entry of dnsEntries) {
-            const domain = normalizeRuleValue("domain", entry.domain).replace(/\.$/u, "");
-            if (
-              !observedAddresses.has(entry.address) ||
-              !Number.isSafeInteger(entry.ttlSeconds) ||
-              entry.ttlSeconds <= 0 ||
-              domain.startsWith("*.") ||
-              !validateRoutingRuleValue("domain", domain).ok
-            ) {
-              continue;
-            }
-            const key = `${entry.address}\u0000${domain}`;
-            const existing = validDnsEntriesByTuple.get(key);
-            if (!existing || entry.ttlSeconds > existing.ttlSeconds) {
-              validDnsEntriesByTuple.set(key, { ...entry, domain });
-            }
-          }
-          const validDnsEntries = [...validDnsEntriesByTuple.values()];
-          const exactDomainsByAddress = new Map<string, Set<string>>();
-          for (const entry of validDnsEntries) {
-            addressesWithDnsEntries.add(entry.address);
-            const domains = exactDomainsByAddress.get(entry.address) ?? new Set<string>();
-            domains.add(entry.domain);
-            exactDomainsByAddress.set(entry.address, domains);
-            const profilePatterns = profilePatternsByAddress.get(entry.address);
-            if (profilePatterns && isDomainCoveredByRoutePatterns(entry.domain, profilePatterns)) {
-              profileCoveredAddresses.add(entry.address);
-            }
-          }
-          const dnsRefreshAtByAddress = new Map<string, number>();
-          for (const entry of validDnsEntries) {
-            const ttlMs = Math.min(routeTtlMs, PROCESS_ROUTE_DNS_REFRESH_MS, entry.ttlSeconds * 1000);
-            const refreshAt = now + Math.max(PROCESS_ROUTE_DNS_MIN_REFRESH_MS, ttlMs);
-            const currentRefreshAt = dnsRefreshAtByAddress.get(entry.address);
-            if (currentRefreshAt === undefined || refreshAt < currentRefreshAt) {
-              dnsRefreshAtByAddress.set(entry.address, refreshAt);
-            }
-          }
-
-          const promotedSessionLeaseAddresses = new Set<string>();
-          for (const address of dnsLookupAddresses) {
-            const owners = processOwnersByAddress.get(address);
-            const soleProcessName = owners?.size === 1 ? owners.values().next().value as string | undefined : undefined;
-            const exactDomains = exactDomainsByAddress.get(address) ?? new Set<string>();
-            const exactDomain = exactDomains.size === 1
-              ? exactDomains.values().next().value as string | undefined
-              : undefined;
-            const hasProfileEvidence =
-              profilePatternsByAddress.has(address) ||
-              profileCoveredAddresses.has(address) ||
-              activeProfileCoveredAddresses.has(address);
-            const isHighConfidenceEvidence = Boolean(
-              soleProcessName &&
-              exactDomain &&
-              (profilePatternsByProcess.get(soleProcessName)?.size ?? 0) === 0 &&
-              !hasProfileEvidence &&
-              isAutoLearnableRemoteAddress(address) &&
-              !isDomainCoveredByDirectDomainSuffixes(exactDomain, directDomainSuffixes)
-            );
-            if (
-              isHighConfidenceEvidence &&
-              soleProcessName &&
-              exactDomain &&
-              !knownAddressesBeforeObservation.has(address) &&
-              nextSessionLeases.size < MAX_PROCESS_ROUTE_SESSION_LEASES
-            ) {
-              nextSessionLeases.set(address, {
-                processName: soleProcessName,
-                address,
-                domain: exactDomain,
-                firstObservedAt: now
-              });
-              promotedSessionLeaseAddresses.add(address);
-            }
-          }
-
-          for (const entry of validDnsEntries) {
-            const profilePatterns = profilePatternsByAddress.get(entry.address);
-            const restrictToReviewedProfile =
-              (profileCoveredAddresses.has(entry.address) || activeProfileCoveredAddresses.has(entry.address)) &&
-              !unprofiledAddresses.has(entry.address);
-            if (
-              restrictToReviewedProfile &&
-              (!profilePatterns || !isDomainCoveredByRoutePatterns(entry.domain, profilePatterns))
-            ) {
-              continue;
-            }
-            if (!isDomainCoveredByRoutePatterns(
-              entry.domain,
-              stableDomainPatterns
-            ) && !isDomainCoveredByDirectDomainSuffixes(entry.domain, directDomainSuffixes)) {
-              // The record TTL only says when the Windows DNS cache entry has to
-              // be re-read (dnsRefreshAtByAddress above); it says nothing about
-              // how long the application keeps using the hostname. Binding the
-              // PAC route to it expired CDN/API hosts after a few tens of
-              // seconds, so route on the process-route TTL and let the renewal
-              // above keep it alive for the session.
-              recordBoundedProcessRouteDomain(nextDomains, entry.domain, now + routeTtlMs);
-            }
-          }
-          for (const address of addressesWithDnsEntries) {
-            const refreshAt = dnsRefreshAtByAddress.get(address) ?? now + PROCESS_ROUTE_DNS_RETRY_BASE_MS;
-            recordBoundedProcessRouteIp(this.processRoutingDnsLookupAt, address, refreshAt);
-            this.processRoutingDnsLookupFailures.delete(address);
-          }
-          for (const address of promotedSessionLeaseAddresses) {
-            recordBoundedProcessRouteIp(
-              this.processRoutingDnsLookupAt,
-              address,
-              now + PROCESS_ROUTE_DNS_RETRY_BASE_MS
-            );
-          }
-          for (const address of profileCoveredAddresses) {
-            recordBoundedProcessRouteIp(
-              activeProfileCoveredAddresses,
-              address,
-              now + routeTtlMs
-            );
-            if (!unprofiledAddresses.has(address)) {
-              nextIps.delete(address);
-            }
-          }
-          if (addressesWithDnsEntries.size > 0) {
-            this.processRoutingDnsWarningEmitted = false;
-          }
-        } catch (error) {
-          for (const address of dnsLookupAddresses) {
-            if (nextSessionLeases.has(address) && observedAddresses.has(address)) {
-              recordBoundedProcessRouteIp(nextIps, address, now);
-            }
-          }
-          if (!this.processRoutingDnsWarningEmitted) {
-            this.processRoutingDnsWarningEmitted = true;
-            this.appendDiagnostic(
-              "warning",
-              `Process-name DNS enrichment failed; IP fallback remains active: ${error instanceof Error ? error.message : String(error)}`
-            );
-          }
-        }
-      }
-
-      this.commitProcessRoutingSnapshot(
-        nextIps,
-        nextDomains,
-        activeProfileCoveredAddresses,
-        nextSessionLeases
-      );
-      return this.processRoutingLastSignature !== signatureBeforeLearning;
-    } catch (error) {
-      this.processRoutingLastMatchedConnections = 0;
-      this.processRoutingDomains = new Map(
-        [...this.processRoutingDomains].filter((entry) =>
-          !isDomainCoveredByDirectDomainSuffixes(entry[0], directDomainSuffixes)
-        )
-      );
-      this.processRoutingSessionLeases = new Map(
-        [...this.processRoutingSessionLeases].filter((entry) =>
-          !isDomainCoveredByDirectDomainSuffixes(entry[1].domain, directDomainSuffixes)
-        )
-      );
-      const changed = this.pruneExpiredProcessRoutingState();
-      if (!this.processRoutingWarningEmitted) {
-        this.processRoutingWarningEmitted = true;
-        this.appendDiagnostic(
-          "warning",
-          `Process-name routing monitor failed: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-      return changed;
-    }
-  }
-
-  private commitProcessRoutingSnapshot(
-    ips: ReadonlyMap<string, number>,
-    domains: ReadonlyMap<string, number>,
-    profileCoveredAddresses: ReadonlyMap<string, number>,
-    sessionLeases: ReadonlyMap<string, ProcessRouteSessionEvidence>
-  ): boolean {
-    const signature = buildProcessRouteSignature(
-      ips.keys(),
-      [
-        ...this.processRoutingHintDomains,
-        ...domains.keys(),
-        ...[...sessionLeases.values()].map((lease) => lease.domain)
-      ]
+    return this.processRoutes.learn(
+      request.routingRules,
+      request.routingDirectDomains,
+      () => generation !== undefined && generation !== this.processRoutingGeneration,
+      publishLiteralIpSnapshot
     );
-    const changed = signature !== this.processRoutingLastSignature;
-    // Clone the phase-local maps so DNS enrichment cannot mutate the
-    // published interim snapshot while its PAC application is in flight.
-    this.processRoutingIps = new Map(ips);
-    this.processRoutingDomains = new Map(domains);
-    this.processRoutingProfileCoveredAddresses = new Map(profileCoveredAddresses);
-    this.processRoutingSessionLeases = new Map(sessionLeases);
-    this.processRoutingLastSignature = signature;
-    return changed;
   }
 
   private setStatus(update: Partial<RuntimeStatus>): void {
@@ -2336,30 +2323,6 @@ export class LiveSshServiceBridge implements ServiceBridge {
     if (!sameLocalProxy(derived.localProxy, this.status.localProxy) || derived.tunActive !== this.status.tunActive) {
       this.setStatus({});
     }
-  }
-
-  private currentProcessRoutingRefreshIntervalMs(): number {
-    try {
-      const requested = this.processRoutingRefreshIntervalMs();
-      return Number.isFinite(requested) && requested >= 1_000
-        ? Math.min(requested, 10 * 60 * 1000)
-        : PROCESS_ROUTE_REFRESH_INTERVAL_MS;
-    } catch {
-      return PROCESS_ROUTE_REFRESH_INTERVAL_MS;
-    }
-  }
-
-  private nextProcessRoutingRefreshIntervalMs(): number {
-    const discoveryDelay = PROCESS_ROUTE_DISCOVERY_DELAYS_MS[this.processRoutingDiscoveryStep];
-    if (discoveryDelay !== undefined) {
-      this.processRoutingDiscoveryStep += 1;
-      return discoveryDelay;
-    }
-    return this.currentProcessRoutingRefreshIntervalMs();
-  }
-
-  private currentProcessRoutingTtlMs(): number {
-    return Math.max(PROCESS_ROUTE_TTL_MS, this.currentProcessRoutingRefreshIntervalMs() * 3);
   }
 
   private appendDiagnostic(level: DiagnosticsEntry["level"], message: string): void {
@@ -2417,65 +2380,6 @@ export class LiveSshServiceBridge implements ServiceBridge {
   private emit(event: ServiceEvent): void {
     this.events.emit("event", event);
   }
-
-  private currentProcessRoutingIps(): Set<string> {
-    return new Set(this.processRoutingIps.keys());
-  }
-
-  private currentProcessRoutingDomains(): Set<string> {
-    return new Set([
-      ...this.processRoutingHintDomains,
-      ...this.processRoutingDomains.keys(),
-      ...[...this.processRoutingSessionLeases.values()].map((lease) => lease.domain)
-    ]);
-  }
-
-  private pruneExpiredProcessRoutingState(now = Date.now()): boolean {
-    const expiresBefore = now - this.currentProcessRoutingTtlMs();
-    const nextIps = new Map([...this.processRoutingIps].filter((entry) => entry[1] >= expiresBefore));
-    const nextDomains = new Map([...this.processRoutingDomains].filter((entry) => entry[1] > now));
-    const activeProfileCoveredAddresses = new Map(
-      [...this.processRoutingProfileCoveredAddresses].filter((entry) => entry[1] > now)
-    );
-    const nextSignature = buildProcessRouteSignature(
-      nextIps.keys(),
-      [
-        ...this.processRoutingHintDomains,
-        ...nextDomains.keys(),
-        ...[...this.processRoutingSessionLeases.values()].map((lease) => lease.domain)
-      ]
-    );
-    const changed = nextSignature !== this.processRoutingLastSignature;
-    this.processRoutingIps = nextIps;
-    this.processRoutingDomains = nextDomains;
-    this.processRoutingProfileCoveredAddresses = activeProfileCoveredAddresses;
-    this.processRoutingLastSignature = nextSignature;
-    return changed;
-  }
-
-  private resetProcessRoutingIpsForTargets(processNames: Set<string>): void {
-    const targetSignature = [...processNames].sort().join(",");
-    if (targetSignature === this.processRoutingTargetSignature) {
-      return;
-    }
-    this.processRoutingTargetSignature = targetSignature;
-    this.processRoutingIps.clear();
-    this.processRoutingHintDomains.clear();
-    this.processRoutingDomains.clear();
-    this.processRoutingDnsLookupAt.clear();
-    for (const domain of processRouteDomainHints(processNames)) {
-      this.processRoutingHintDomains.add(domain);
-    }
-    this.processRoutingDnsLookupFailures.clear();
-    this.processRoutingProfileCoveredAddresses.clear();
-    this.processRoutingSessionLeases.clear();
-    this.processRoutingLastSignature = "";
-    this.processRoutingAppliedSignature = "";
-    this.processRoutingApplyPending = false;
-    this.processRoutingLastMatchedConnections = 0;
-    this.processRoutingWarningEmitted = false;
-    this.processRoutingDnsWarningEmitted = false;
-  }
 }
 
 function buildLocalRoutingContext(request: ConnectRequest): LocalRoutingContext {
@@ -2501,6 +2405,7 @@ const CLEARED_SESSION_STATUS = {
   activeConfigName: undefined,
   activeTarget: undefined,
   observedHostKeyFingerprint: undefined,
+  observedHostKeyType: undefined,
   connectedAt: undefined,
   reconnectAttempt: 0,
   realTunnelAvailable: false
@@ -2509,6 +2414,19 @@ const CLEARED_SESSION_STATUS = {
 /** `host:port`, with an IPv6 literal in brackets so the port stays unambiguous. */
 export function formatServiceTarget(host: string, port: number): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+/** Reads a {@link formatServiceTarget} string back; undefined for anything else. */
+export function parseServiceTarget(target: string | undefined): { host: string; port: number } | undefined {
+  const match = /^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$/u.exec(target?.trim() ?? "");
+  if (!match) {
+    return undefined;
+  }
+  const port = Number(match[3]);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    return undefined;
+  }
+  return { host: match[1] ?? match[2], port };
 }
 
 export function sameLocalProxy(left: LocalProxyEndpoint | undefined, right: LocalProxyEndpoint | undefined): boolean {
@@ -2536,6 +2454,56 @@ function abortedTunnelWaitError(): Error {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function withFinalStop(value: string): string {
+  const trimmed = value.trim();
+  return /[.!?]$/u.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+type ExpectedHostKey = {
+  fingerprint?: string;
+  /** Where the expectation comes from; undefined when nothing is expected yet. */
+  source?: "pinned" | "trusted" | "session";
+};
+
+/**
+ * Rewords a host-key mismatch against a key Shadow trusted by itself - on the
+ * first connection, or earlier in this session - so the user learns what
+ * changed and what to do. The wording keeps "host key" and "fingerprint":
+ * reconnect halting, attention and the connect screen match on them. A
+ * mismatch against a pinned fingerprint is already reported as such.
+ */
+function hostKeyTrustError(error: unknown, hostKey: ExpectedHostKey, config: SshConfig): Error | undefined {
+  if (hostKey.source !== "trusted" && hostKey.source !== "session") {
+    return undefined;
+  }
+  const mismatch = error instanceof SshHostKeyMismatchError;
+  if (!mismatch && !/fingerprint mismatch/iu.test(errorMessage(error))) {
+    return undefined;
+  }
+  const presented = mismatch
+    ? error.presentedHostKeys.map((key) => `${key.fingerprint} (${key.keyType})`).join(", ")
+    : undefined;
+  const target = formatServiceTarget(config.host, config.port);
+  // Nothing was saved for a key this session verified, so the message says
+  // where the expectation came from; the connect screen words it to match.
+  const expected = hostKey.source === "trusted"
+    ? `the key Shadow trusted on its first connection to ${target}`
+    : `the key ${target} presented earlier in this session`;
+  const failure = new Error(
+    `SSH server host key does not match ${expected}: expected ${hostKey.fingerprint ?? "the trusted key"}${presented ? `, got ${presented}` : ""}. Shadow stopped so nothing is sent to a server that may be an impostor. If the server's key was changed on purpose, paste the new fingerprint into the server's Fingerprint field.`
+  );
+  failure.name = "SshHostKeyChangedError";
+  return failure;
+}
+
+function isHostKeyMismatch(error: unknown): boolean {
+  return error instanceof SshHostKeyMismatchError || /fingerprint mismatch/iu.test(errorMessage(error));
+}
+
+function isHostKeyFailure(error: unknown): boolean {
+  return error instanceof SshHostKeyMismatchError || /host key|fingerprint/iu.test(errorMessage(error));
 }
 
 function isAuthenticationFailure(error: unknown): boolean {
@@ -2571,125 +2539,3 @@ function isNonRetryableConnectError(error: unknown): boolean {
   );
 }
 
-export function describeUnsupportedSelectedRouting(request: ConnectRequest, platform: NodeJS.Platform = process.platform): string | undefined {
-  void request;
-  void platform;
-  return undefined;
-}
-
-export function buildSelectedRulesWithProcessIps(
-  rules: RoutingRule[],
-  processIps: ReadonlySet<string>,
-  processDomains: ReadonlySet<string> = new Set()
-): RoutingRule[] {
-  if (processIps.size === 0 && processDomains.size === 0) {
-    return rules;
-  }
-
-  const existingIpRules = new Set(
-    rules.filter((rule) => rule.enabled && rule.type === "ip").map((rule) => normalizeRuleValue("ip", rule.value).toLowerCase())
-  );
-  const existingDomainRules = new Set(
-    rules.filter((rule) => rule.enabled && rule.type === "domain").map((rule) => normalizeRuleValue("domain", rule.value))
-  );
-  const now = new Date(0).toISOString();
-  const dynamicDomainRules = [...processDomains]
-    .map((domain) => normalizeRuleValue("domain", domain))
-    .filter((domain) => validateRoutingRuleValue("domain", domain).ok)
-    .filter((domain) => !existingDomainRules.has(domain))
-    .sort()
-    .map<RoutingRule>((domain) => ({
-      id: `process-domain:${domain}`,
-      type: "domain",
-      value: domain,
-      enabled: true,
-      createdAt: now,
-      updatedAt: now
-    }));
-  const dynamicIpRules = [...processIps]
-    .map((ip) => ip.trim())
-    .filter((ip) => validateRoutingRuleValue("ip", ip).ok)
-    .filter((ip) => !existingIpRules.has(ip.toLowerCase()))
-    .sort()
-    .map<RoutingRule>((ip) => ({
-      id: `process-ip:${ip}`,
-      type: "ip",
-      value: ip,
-      enabled: true,
-      createdAt: now,
-      updatedAt: now
-    }));
-
-  return [...rules, ...dynamicDomainRules, ...dynamicIpRules];
-}
-
-export const MAX_LEARNED_PROCESS_ROUTE_IPS = 2048;
-export const MAX_LEARNED_PROCESS_ROUTE_DOMAINS = 512;
-
-export function recordBoundedProcessRouteIp(
-  entries: Map<string, number>,
-  ip: string,
-  observedAt: number,
-  maximum = MAX_LEARNED_PROCESS_ROUTE_IPS
-): void {
-  if (maximum <= 0) {
-    entries.clear();
-    return;
-  }
-  // Refresh insertion order so actively used destinations survive eviction.
-  entries.delete(ip);
-  entries.set(ip, observedAt);
-  while (entries.size > maximum) {
-    const oldest = entries.keys().next().value as string | undefined;
-    if (!oldest) {
-      break;
-    }
-    entries.delete(oldest);
-  }
-}
-
-export function recordBoundedProcessRouteDomain(
-  entries: Map<string, number>,
-  domain: string,
-  expiresAt: number,
-  maximum = MAX_LEARNED_PROCESS_ROUTE_DOMAINS
-): void {
-  const normalized = normalizeRuleValue("domain", domain).replace(/\.$/u, "");
-  if (normalized.startsWith("*.") || !validateRoutingRuleValue("domain", normalized).ok) {
-    return;
-  }
-  if (maximum <= 0) {
-    entries.clear();
-    return;
-  }
-  entries.delete(normalized);
-  entries.set(normalized, expiresAt);
-  while (entries.size > maximum) {
-    const oldest = entries.keys().next().value as string | undefined;
-    if (!oldest) {
-      break;
-    }
-    entries.delete(oldest);
-  }
-}
-
-export function buildProcessRouteSignature(processIps: Iterable<string>, processDomains: Iterable<string>): string {
-  return [
-    `ips:${[...processIps].sort().join(",")}`,
-    `domains:${[...processDomains].sort().join(",")}`
-  ].join("|");
-}
-
-function supportsDynamicProcessRouting(request: ConnectRequest, platform: NodeJS.Platform = process.platform): boolean {
-  return platform === "win32" && request.routingMode === "selected-rules" && enabledProcessRuleNames(request.routingRules).size > 0;
-}
-
-function enabledProcessRuleNames(rules: RoutingRule[]): Set<string> {
-  return new Set(
-    rules
-      .filter((rule) => rule.enabled && rule.type === "process.name")
-      .filter((rule) => validateRoutingRuleValue(rule.type, rule.value).ok)
-      .map((rule) => normalizeWindowsProcessName(normalizeRuleValue("process.name", rule.value)))
-      .filter(Boolean)
-  );
-}

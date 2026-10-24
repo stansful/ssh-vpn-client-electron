@@ -136,12 +136,42 @@ func TestSniffHTTPHost(t *testing.T) {
 	if name, more := sniffClientName(bare); name != "" || more {
 		t.Fatalf("bare request: got %q needMore=%v", name, more)
 	}
-	// A Host carrying an address is not a name; a single label is not one a rule could match.
-	for _, host := range []string{"192.168.1.10", "[::1]:80", "localhost", "intranet"} {
+	// A Host carrying an address is not a name.
+	for _, host := range []string{"192.168.1.10", "[::1]:80"} {
 		data := []byte("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n")
 		if name, _ := sniffClientName(data); name != "" {
 			t.Fatalf("host %q reported as name %q", host, name)
 		}
+	}
+	// A single label is: it is what keeps an intranet flow on the local
+	// network (policy step 2).
+	for host, want := range map[string]string{"localhost": "localhost", "Intranet:8080": "intranet", "printer.": "printer"} {
+		data := []byte("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n")
+		if name, _ := sniffClientName(data); name != want {
+			t.Fatalf("host %q reported as name %q, want %q", host, name, want)
+		}
+	}
+	if name, _ := sniffClientName(clientHelloFor(t, "wiki", tls.VersionTLS13)); name != "wiki" {
+		t.Fatalf("single-label SNI reported as %q", name)
+	}
+}
+
+func TestSniffedNameOfARequestToAProxyIsNotTheServers(t *testing.T) {
+	for request, own := range map[string]bool{
+		"GET /index.html HTTP/1.1\r\nHost: example.org\r\n\r\n":             true,
+		"OPTIONS * HTTP/1.1\r\nHost: example.org\r\n\r\n":                   true,
+		"CONNECT example.org:443 HTTP/1.1\r\nHost: example.org:443\r\n\r\n": false,
+		"GET http://example.org/a HTTP/1.1\r\nHost: example.org\r\n\r\n":    false,
+		"GET https://example.org/a HTTP/1.1\r\n\r\n":                        false,
+		"GET / HTTP/1.1": false,
+		"":               false,
+	} {
+		if got := namesConnectedServer([]byte(request)); got != own {
+			t.Fatalf("%q: namesConnectedServer=%v, want %v", request, got, own)
+		}
+	}
+	if !namesConnectedServer(clientHelloFor(t, "example.org", tls.VersionTLS13)) {
+		t.Fatal("a ClientHello's server name is the connected server's own")
 	}
 }
 
@@ -215,7 +245,11 @@ func TestPolicyNamesMatter(t *testing.T) {
 		config Config
 		want   bool
 	}{
-		{"proxy-all", Config{Mode: routing.ModeProxyAll, Rules: []routing.Rule{domainRule}}, false},
+		{"proxy-all", Config{Mode: routing.ModeProxyAll}, false},
+		// A domain rule can claim a flow to the local network, which wins over it.
+		{"proxy-all with a domain rule", Config{Mode: routing.ModeProxyAll, Rules: []routing.Rule{domainRule}}, true},
+		{"proxy-all with an address rule", Config{Mode: routing.ModeProxyAll, Rules: []routing.Rule{{ID: "ip", Type: routing.RuleIP, Value: "10.0.0.0/8", Enabled: true}}}, false},
+		{"proxy-all with the direct list", Config{Mode: routing.ModeProxyAll, DirectDomains: []string{"ru"}}, true},
 		{"domain rule", Config{Mode: routing.ModeSelectedRules, Rules: []routing.Rule{domainRule}}, true},
 		{"process rule only", Config{Mode: routing.ModeSelectedRules, Rules: []routing.Rule{processRule}}, false},
 		{"proxy list only", Config{Mode: routing.ModeSelectedRules, ProxyDomains: []string{"ua"}}, true},

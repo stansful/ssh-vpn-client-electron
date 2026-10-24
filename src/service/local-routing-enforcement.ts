@@ -1,10 +1,8 @@
+import { lookup } from "node:dns/promises";
 import { openDirectEgressChannel } from "../core/network/direct-tcp-channel.js";
 import type { DirectTcpIpChannel, DirectTcpIpTarget } from "../core/network/local-tcp-proxy.js";
-import { parseIpAddress } from "../core/routing/ip-address.js";
-import {
-  isDomainCoveredByDirectDomainSuffixes,
-  normalizeProcessRouteDirectDomains
-} from "../core/routing/process-route-domains.js";
+import { parseIpAddressUnmapped, unmapIpv4MappedAddress } from "../core/routing/ip-address.js";
+import { RoutingMatcher } from "../core/routing/routing-matcher.js";
 import { TrafficPolicy } from "../core/routing/traffic-policy.js";
 import { normalizeWindowsProcessName } from "../core/network/windows-process-connections.js";
 import type { RoutingMode, RoutingRule } from "../shared/types.js";
@@ -33,6 +31,27 @@ export interface LocalRoutingDecision {
   processName?: string;
 }
 
+export interface LocalRoutingEnforcerOptions {
+  /**
+   * Resolves a hostname to its addresses, for IP rules. Defaults to the
+   * system resolver; injected by tests.
+   */
+  resolveHost?: (host: string) => Promise<string[]>;
+  /** Injection seam for tests; defaults to the wall clock. */
+  now?: () => number;
+}
+
+/** How long a resolved hostname is reused for IP-rule matching. */
+export const HOST_RESOLUTION_TTL_MS = 30_000;
+/** How long a failed or empty resolution is remembered, so a dead name is not asked per socket. */
+const HOST_RESOLUTION_FAILURE_TTL_MS = 5_000;
+/** Longest a connection waits on the resolver before it is routed without the answer. */
+export const HOST_RESOLUTION_TIMEOUT_MS = 2_000;
+/** Bounds the resolution cache. */
+const MAX_RESOLVED_HOSTS = 512;
+/** Bounds how many addresses of one name are matched. */
+const MAX_RESOLVED_ADDRESSES = 16;
+
 /**
  * Decides, per connection, whether traffic belongs in the tunnel.
  *
@@ -46,15 +65,19 @@ export interface LocalRoutingDecision {
  * Both transports share this class so their routing behaviour cannot diverge.
  */
 export class LocalRoutingEnforcer {
-  private policyCache: {
-    context: LocalRoutingContext;
-    policy: TrafficPolicy;
-    processNames: ReadonlySet<string>;
-    proxyListSuffixes: ReadonlySet<string>;
-    directListSuffixes: ReadonlySet<string>;
-  } | undefined;
+  private policyCache: CompiledLocalRouting | undefined;
+  private userRulesCache: { rules: RoutingRule[]; matcher: RoutingMatcher; hasIpRules: boolean } | undefined;
+  private readonly resolvedHosts = new Map<string, ResolvedHost>();
+  private readonly resolveHost: (host: string) => Promise<string[]>;
+  private readonly now: () => number;
 
-  constructor(private readonly attribution: ProcessAttribution | undefined) {}
+  constructor(
+    private readonly attribution: ProcessAttribution | undefined,
+    options: LocalRoutingEnforcerOptions = {}
+  ) {
+    this.resolveHost = options.resolveHost ?? resolveHostAddresses;
+    this.now = options.now ?? (() => Date.now());
+  }
 
   /**
    * Reports whether this connection can enforce process rules locally. The
@@ -100,16 +123,31 @@ export class LocalRoutingEnforcer {
   }
 
   /**
-   * Order matters here.
+   * The shared routing order, the same on every path (see TrafficPolicy):
    *
-   * A `process.name` rule means "route everything this application sends", so
-   * it is evaluated before the direct list and cannot be pre-empted by it. That
-   * is also why the direct list is applied here instead of in the PAC: the PAC
-   * runs before the listener and has no process context, so a direct-list entry
-   * there would silently carve holes in a selected application's traffic.
+   * 1. the transport's own endpoint stays direct - routing it into the tunnel
+   *    it carries would deadlock the transport;
+   * 2. an enabled domain or IP rule proxies, a private range or a `.local`
+   *    name included: an explicit rule wins;
+   * 3. a local or private destination no rule named stays direct;
+   * 4. a `process.name` rule for the owning process proxies;
+   * 5. the direct list keeps a destination direct;
+   * 6. proxy-all proxies;
+   * 7. the proxy list proxies;
+   * 8. anything else goes direct.
    *
-   * The transport's own endpoint stays excluded regardless, because routing it
-   * into the tunnel it carries would deadlock the transport.
+   * A `process.name` rule means "route everything this application sends to
+   * the internet", so it comes before the direct list and cannot be
+   * pre-empted by it, and after the local network, which it does not pull
+   * into the tunnel.
+   *
+   * An IP rule also matches a hostname through the addresses it resolves to,
+   * as it does in the PAC and at the TUN adapter: a connection here arrives
+   * by name, and matching IP rules against literal addresses only made a
+   * single app rule silently switch every IP rule off for browser traffic.
+   * The resolver is asked only when the answer would otherwise be direct:
+   * every rule proxies, so for a connection a process rule or a list already
+   * tunnels the lookup could change only the reason logged.
    */
   async decide(
     context: LocalRoutingContext,
@@ -117,39 +155,59 @@ export class LocalRoutingEnforcer {
     originator: { address: string; port: number }
   ): Promise<LocalRoutingDecision> {
     const processName = await this.attribution?.resolveProcessName(originator.port);
-    const { policy, processNames, proxyListSuffixes, directListSuffixes } = this.compile(context);
+    const compiled = this.compile(context);
     const destination = describeDestination(target.host);
-    const decision = policy.decide("tcp", {
-      ...destination,
-      destinationPort: target.port,
-      processName
-    });
+    // The owning process is matched below, with the `.exe` normalisation the
+    // rules are stored with, rather than inside the policy.
+    const decision = compiled.policy.decide("tcp", { ...destination, destinationPort: target.port });
+    const local = decision.blockedReason === "local-destination";
 
-    if (decision.blockedReason) {
+    if (decision.blockedReason && !local) {
       return { shouldProxy: false, reason: decision.blockedReason, processName };
     }
-    if (processName && processNames.has(normalizeWindowsProcessName(processName))) {
+    if (decision.shouldProxy && (decision.reason === "domain" || decision.reason === "ip")) {
+      return { shouldProxy: true, reason: decision.reason, processName };
+    }
+    if (!local && processName && compiled.processNames.has(normalizeWindowsProcessName(processName))) {
       return { shouldProxy: true, reason: "process.name", processName };
     }
     if (decision.shouldProxy) {
       return { shouldProxy: true, reason: decision.reason, processName };
     }
-    // The curated proxy list is not expressible as routing rules - its entries
-    // include bare suffixes such as `.ua` - so it is matched separately with
-    // the domain-or-parent semantics the PAC applies to it.
     if (
       destination.destinationDomain !== undefined &&
-      isDomainCoveredByDirectDomainSuffixes(destination.destinationDomain, proxyListSuffixes)
+      compiled.ipRules !== undefined &&
+      (await this.matchesResolvedAddress(compiled.ipRules, destination.destinationDomain))
     ) {
-      return { shouldProxy: true, reason: "proxy-list", processName };
+      // Step 2 by address: ahead of the local network and the direct list,
+      // as a rule always is.
+      return { shouldProxy: true, reason: "ip", processName };
     }
-    if (
+    return { shouldProxy: false, reason: local ? "local-destination" : decision.reason, processName };
+  }
+
+  /**
+   * Whether an enabled domain or IP rule names `host` - step 2 of the shared
+   * order, a hostname's resolved addresses included. For the SSH listener
+   * where nothing enforces routing per connection: the system proxy or the
+   * TUN adapter has already chosen what reaches it, and the local network it
+   * still keeps direct must give way to a rule that names it.
+   */
+  async matchesUserRule(rules: RoutingRule[], host: string): Promise<boolean> {
+    if (this.userRulesCache?.rules !== rules) {
+      const matcher = new RoutingMatcher("selected-rules", rules);
+      this.userRulesCache = { rules, matcher, hasIpRules: matcher.summary().ipRules > 0 };
+    }
+    const { matcher, hasIpRules } = this.userRulesCache;
+    const destination = describeDestination(host);
+    if (matcher.matchDestination(destination)) {
+      return true;
+    }
+    return (
       destination.destinationDomain !== undefined &&
-      isDomainCoveredByDirectDomainSuffixes(destination.destinationDomain, directListSuffixes)
-    ) {
-      return { shouldProxy: false, reason: "direct-list", processName };
-    }
-    return { shouldProxy: false, reason: decision.reason, processName };
+      hasIpRules &&
+      (await this.matchesResolvedAddress(matcher, destination.destinationDomain))
+    );
   }
 
   /**
@@ -175,25 +233,121 @@ export class LocalRoutingEnforcer {
    * tens of thousands of domains, so rebuilding it per accepted socket would
    * put a full list scan on the connection hot path.
    */
-  private compile(context: LocalRoutingContext): {
-    policy: TrafficPolicy;
-    processNames: ReadonlySet<string>;
-    proxyListSuffixes: ReadonlySet<string>;
-    directListSuffixes: ReadonlySet<string>;
-  } {
+  private compile(context: LocalRoutingContext): CompiledLocalRouting {
     if (this.policyCache?.context !== context) {
+      const ipRules = context.routingRules.filter((rule) => rule.type === "ip");
+      const ipMatcher = new RoutingMatcher("selected-rules", ipRules);
       this.policyCache = {
         context,
         policy: new TrafficPolicy(context.routingMode, context.routingRules, {
-          protectedSshEndpoint: context.protectedEndpoint
+          protectedSshEndpoint: context.protectedEndpoint,
+          proxyListDomains: context.routingProxyDomains ?? [],
+          directListDomains: context.routingDirectDomains ?? []
         }),
         processNames: enabledProcessRuleNames(context.routingRules),
-        proxyListSuffixes: normalizeProcessRouteDirectDomains(context.routingProxyDomains ?? []),
-        directListSuffixes: normalizeProcessRouteDirectDomains(context.routingDirectDomains ?? [])
+        ipRules: ipMatcher.summary().ipRules > 0 ? ipMatcher : undefined
       };
     }
     return this.policyCache;
   }
+
+  /**
+   * Whether any address `host` resolves to falls under an IP rule. The
+   * answer is cached briefly, and a resolver that does not answer in time
+   * counts as no match: the connection is then routed on its name alone
+   * rather than kept waiting.
+   */
+  private async matchesResolvedAddress(ipRules: RoutingMatcher, host: string): Promise<boolean> {
+    const addresses = await this.resolvedAddresses(host);
+    return addresses.some((address) => ipRules.match({ destinationIp: address }).reason === "ip");
+  }
+
+  private resolvedAddresses(host: string): Promise<string[]> {
+    const key = host.trim().toLowerCase().replace(/\.$/u, "");
+    const now = this.now();
+    const cached = this.resolvedHosts.get(key);
+    if (cached && cached.expiresAt > now) {
+      // Refresh its place so names in use survive eviction.
+      this.resolvedHosts.delete(key);
+      this.resolvedHosts.set(key, cached);
+      return cached.addresses;
+    }
+    const entry: ResolvedHost = {
+      expiresAt: now + HOST_RESOLUTION_TTL_MS,
+      addresses: withTimeout(this.resolveHost(key), HOST_RESOLUTION_TIMEOUT_MS)
+        .then((answers) => normalizeResolvedAddresses(answers))
+        .catch(() => [] as string[])
+        .then((addresses) => {
+          if (addresses.length === 0) {
+            entry.expiresAt = Math.min(entry.expiresAt, this.now() + HOST_RESOLUTION_FAILURE_TTL_MS);
+          }
+          return addresses;
+        })
+    };
+    this.resolvedHosts.delete(key);
+    this.resolvedHosts.set(key, entry);
+    while (this.resolvedHosts.size > MAX_RESOLVED_HOSTS) {
+      const oldest = this.resolvedHosts.keys().next().value as string | undefined;
+      if (oldest === undefined) {
+        break;
+      }
+      this.resolvedHosts.delete(oldest);
+    }
+    return entry.addresses;
+  }
+}
+
+interface CompiledLocalRouting {
+  context: LocalRoutingContext;
+  policy: TrafficPolicy;
+  processNames: ReadonlySet<string>;
+  /** The enabled IP rules alone, for matching a hostname's addresses; undefined when there are none. */
+  ipRules: RoutingMatcher | undefined;
+}
+
+interface ResolvedHost {
+  expiresAt: number;
+  /** Shared by every connection to the name while the lookup is running. */
+  addresses: Promise<string[]>;
+}
+
+async function resolveHostAddresses(host: string): Promise<string[]> {
+  const answers = await lookup(host, { all: true, verbatim: true });
+  return answers.map((answer) => answer.address);
+}
+
+function normalizeResolvedAddresses(addresses: string[]): string[] {
+  const normalized: string[] = [];
+  for (const address of addresses) {
+    if (typeof address !== "string" || !parseIpAddressUnmapped(address)) {
+      continue;
+    }
+    const value = unmapIpv4MappedAddress(address.trim());
+    if (!normalized.includes(value)) {
+      normalized.push(value);
+    }
+    if (normalized.length >= MAX_RESOLVED_ADDRESSES) {
+      break;
+    }
+  }
+  return normalized;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    );
+  });
 }
 
 /** How many per-connection decisions of each direction reach the log. */
@@ -284,11 +438,13 @@ export class RoutingDecisionLog {
 /**
  * Splits a proxy target into the descriptor fields the matcher expects. A
  * literal address must be offered as an IP so CIDR rules can match it, while a
- * hostname must stay a domain so it is not parsed as an address.
+ * hostname must stay a domain so it is not parsed as an address. An
+ * IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) is the IPv4 host it carries, so
+ * IPv4 rules, the local ranges and the protected endpoint all see it as one.
  */
 export function describeDestination(host: string): { destinationDomain?: string; destinationIp?: string } {
   const value = host.trim().replace(/^\[|\]$/gu, "");
-  return parseIpAddress(value) ? { destinationIp: value } : { destinationDomain: value };
+  return parseIpAddressUnmapped(value) ? { destinationIp: unmapIpv4MappedAddress(value) } : { destinationDomain: value };
 }
 
 export function hasEnabledProcessRule(rules: RoutingRule[]): boolean {

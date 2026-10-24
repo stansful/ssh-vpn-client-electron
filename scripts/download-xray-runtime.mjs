@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { createReadStream, createWriteStream } from "node:fs";
-import { chmod, copyFile, mkdir, readdir, rename, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { get } from "node:https";
 import path from "node:path";
 import { Transform } from "node:stream";
@@ -10,7 +10,13 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, URL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const releaseApiUrl = "https://api.github.com/repos/XTLS/Xray-core/releases/latest";
+// The release committed under resources/xray and recorded in
+// xray-checksums.json. Never releases/latest: that installs whatever GitHub
+// calls latest today, checked only by the digest the same API response gives,
+// and the config builder targets this release's config shapes.
+const pinnedVersion = "v26.3.27";
+const releaseApiUrl = `https://api.github.com/repos/XTLS/Xray-core/releases/tags/${pinnedVersion}`;
+const checksumsPath = path.join(root, "scripts", "xray-checksums.json");
 const maxRedirects = 5;
 const requestIdleTimeoutMs = 30_000;
 const maxReleaseMetadataBytes = 4 * 1024 * 1024;
@@ -26,9 +32,18 @@ const targetMap = new Map([
 
 const cliArgs = process.argv.slice(2);
 const includeGeoData = cliArgs.includes("--include-geo");
-const targets = parseTargets(cliArgs.filter((arg) => arg !== "--include-geo"));
+const trustDownload = cliArgs.includes("--trust-download");
+const targets = parseTargets(cliArgs.filter((arg) => arg !== "--include-geo" && arg !== "--trust-download"));
+const checksums = await readChecksums();
+// Values recorded for another release say nothing about this one.
+const recorded = checksums.version === pinnedVersion
+  ? { archives: { ...checksums.archives }, executables: { ...checksums.executables } }
+  : { archives: {}, executables: {} };
 const release = await requestJson(releaseApiUrl);
 const version = normalizeReleaseVersion(release.tag_name);
+if (version !== pinnedVersion) {
+  throw new Error(`GitHub returned release ${version} for the pinned tag ${pinnedVersion}.`);
+}
 const cacheDir = path.join(root, ".cache", "xray", version);
 await mkdir(cacheDir, { recursive: true });
 
@@ -43,7 +58,9 @@ for (const target of targets) {
   }
 
   const zipPath = path.join(cacheDir, descriptor.asset);
-  await downloadFile(asset.browser_download_url, zipPath, asset.digest);
+  const archiveSha256 = await downloadFile(asset.browser_download_url, zipPath, asset.digest, recorded.archives[descriptor.asset]);
+  // Checked before extraction, so an archive nothing has verified is never unpacked.
+  const recordedArchive = acceptChecksum("archives", descriptor.asset, archiveSha256);
 
   const extractDir = path.join(cacheDir, target.replace("/", "-"));
   await rm(extractDir, { recursive: true, force: true });
@@ -53,6 +70,13 @@ for (const target of targets) {
   const executablePath = await findFile(extractDir, descriptor.executable);
   if (!executablePath) {
     throw new Error(`${descriptor.asset} does not contain ${descriptor.executable}.`);
+  }
+  // The committed binary is what `npm run xray:ensure` checks, so it is
+  // verified on its own as well, not only through its archive.
+  const recordedExecutable = acceptChecksum("executables", target, await sha256File(executablePath));
+  if (recordedArchive || recordedExecutable) {
+    await writeChecksums();
+    console.log(`Recorded SHA-256 for Xray ${version} ${target} in ${path.relative(root, checksumsPath)}.`);
   }
 
   const outputDir = path.join(root, "resources", "xray", ...target.split("/"));
@@ -73,6 +97,45 @@ for (const target of targets) {
   }
 
   console.log(`Installed Xray ${version} for ${target} -> ${path.relative(root, outputExecutable)}`);
+}
+
+/**
+ * Compares a digest with the recorded one. Returns true when it was recorded
+ * just now (only with --trust-download), and throws on a mismatch or when
+ * nothing is recorded, so an unverified file is never installed.
+ */
+function acceptChecksum(kind, key, actual) {
+  const expected = recorded[kind][key];
+  if (expected) {
+    if (expected !== actual) {
+      throw new Error(`SHA-256 mismatch for ${key} of Xray ${version}: expected ${expected}, got ${actual}. Nothing was installed.`);
+    }
+    return false;
+  }
+  if (!trustDownload) {
+    throw new Error([
+      `No recorded SHA-256 for ${key} of Xray ${version}, so nothing was installed.`,
+      `  sha256 ${actual}`,
+      "Compare it against the .dgst file published with the release, then re-run with",
+      `\`--trust-download\` to record it in ${path.relative(root, checksumsPath)} and commit the result.`
+    ].join("\n"));
+  }
+  recorded[kind][key] = actual;
+  return true;
+}
+
+async function readChecksums() {
+  try {
+    const parsed = JSON.parse(await readFile(checksumsPath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeChecksums() {
+  const next = { ...checksums, version: pinnedVersion, archives: recorded.archives, executables: recorded.executables };
+  await writeFile(checksumsPath, `${JSON.stringify(next, undefined, 2)}\n`, "utf8");
 }
 
 function parseTargets(args) {
@@ -203,30 +266,41 @@ function requestBuffer(url, redirectCount, maxBytes) {
   });
 }
 
-async function downloadFile(url, outputPath, expectedDigest) {
-  const expectedSha256 = typeof expectedDigest === "string" && expectedDigest.startsWith("sha256:")
+/** Returns the archive's SHA-256, downloading it unless a verified copy is cached. */
+async function downloadFile(url, outputPath, expectedDigest, recordedSha256) {
+  const githubSha256 = typeof expectedDigest === "string" && expectedDigest.startsWith("sha256:")
     ? expectedDigest.slice("sha256:".length).toLowerCase()
     : undefined;
+  if (recordedSha256 && githubSha256 && githubSha256 !== recordedSha256) {
+    throw new Error(
+      `GitHub reports sha256 ${githubSha256} for ${path.basename(outputPath)}, but ${recordedSha256} is recorded for Xray ${version}. The release asset has changed; nothing was installed.`
+    );
+  }
+  const expectedSha256 = recordedSha256 ?? githubSha256;
 
   if (expectedSha256 && await fileMatchesSha256(outputPath, expectedSha256)) {
     console.log(`Reusing verified Xray archive ${path.basename(outputPath)}`);
-    return;
+    return expectedSha256;
   }
 
   const partialPath = `${outputPath}.part-${process.pid}`;
   await rm(partialPath, { force: true });
   try {
-    await downloadFileResponse(url, partialPath, expectedSha256, 0);
+    const actual = await downloadFileResponse(url, partialPath, 0);
+    if (expectedSha256 && actual !== expectedSha256) {
+      throw new Error(`SHA-256 mismatch for ${path.basename(outputPath)}: expected ${expectedSha256}, got ${actual}.`);
+    }
     // Windows does not replace an existing destination with fs.rename(). A
     // verified archive returned above, so any remaining destination is stale.
     await rm(outputPath, { force: true });
     await rename(partialPath, outputPath);
+    return actual;
   } finally {
     await rm(partialPath, { force: true });
   }
 }
 
-async function downloadFileResponse(url, outputPath, expectedSha256, redirectCount) {
+async function downloadFileResponse(url, outputPath, redirectCount) {
   const hash = createHash("sha256");
 
   const redirectUrl = await new Promise((resolve, reject) => {
@@ -260,16 +334,10 @@ async function downloadFileResponse(url, outputPath, expectedSha256, redirectCou
     if (redirectCount >= maxRedirects) {
       throw new Error(`Too many redirects while downloading ${url}`);
     }
-    await downloadFileResponse(redirectUrl, outputPath, expectedSha256, redirectCount + 1);
-    return;
+    return downloadFileResponse(redirectUrl, outputPath, redirectCount + 1);
   }
 
-  if (expectedSha256) {
-    const actual = hash.digest("hex");
-    if (actual !== expectedSha256) {
-      throw new Error(`SHA-256 mismatch for ${path.basename(outputPath)}: expected ${expectedSha256}, got ${actual}.`);
-    }
-  }
+  return hash.digest("hex");
 }
 
 function byteLimitTransform(maxBytes, onChunk) {
@@ -289,14 +357,18 @@ function byteLimitTransform(maxBytes, onChunk) {
 
 async function fileMatchesSha256(filePath, expectedSha256) {
   try {
-    const hash = createHash("sha256");
-    for await (const chunk of createReadStream(filePath)) {
-      hash.update(chunk);
-    }
-    return hash.digest("hex") === expectedSha256;
+    return await sha256File(filePath) === expectedSha256;
   } catch {
     return false;
   }
+}
+
+async function sha256File(filePath) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
 }
 
 function extractZip(zipPath, outputDir) {

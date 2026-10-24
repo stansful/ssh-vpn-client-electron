@@ -1,8 +1,20 @@
-import { access } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+/**
+ * Fails when an Xray runtime is missing or is not the pinned release recorded
+ * in `scripts/xray-checksums.json`. The binaries are committed and packaged
+ * as they are, so this is the check that stands between a replaced binary and
+ * a shipped build.
+ */
+
+// Test seam: lets the check run against a fixture tree.
+const root = process.env.SHADOW_SSH_PROJECT_ROOT
+  ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const checksumsPath = path.join(root, "scripts", "xray-checksums.json");
 const targetMap = new Map([
   ["windows/x64", "xray.exe"],
   ["windows/arm64", "xray.exe"],
@@ -13,15 +25,28 @@ const targetMap = new Map([
 ]);
 
 const targets = parseTargets(process.argv.slice(2));
+const checksums = await readChecksums();
 const missing = [];
+const mismatched = [];
 
 for (const target of targets) {
   const executable = targetMap.get(target);
   const runtimePath = path.join(root, "resources", "xray", ...target.split("/"), executable);
+  const relative = path.relative(root, runtimePath);
   try {
     await access(runtimePath);
   } catch {
-    missing.push(path.relative(root, runtimePath));
+    missing.push(relative);
+    continue;
+  }
+  const expected = checksums.executables?.[target];
+  if (typeof expected !== "string" || expected.length === 0) {
+    mismatched.push(`${relative} has no recorded SHA-256`);
+    continue;
+  }
+  const actual = await sha256File(runtimePath);
+  if (actual !== expected) {
+    mismatched.push(`${relative} does not match the recorded SHA-256 (expected ${expected}, got ${actual})`);
   }
 }
 
@@ -33,8 +58,33 @@ if (missing.length > 0) {
   ].join("\n"));
 }
 
+if (mismatched.length > 0) {
+  throw new Error([
+    `Xray runtime is not the pinned release ${checksums.version ?? "(none recorded)"} from ${path.relative(root, checksumsPath)}:`,
+    ...mismatched.map((item) => `- ${item}`),
+    "Run `npm run xray:download-all` to reinstall the pinned binaries."
+  ].join("\n"));
+}
+
 for (const target of targets) {
-  console.log(`Xray runtime OK: ${target}`);
+  console.log(`Xray runtime OK: ${target} (${checksums.version})`);
+}
+
+async function readChecksums() {
+  try {
+    const parsed = JSON.parse(await readFile(checksumsPath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function sha256File(filePath) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
 }
 
 function parseTargets(args) {

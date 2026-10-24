@@ -4,6 +4,24 @@ import { bigIntToBuffer } from "./kex-group14.js";
 
 export type SshHostKeyAlgorithm = "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" | "ssh-ed25519";
 
+/** Algorithms a user key can sign public-key authentication with. */
+export type SshPublicKeyAlgorithm =
+  | "rsa-sha2-256"
+  | "rsa-sha2-512"
+  | "ssh-rsa"
+  | "ssh-ed25519"
+  | "ecdsa-sha2-nistp256"
+  | "ecdsa-sha2-nistp384"
+  | "ecdsa-sha2-nistp521";
+
+type EcdsaCurve = { sshName: "nistp256" | "nistp384" | "nistp521"; coordinateLength: number };
+
+const ECDSA_CURVES: Record<string, EcdsaCurve> = {
+  "P-256": { sshName: "nistp256", coordinateLength: 32 },
+  "P-384": { sshName: "nistp384", coordinateLength: 48 },
+  "P-521": { sshName: "nistp521", coordinateLength: 66 }
+};
+
 export interface ParsedSshHostKey {
   algorithm: SshHostKeyAlgorithm;
   blob: Buffer;
@@ -89,9 +107,12 @@ export function encodeEd25519PublicKeyBlob(publicKey: Buffer): Buffer {
   return new SshBinaryWriter().string("ssh-ed25519").string(publicKey).toBuffer();
 }
 
-export function exportSshPublicKeyBlob(publicKey: KeyObject, algorithm?: "rsa-sha2-256" | "rsa-sha2-512" | "ssh-rsa" | "ssh-ed25519"): { algorithm: string; blob: Buffer } {
+export function exportSshPublicKeyBlob(publicKey: KeyObject, algorithm?: SshPublicKeyAlgorithm): { algorithm: SshPublicKeyAlgorithm; blob: Buffer } {
   if (publicKey.asymmetricKeyType === "rsa") {
-    const selected = algorithm && algorithm !== "ssh-ed25519" ? algorithm : "rsa-sha2-256";
+    if (algorithm && algorithm !== "rsa-sha2-256" && algorithm !== "rsa-sha2-512" && algorithm !== "ssh-rsa") {
+      throw new Error(`Algorithm ${algorithm} is incompatible with RSA keys.`);
+    }
+    const selected = algorithm ?? "rsa-sha2-256";
     const jwk = publicKey.export({ format: "jwk" });
     if (!jwk.n || !jwk.e) {
       throw new Error("RSA public key JWK is missing modulus or exponent.");
@@ -115,7 +136,50 @@ export function exportSshPublicKeyBlob(publicKey: KeyObject, algorithm?: "rsa-sh
     };
   }
 
+  if (publicKey.asymmetricKeyType === "ec") {
+    const jwk = publicKey.export({ format: "jwk" });
+    const curve = jwk.crv ? ECDSA_CURVES[jwk.crv] : undefined;
+    if (!curve || !jwk.x || !jwk.y) {
+      throw new Error(`Unsupported ECDSA curve ${jwk.crv ?? "unknown"}.`);
+    }
+    const selected = `ecdsa-sha2-${curve.sshName}` as const;
+    if (algorithm && algorithm !== selected) {
+      throw new Error(`Algorithm ${algorithm} is incompatible with ${selected} keys.`);
+    }
+    // RFC 5656 §3.1: the curve name, then the uncompressed point Q.
+    const point = Buffer.concat([
+      Buffer.from([4]),
+      leftPad(Buffer.from(jwk.x, "base64url"), curve.coordinateLength),
+      leftPad(Buffer.from(jwk.y, "base64url"), curve.coordinateLength)
+    ]);
+    return {
+      algorithm: selected,
+      blob: new SshBinaryWriter().string(selected).string(curve.sshName).string(point).toBuffer()
+    };
+  }
+
   throw new Error(`Unsupported public key type ${publicKey.asymmetricKeyType ?? "unknown"}.`);
+}
+
+/** Hash an ECDSA signature algorithm signs with (RFC 5656 §6.2.1). */
+export function ecdsaHashForAlgorithm(algorithm: string): "sha256" | "sha384" | "sha512" {
+  if (algorithm === "ecdsa-sha2-nistp256") {
+    return "sha256";
+  }
+  if (algorithm === "ecdsa-sha2-nistp384") {
+    return "sha384";
+  }
+  if (algorithm === "ecdsa-sha2-nistp521") {
+    return "sha512";
+  }
+  throw new Error(`Unsupported ECDSA signature algorithm ${algorithm}.`);
+}
+
+function leftPad(value: Buffer, length: number): Buffer {
+  if (value.length > length) {
+    throw new Error("ECDSA coordinate is longer than its curve allows.");
+  }
+  return value.length === length ? value : Buffer.concat([Buffer.alloc(length - value.length), value]);
 }
 
 export function encodeSshSignatureBlob(algorithm: string, signature: Buffer): Buffer {

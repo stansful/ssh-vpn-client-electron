@@ -4,12 +4,17 @@ import { MemoryDirectTcpIpChannel } from "../src/core/network/memory-direct-chan
 import { Socks5Proxy } from "../src/core/network/socks5-proxy.js";
 import {
   forgetLocalProxyPort,
+  forgetXrayInboundPorts,
   preferredLocalProxyPort,
-  rememberLocalProxyPort
+  preferredXrayInboundPorts,
+  rememberLocalProxyPort,
+  rememberXrayInboundPorts
 } from "../src/service/local-proxy-port.js";
+import { reserveDistinctLocalTcpPorts } from "../src/service/xray/process-utils.js";
 
 afterEach(() => {
   forgetLocalProxyPort();
+  forgetXrayInboundPorts();
 });
 
 describe("local proxy port memory", () => {
@@ -25,6 +30,52 @@ describe("local proxy port memory", () => {
     rememberLocalProxyPort(70_000);
     rememberLocalProxyPort(1.5);
     expect(preferredLocalProxyPort()).toBeUndefined();
+  });
+
+  it("remembers the pair of ports Xray's own inbounds last listened on", () => {
+    expect(preferredXrayInboundPorts()).toBeUndefined();
+    rememberXrayInboundPorts({ socksPort: 52_000, httpPort: 52_001 });
+    const remembered = preferredXrayInboundPorts();
+    expect(remembered).toEqual({ socksPort: 52_000, httpPort: 52_001 });
+
+    // A copy: a caller cannot change what the next connect prefers.
+    remembered!.socksPort = 1;
+    expect(preferredXrayInboundPorts()).toEqual({ socksPort: 52_000, httpPort: 52_001 });
+
+    forgetXrayInboundPorts();
+    expect(preferredXrayInboundPorts()).toBeUndefined();
+  });
+
+  it("ignores an Xray pair that could not be bound again", () => {
+    rememberXrayInboundPorts({ socksPort: 0, httpPort: 52_001 });
+    rememberXrayInboundPorts({ socksPort: 52_000, httpPort: 70_000 });
+    rememberXrayInboundPorts({ socksPort: 52_000, httpPort: 52_000 });
+    expect(preferredXrayInboundPorts()).toBeUndefined();
+  });
+});
+
+describe("Xray inbound port selection", () => {
+  it("rebinds the remembered ports, and gives a taken one a fresh port in its own slot", async () => {
+    const [socks, http] = await reserveDistinctLocalTcpPorts(2);
+    rememberXrayInboundPorts({ socksPort: socks.port, httpPort: http.port });
+    const preferred = preferredXrayInboundPorts()!;
+
+    await expect(reserveDistinctLocalTcpPorts(2, undefined, {
+      preferredPorts: [preferred.socksPort, preferred.httpPort]
+    })).resolves.toEqual([socks, http]);
+
+    const squatter = net.createServer();
+    await new Promise<void>((resolve) => squatter.listen(socks.port, "127.0.0.1", resolve));
+    try {
+      const [nextSocks, nextHttp] = await reserveDistinctLocalTcpPorts(2, undefined, {
+        preferredPorts: [preferred.socksPort, preferred.httpPort]
+      });
+      expect(nextSocks.port).not.toBe(socks.port);
+      expect(nextSocks.port).not.toBe(http.port);
+      expect(nextHttp).toEqual(http);
+    } finally {
+      await new Promise<void>((resolve) => squatter.close(() => resolve()));
+    }
   });
 });
 

@@ -38,18 +38,6 @@ export function encodePasswordAuthRequest(request: PasswordAuthRequest): Buffer 
     .toBuffer();
 }
 
-export function encodePublicKeyAuthProbe(request: PublicKeyAuthProbe): Buffer {
-  return new SshBinaryWriter()
-    .byte(SSH_MSG_USERAUTH_REQUEST)
-    .string(request.username)
-    .string(request.service ?? SSH_SERVICE_CONNECTION)
-    .string("publickey")
-    .boolean(false)
-    .string(request.publicKeyAlgorithm)
-    .string(request.publicKeyBlob)
-    .toBuffer();
-}
-
 export function encodePublicKeyAuthSignedRequest(request: PublicKeyAuthSignedRequest): Buffer {
   return new SshBinaryWriter()
     .byte(SSH_MSG_USERAUTH_REQUEST)

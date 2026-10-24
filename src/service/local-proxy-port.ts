@@ -22,7 +22,7 @@ export function preferredLocalProxyPort(): number | undefined {
 }
 
 export function rememberLocalProxyPort(port: number): void {
-  if (Number.isInteger(port) && port > 0 && port <= 65535) {
+  if (isBindablePort(port)) {
     lastBoundLocalProxyPort = port;
   }
 }
@@ -30,4 +30,39 @@ export function rememberLocalProxyPort(port: number): void {
 /** Test seam; also used when a listener is retired for good. */
 export function forgetLocalProxyPort(): void {
   lastBoundLocalProxyPort = undefined;
+}
+
+/** The ports Xray's own SOCKS and HTTP inbounds last listened on. */
+export interface XrayInboundPorts {
+  socksPort: number;
+  httpPort: number;
+}
+
+/**
+ * Xray's own inbounds are what the app advertises as the local proxy on the
+ * Xray transport, and what a client on macOS or Linux is pointed at by hand.
+ * They were reserved afresh on every connect and every automatic restart, so
+ * such a client lost the tunnel each time. The same rule as above applies:
+ * the last pair is preferred for the lifetime of the process, and a port that
+ * has been taken since falls back to an ephemeral one.
+ */
+let lastBoundXrayInboundPorts: XrayInboundPorts | undefined;
+
+export function preferredXrayInboundPorts(): XrayInboundPorts | undefined {
+  return lastBoundXrayInboundPorts ? { ...lastBoundXrayInboundPorts } : undefined;
+}
+
+export function rememberXrayInboundPorts(ports: XrayInboundPorts): void {
+  if (isBindablePort(ports.socksPort) && isBindablePort(ports.httpPort) && ports.socksPort !== ports.httpPort) {
+    lastBoundXrayInboundPorts = { socksPort: ports.socksPort, httpPort: ports.httpPort };
+  }
+}
+
+/** Test seam; also used when the remembered pair could not be bound. */
+export function forgetXrayInboundPorts(): void {
+  lastBoundXrayInboundPorts = undefined;
+}
+
+function isBindablePort(port: number): boolean {
+  return Number.isInteger(port) && port > 0 && port <= 65535;
 }

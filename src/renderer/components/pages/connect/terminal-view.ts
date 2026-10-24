@@ -149,6 +149,8 @@ export type ShellPhase = "opening" | "open" | "failed";
 export interface ShellRecord {
   session: string;
   phase: ShellPhase;
+  /** Which open request the record belongs to; the answer to an older one is ignored. */
+  attempt?: number;
   /** Last output line when the open was requested; markers before it belong to an older shell. */
   afterId?: string;
   error?: string;

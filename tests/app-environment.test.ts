@@ -9,7 +9,7 @@ import {
   TUN_FAILURE_NOT_ELEVATED,
   type TunEnvironmentFacts
 } from "../src/main/app/environment.js";
-import { resolveAppDataLayout } from "../src/main/app/paths.js";
+import { resolveAppDataLayout, resolveUserDataPath, resolveXrayExecutablePath } from "../src/main/app/paths.js";
 
 const usableSecrets = { encryptionAvailable: true, insecureFallbackAllowed: false };
 
@@ -143,5 +143,17 @@ describe("app data layout", () => {
       xrayRuntimeDirectory: path.join(root, "xray"),
       updatesDirectory: path.join(root, "updates")
     });
+  });
+
+  it("keeps the data folder override in every build", () => {
+    expect(resolveUserDataPath("Shadow SSH", "darwin", { SHADOW_SSH_USER_DATA_DIR: "/profiles/second" })).toBe("/profiles/second");
+  });
+
+  it("runs the bundled Xray in a packaged build whatever SHADOW_SSH_XRAY_PATH says", () => {
+    const base = { resourcesPath: "/app/resources", projectRoot: "/src/shadow", platform: "linux" as const, arch: "x64" };
+    const env = { SHADOW_SSH_XRAY_PATH: "/tmp/not-xray" };
+    expect(resolveXrayExecutablePath({ ...base, packaged: true, env })).toBe(path.join("/app/resources", "xray", "linux", "x64", "xray"));
+    expect(resolveXrayExecutablePath({ ...base, packaged: false, env })).toBe("/tmp/not-xray");
+    expect(resolveXrayExecutablePath({ ...base, packaged: false, env: {} })).toBe(path.join("/src/shadow", "resources", "xray", "linux", "x64", "xray"));
   });
 });

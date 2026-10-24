@@ -1,4 +1,4 @@
-import { normalizeRuleValue, validateRoutingRuleValue } from "../../../../shared/validation.js";
+import { canonicalIpRuleValue, normalizeRuleValue, validateRoutingRuleValue } from "../../../../shared/validation.js";
 import type { RoutingRule, RoutingRuleType } from "../../../../shared/types.js";
 import { formatCount, plural } from "../../../lib/format.js";
 
@@ -107,11 +107,14 @@ export function parseRuleImport(text: string, file: { name: string; size: number
       continue;
     }
     const ruleType = type as RoutingRuleType;
-    if (!validateRoutingRuleValue(ruleType, record.value).ok) {
+    // A zero-padded prefix ("/022") that earlier versions saved, and so
+    // exported, is rewritten as storage and IPC rewrite it, not dropped.
+    const rawValue = ruleType === "ip" ? canonicalIpRuleValue(record.value) : record.value;
+    if (!validateRoutingRuleValue(ruleType, rawValue).ok) {
       skipped.invalid += 1;
       continue;
     }
-    const value = ruleType === "ip" && record.value.includes(":") ? record.value.trim().toLowerCase() : normalizeRuleValue(ruleType, record.value);
+    const value = ruleType === "ip" && rawValue.includes(":") ? rawValue.trim().toLowerCase() : normalizeRuleValue(ruleType, rawValue);
     const key = `${ruleType}\u0000${value}`;
     if (seenValues.has(key)) {
       skipped.duplicates += 1;

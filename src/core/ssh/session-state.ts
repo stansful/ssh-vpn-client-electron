@@ -26,6 +26,7 @@ import {
 } from "./connection-messages.js";
 import { negotiateAlgorithms, type NegotiatedAlgorithms } from "./algorithms.js";
 import { encodePasswordAuthRequest, encodeServiceRequest, SSH_SERVICE_USERAUTH } from "./auth-messages.js";
+import { SshBinaryReader } from "./binary.js";
 import {
   encodeChannelClose,
   encodeChannelData,
@@ -95,6 +96,45 @@ export interface KexCompleteResult {
   sessionId: Buffer;
   transportKeys: DerivedTransportKeys;
   serverHostKeyFingerprint: string;
+  /** SSH name of the host key's type as OpenSSH prints it: "ssh-ed25519", "ssh-rsa". */
+  serverHostKeyType: string;
+}
+
+export interface PresentedHostKey {
+  fingerprint: string;
+  /** SSH name of the key's type as the server sent it, for example "ssh-ed25519". */
+  keyType: string;
+}
+
+/**
+ * The server's host key is not the one the configuration expects. Carries
+ * what the server offered so the caller can ask for another key type on a
+ * fresh connection, and every key seen so far for the final message.
+ */
+export class SshHostKeyMismatchError extends Error {
+  readonly expectedFingerprint: string;
+  readonly presentedHostKeys: PresentedHostKey[];
+  /** The host-key algorithm this key exchange negotiated. */
+  readonly negotiatedHostKeyAlgorithm: string;
+  /** Host-key algorithms the server's KEXINIT advertised. */
+  readonly serverHostKeyAlgorithms: string[];
+
+  constructor(input: {
+    expectedFingerprint: string;
+    presentedHostKeys: PresentedHostKey[];
+    negotiatedHostKeyAlgorithm: string;
+    serverHostKeyAlgorithms: string[];
+  }) {
+    // The wording is what reconnect loops and the UI match on: it has to keep
+    // saying "fingerprint mismatch".
+    const presented = input.presentedHostKeys.map((key) => `${key.fingerprint} (${key.keyType})`).join(", ");
+    super(`SSH server fingerprint mismatch: expected ${input.expectedFingerprint}, got ${presented}.`);
+    this.name = "SshHostKeyMismatchError";
+    this.expectedFingerprint = input.expectedFingerprint;
+    this.presentedHostKeys = input.presentedHostKeys;
+    this.negotiatedHostKeyAlgorithm = input.negotiatedHostKeyAlgorithm;
+    this.serverHostKeyAlgorithms = input.serverHostKeyAlgorithms;
+  }
 }
 
 export interface AuthFailureResult {
@@ -119,6 +159,7 @@ export class SshSessionStateMachine {
   private activeClientKexInit?: SshKexInit;
   private clientKexInitPayload?: Buffer;
   private serverKexInitPayload?: Buffer;
+  private serverHostKeyAlgorithms: string[] = [];
   private negotiated?: NegotiatedAlgorithms;
   private clientExchange?: Group14Sha256ClientExchange | Curve25519ClientExchange;
   private sessionId?: Buffer;
@@ -160,6 +201,7 @@ export class SshSessionStateMachine {
     }
     this.negotiated = negotiateAlgorithms(this.activeClientKexInit, serverKexInit);
     this.serverKexInitPayload = serverKexInitPayload;
+    this.serverHostKeyAlgorithms = serverKexInit.serverHostKeyAlgorithms;
     const ignoreNextServerKexPacket = serverKexInit.firstKexPacketFollows && (
       serverKexInit.kexAlgorithms[0] !== this.negotiated.kexAlgorithm ||
       serverKexInit.serverHostKeyAlgorithms[0] !== this.negotiated.serverHostKeyAlgorithm
@@ -203,8 +245,14 @@ export class SshSessionStateMachine {
     });
 
     const fingerprint = sha256Fingerprint(kex.hostKey);
+    const hostKeyType = hostKeyBlobType(kex.hostKey) ?? this.negotiated.serverHostKeyAlgorithm;
     if (this.options.expectedServerFingerprint && this.options.expectedServerFingerprint !== fingerprint) {
-      throw new Error(`SSH server fingerprint mismatch: expected ${this.options.expectedServerFingerprint}, got ${fingerprint}.`);
+      throw new SshHostKeyMismatchError({
+        expectedFingerprint: this.options.expectedServerFingerprint,
+        presentedHostKeys: [{ fingerprint, keyType: hostKeyType }],
+        negotiatedHostKeyAlgorithm: this.negotiated.serverHostKeyAlgorithm,
+        serverHostKeyAlgorithms: [...this.serverHostKeyAlgorithms]
+      });
     }
     if (this.serverHostKeyFingerprint && this.serverHostKeyFingerprint !== fingerprint) {
       throw new Error(`SSH server host key changed during rekey: expected ${this.serverHostKeyFingerprint}, got ${fingerprint}.`);
@@ -227,7 +275,8 @@ export class SshSessionStateMachine {
         transportKeyLengthsFor(this.negotiated.encryptionClientToServer, this.negotiated.macClientToServer),
         transportKeyLengthsFor(this.negotiated.encryptionServerToClient, this.negotiated.macServerToClient)
       ),
-      serverHostKeyFingerprint: fingerprint
+      serverHostKeyFingerprint: fingerprint,
+      serverHostKeyType: hostKeyType
     };
   }
 
@@ -558,6 +607,16 @@ export function assertNegotiatedHostKeyAndSignature(negotiatedAlgorithm: string,
   }
 
   throw new Error(`Unsupported negotiated SSH host key algorithm ${negotiatedAlgorithm}.`);
+}
+
+/** The key type a host key blob names, without trusting the rest of the blob. */
+function hostKeyBlobType(hostKeyBlob: Buffer): string | undefined {
+  try {
+    const keyType = new SshBinaryReader(hostKeyBlob).utf8String();
+    return /^[A-Za-z0-9@._+-]{1,64}$/u.test(keyType) ? keyType : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isCurve25519Kex(algorithm: string): boolean {

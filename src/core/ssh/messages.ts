@@ -21,7 +21,10 @@ export interface SshKexInit {
 
 export const DEFAULT_KEX_INIT: Omit<SshKexInit, "cookie"> = {
   kexAlgorithms: ["curve25519-sha256", "curve25519-sha256@libssh.org", "diffie-hellman-group14-sha256"],
-  serverHostKeyAlgorithms: ["rsa-sha2-512", "rsa-sha2-256", "ssh-ed25519"],
+  // Ed25519 first: it is the key the server form tells people to pin, and
+  // what OpenSSH itself asks for first. A pin of the RSA key still connects
+  // through the key-type fallback in SshLiveClient.connect.
+  serverHostKeyAlgorithms: ["ssh-ed25519", "rsa-sha2-512", "rsa-sha2-256"],
   // Prefer AES-128 for lower client CPU cost and higher bulk throughput while
   // retaining a full 128-bit security level; stronger-key variants remain
   // available for servers whose policy requires them.

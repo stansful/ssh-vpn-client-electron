@@ -32,6 +32,9 @@ type Capabilities struct {
 	IPv6RouteEnforcement         bool   `json:"ipv6RouteEnforcement"`
 	UDPForwarding                bool   `json:"udpForwarding"`
 	SSHCoreLinked                bool   `json:"sshCoreLinked"`
+	// RouteRecovery reports that the helper understands `recover-routes`.
+	// Older helpers lack the field, which reads as false.
+	RouteRecovery bool `json:"routeRecovery"`
 	// TUNUnavailableReason says why TUNDevice is false, in terms the user can
 	// act on. Creating an adapter needs two unrelated things - the DLL and
 	// administrator rights - and a single "cannot create a tunnel adapter"

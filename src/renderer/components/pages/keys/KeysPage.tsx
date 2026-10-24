@@ -192,7 +192,7 @@ export function KeysPage({ intent }: PageProps): JSX.Element {
               <ul>
                 <li className="is-yes">
                   <Icon icon={Check} />
-                  <span>RSA and Ed25519 keys</span>
+                  <span>Ed25519, ECDSA and RSA keys</span>
                 </li>
                 <li className="is-yes">
                   <Icon icon={Check} />
@@ -200,7 +200,7 @@ export function KeysPage({ intent }: PageProps): JSX.Element {
                 </li>
                 <li className="is-yes">
                   <Icon icon={Check} />
-                  <span>Passphrases on PEM and PKCS#8 keys</span>
+                  <span>Passphrases on OpenSSH, PEM and PKCS#8 keys</span>
                 </li>
               </ul>
             </div>
@@ -209,11 +209,7 @@ export function KeysPage({ intent }: PageProps): JSX.Element {
               <ul>
                 <li className="is-no">
                   <Icon icon={X} />
-                  <span>Passphrase-protected OpenSSH keys</span>
-                </li>
-                <li className="is-no">
-                  <Icon icon={X} />
-                  <span>ECDSA and DSA keys</span>
+                  <span>DSA and security-key (FIDO) keys</span>
                 </li>
                 <li className="is-no">
                   <Icon icon={X} />

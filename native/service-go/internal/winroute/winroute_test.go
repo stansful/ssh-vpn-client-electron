@@ -3,15 +3,25 @@ package winroute
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"shadowssh/service/internal/winnet"
+)
+
+const (
+	tunnelIndex   = 17
+	physicalIndex = 4
+	tunnelLUID    = 0x0083000000a10000
+	physicalLUID  = 0x0006000000040000
 )
 
 func basePlan() Plan {
 	return Plan{
-		TunnelInterfaceIndex: 17,
+		TunnelInterfaceIndex: tunnelIndex,
 		TunnelAddress4:       netip.MustParseAddr("10.253.7.2"),
 		TunnelMask4:          netip.MustParseAddr("255.255.255.0"),
 		TunnelAddress6:       netip.MustParseAddr("fd7a:c0de:5417::2"),
@@ -20,12 +30,110 @@ func basePlan() Plan {
 	}
 }
 
+func protectedPlan() Plan {
+	plan := basePlan()
+	plan.ProtectedRoutes = []ProtectedRoute{{
+		Address:        netip.MustParseAddr("198.51.100.4"),
+		InterfaceIndex: physicalIndex,
+		NextHop:        netip.MustParseAddr("192.168.1.1"),
+	}}
+	return plan
+}
+
 func joined(operations []Operation) []string {
 	rendered := make([]string, 0, len(operations))
 	for _, operation := range operations {
 		rendered = append(rendered, strings.Join(operation.Apply, " "))
 	}
 	return rendered
+}
+
+func testJournalPath(t *testing.T) string {
+	return filepath.Join(t.TempDir(), JournalFileName)
+}
+
+// interfacesOf answers from byIndex, which a test may change between calls to
+// stand in for an adapter going away or an index being handed to another one.
+func interfacesOf(byIndex map[uint32]uint64) interfaceTable {
+	return interfaceTable{
+		luid: func(index uint32) (uint64, error) {
+			if luid, ok := byIndex[index]; ok {
+				return luid, nil
+			}
+			return 0, fmt.Errorf("index %d: %w", index, winnet.ErrInterfaceNotFound)
+		},
+		index: func(luid uint64) (uint32, error) {
+			for index, candidate := range byIndex {
+				if candidate == luid {
+					return index, nil
+				}
+			}
+			return 0, fmt.Errorf("luid %#x: %w", luid, winnet.ErrInterfaceNotFound)
+		},
+	}
+}
+
+func liveInterfaces() map[uint32]uint64 {
+	return map[uint32]uint64{tunnelIndex: tunnelLUID, physicalIndex: physicalLUID}
+}
+
+func newTestManager(path string, byIndex map[uint32]uint64, run Runner) *Manager {
+	manager := NewManager(path, run, nil)
+	manager.interfaces = interfacesOf(byIndex)
+	// A lock left held by mistake fails a test at once instead of stalling
+	// it for the minutes a real start waits.
+	manager.lockWait = 0
+	return manager
+}
+
+// crash leaves the manager as a killed helper leaves the machine: its changes
+// and their journal stay, and the operating system lets go of its lock.
+func crash(manager *Manager) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.releaseLockLocked()
+}
+
+// routeTable stands in for the routing table: the routes it lists are there.
+func routeTable(routes ...winnet.Route) func() ([]winnet.Route, error) {
+	return func() ([]winnet.Route, error) { return routes, nil }
+}
+
+// recorder is a Runner that records every command and fails the ones fail
+// picks.
+type recorder struct {
+	executed []string
+	fail     func(line string) bool
+}
+
+func (r *recorder) run(ctx context.Context, argv []string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	line := strings.Join(argv, " ")
+	r.executed = append(r.executed, line)
+	if r.fail != nil && r.fail(line) {
+		return errors.New("netsh failed")
+	}
+	return nil
+}
+
+func (r *recorder) ran(fragment string) bool {
+	for _, line := range r.executed {
+		if strings.Contains(line, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func readJournal(t *testing.T, path string) []Operation {
+	t.Helper()
+	entries, err := NewJournalFile(path).Read()
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	return entries
 }
 
 func TestPlanCapturesBothHalvesOfTheAddressSpace(t *testing.T) {
@@ -47,13 +155,7 @@ func TestPlanCapturesBothHalvesOfTheAddressSpace(t *testing.T) {
 }
 
 func TestPlanExcludesTheTransportBeforeCapturing(t *testing.T) {
-	plan := basePlan()
-	plan.ProtectedRoutes = []ProtectedRoute{{
-		Address:        netip.MustParseAddr("198.51.100.4"),
-		InterfaceIndex: 4,
-		NextHop:        netip.MustParseAddr("192.168.1.1"),
-	}}
-	operations, err := plan.Operations()
+	operations, err := protectedPlan().Operations()
 	if err != nil {
 		t.Fatalf("operations: %v", err)
 	}
@@ -90,28 +192,27 @@ func TestIPv6CaptureRequiresAnIPv6Address(t *testing.T) {
 
 func TestManagerRollsBackAPartialApply(t *testing.T) {
 	// A half-captured machine is the failure this rollback exists to prevent.
-	var executed []string
-	failOn := "prefix=128.0.0.0/1"
-	manager := NewManager(filepath.Join(t.TempDir(), "routing.json"), func(_ context.Context, argv []string) error {
-		line := strings.Join(argv, " ")
-		executed = append(executed, line)
-		if strings.Contains(line, failOn) && strings.Contains(line, " add ") {
-			return errors.New("netsh failed")
-		}
-		return nil
-	}, nil)
+	runner := &recorder{fail: func(line string) bool {
+		return strings.Contains(line, "prefix=128.0.0.0/1") && strings.Contains(line, " add ")
+	}}
+	path := testJournalPath(t)
+	manager := newTestManager(path, liveInterfaces(), runner.run)
 
 	if err := manager.Apply(context.Background(), basePlan()); err == nil {
 		t.Fatalf("expected the apply to fail")
 	}
 	var deletes int
-	for _, line := range executed {
+	for _, line := range runner.executed {
 		if strings.Contains(line, " delete ") || strings.Contains(line, "source=dhcp") || strings.Contains(line, "metric=automatic") {
 			deletes++
 		}
 	}
 	if deletes == 0 {
-		t.Fatalf("expected the applied operations to be undone, got:\n%s", strings.Join(executed, "\n"))
+		t.Fatalf("expected the applied operations to be undone, got:\n%s", strings.Join(runner.executed, "\n"))
+	}
+	// Every undo succeeded, so nothing is left to describe.
+	if entries := readJournal(t, path); entries != nil {
+		t.Fatalf("expected a fully rolled-back apply to clear the journal, got %+v", entries)
 	}
 	if err := manager.Apply(context.Background(), basePlan()); err == nil {
 		t.Fatalf("expected a second apply attempt to be possible after rollback")
@@ -119,38 +220,41 @@ func TestManagerRollsBackAPartialApply(t *testing.T) {
 }
 
 func TestManagerRecoversAJournalFromAPreviousRun(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "routing.json")
-	journal := NewJournalFile(path)
-	if err := journal.Write([]Operation{
-		{Description: "first", Undo: []string{"netsh", "first"}},
-		{Description: "second", Undo: []string{"netsh", "second"}},
-	}); err != nil {
-		t.Fatalf("write journal: %v", err)
+	path := testJournalPath(t)
+	// A run that crashed after applying everything.
+	crashed := newTestManager(path, liveInterfaces(), (&recorder{}).run)
+	if err := crashed.Apply(context.Background(), protectedPlan()); err != nil {
+		t.Fatalf("apply: %v", err)
 	}
+	crash(crashed)
+	journalled := readJournal(t, path)
 
-	var executed []string
-	manager := NewManager(path, func(_ context.Context, argv []string) error {
-		executed = append(executed, strings.Join(argv, " "))
-		return nil
-	}, nil)
+	runner := &recorder{}
+	manager := newTestManager(path, liveInterfaces(), runner.run)
 	if err := manager.Recover(context.Background()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
 	// Undo runs in reverse, so a route is removed before the address it needs.
-	if len(executed) != 2 || executed[0] != "netsh second" || executed[1] != "netsh first" {
-		t.Fatalf("expected the journal to be undone in reverse, got %v", executed)
+	if len(runner.executed) != len(journalled) {
+		t.Fatalf("expected all %d undo commands to run, got %v", len(journalled), runner.executed)
 	}
-	if entries, err := journal.Read(); err != nil || entries != nil {
-		t.Fatalf("expected the journal to be cleared, got %v (%v)", entries, err)
+	for position, line := range runner.executed {
+		want := strings.Join(journalled[len(journalled)-1-position].Undo, " ")
+		if line != want {
+			t.Fatalf("undo %d = %q, want %q", position, line, want)
+		}
+	}
+	if entries := readJournal(t, path); entries != nil {
+		t.Fatalf("expected the journal to be cleared, got %v", entries)
 	}
 }
 
 func TestJournalIsWrittenBeforeTheFirstChange(t *testing.T) {
 	// An operation applied but not journalled survives a crash; one journalled
 	// but not applied only costs a no-op undo. The order has to be this way.
-	path := filepath.Join(t.TempDir(), "routing.json")
+	path := testJournalPath(t)
 	var journalledAtFirstCall []Operation
-	manager := NewManager(path, func(context.Context, []string) error {
+	manager := newTestManager(path, liveInterfaces(), func(context.Context, []string) error {
 		if journalledAtFirstCall == nil {
 			entries, err := NewJournalFile(path).Read()
 			if err != nil {
@@ -159,18 +263,23 @@ func TestJournalIsWrittenBeforeTheFirstChange(t *testing.T) {
 			journalledAtFirstCall = entries
 		}
 		return nil
-	}, nil)
+	})
 	if err := manager.Apply(context.Background(), basePlan()); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if len(journalledAtFirstCall) == 0 {
 		t.Fatalf("expected the journal to exist before the first command ran")
 	}
+	for _, entry := range journalledAtFirstCall {
+		if entry.InterfaceLUID != tunnelLUID {
+			t.Fatalf("expected every entry to name the adapter's LUID, got %+v", entry)
+		}
+	}
 	if err := manager.Restore(context.Background()); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	if entries, err := NewJournalFile(path).Read(); err != nil || entries != nil {
-		t.Fatalf("expected the journal to be cleared after restore, got %v (%v)", entries, err)
+	if entries := readJournal(t, path); entries != nil {
+		t.Fatalf("expected the journal to be cleared after restore, got %v", entries)
 	}
 }
 
@@ -180,52 +289,41 @@ func TestRestoreRunsEveryUndoEvenWhenTheCallerGaveUp(t *testing.T) {
 	// would abort every remaining undo instantly and leave the machine with
 	// capture routes pointing at an adapter that is about to disappear, which
 	// is what makes the next connect unable to bring the tunnel back up.
-	var executed []string
-	manager := NewManager(filepath.Join(t.TempDir(), "routing.json"), func(ctx context.Context, argv []string) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		executed = append(executed, strings.Join(argv, " "))
-		return nil
-	}, nil)
+	runner := &recorder{}
+	manager := newTestManager(testJournalPath(t), liveInterfaces(), runner.run)
 
 	if err := manager.Apply(context.Background(), basePlan()); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	applied := len(executed)
-	executed = nil
+	applied := len(runner.executed)
+	runner.executed = nil
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := manager.Restore(cancelled); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	if len(executed) != applied {
-		t.Fatalf("expected all %d undo commands to run, got %d", applied, len(executed))
+	if len(runner.executed) != applied {
+		t.Fatalf("expected all %d undo commands to run, got %d", applied, len(runner.executed))
 	}
 }
 
 func TestRecoverAlsoIgnoresACancelledCaller(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "routing.json")
-	if err := NewJournalFile(path).Write([]Operation{{Description: "left over", Undo: []string{"netsh", "undo"}}}); err != nil {
-		t.Fatalf("write journal: %v", err)
+	path := testJournalPath(t)
+	crashed := newTestManager(path, liveInterfaces(), (&recorder{}).run)
+	if err := crashed.Apply(context.Background(), protectedPlan()); err != nil {
+		t.Fatalf("apply: %v", err)
 	}
+	crash(crashed)
 
-	var executed []string
-	manager := NewManager(path, func(ctx context.Context, argv []string) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		executed = append(executed, strings.Join(argv, " "))
-		return nil
-	}, nil)
-
+	runner := &recorder{}
+	manager := newTestManager(path, liveInterfaces(), runner.run)
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := manager.Recover(cancelled); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	if len(executed) != 1 {
-		t.Fatalf("expected the journalled undo to run, got %v", executed)
+	if !runner.ran("nexthop=192.168.1.1") {
+		t.Fatalf("expected the journalled undo to run, got %v", runner.executed)
 	}
 }

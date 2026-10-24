@@ -24,10 +24,12 @@ type WindowsOptions struct {
 	ProtectedAddresses []netip.Addr
 	EnforceIPv6        bool
 	Log                func(level string, message string)
+	OnFatal            func(runner *Runner, cause error)
 }
 
-// Runner is the unavailable stub.
-type Runner struct{}
+// Runner is the unavailable stub. It is not zero-sized, so two runners are
+// told apart by address here as they are on Windows.
+type Runner struct{ _ byte }
 
 // StartWindows always fails off Windows.
 func StartWindows(context.Context, WindowsOptions) (*Runner, error) { return nil, ErrNotSupported }
