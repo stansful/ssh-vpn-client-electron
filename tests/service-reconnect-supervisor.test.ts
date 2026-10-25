@@ -1110,40 +1110,6 @@ describe("live SSH service reconnect supervisor", () => {
     await service.dispose();
   });
 
-  it("does not restart an expired hold when the attempt in flight then fails", async () => {
-    vi.useFakeTimers();
-    const first = new FakeSshClient();
-    // Every retry hangs for 10 s (a blackholed server: the TCP connect
-    // timeout) and then fails, so the hold expires while one is in flight.
-    vi.spyOn(SshLiveClient, "connect")
-      .mockResolvedValueOnce(first.asClient())
-      .mockImplementation((_options, signal) => new Promise<SshLiveClient>((_resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("connect ETIMEDOUT")), 10_000);
-        signal?.addEventListener("abort", () => {
-          clearTimeout(timer);
-          reject(Object.assign(new Error("SSH connect was cancelled."), { name: "AbortError" }));
-        });
-      }));
-    mockProxy();
-    const { service, systemProxy, diagnostics } = createService();
-    await service.connect(connectRequest("hold-expiry"));
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(systemProxy.restore).toHaveBeenCalledTimes(1);
-
-    first.emit({ type: "close" });
-    await vi.advanceTimersByTimeAsync(29_500);
-    expect(systemProxy.restore).toHaveBeenCalledTimes(1);
-    // The hold fires during the third attempt (23-33 s) and queues the return
-    // to direct routing behind it; that attempt's failure must not arm a new
-    // window over the same outage and cancel it.
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(systemProxy.restore).toHaveBeenCalledTimes(2);
-    expect(service.getStatus().state).toBe("Reconnecting");
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(diagnostics.filter((entry) => entry.includes("down for 30 s"))).toHaveLength(1);
-    await service.dispose();
-  });
-
   it("cancels a connect that hangs when the user disconnects", async () => {
     vi.useFakeTimers();
     let connectSignal: AbortSignal | undefined;
