@@ -146,7 +146,7 @@ for v in v0.3.0 0.3 00.3.0 0.3.0-rc1 ""; do
 	if [ -z "$v" ]; then
 		check "an empty VERSION reads package.json" '[ "$OUT" = new ]'
 	else
-		check "a malformed version '$v' is refused" '[ $RC = 1 ] && has_err "::error file=package.json::Версия «$v» должна быть X.Y.Z"'
+		check "a malformed version '$v' is refused" '[ $RC = 1 ] && has_err "::error file=package.json::Версия «${v}» должна быть X.Y.Z"'
 	fi
 done
 write_version "$REPO" "0.3.0 "
