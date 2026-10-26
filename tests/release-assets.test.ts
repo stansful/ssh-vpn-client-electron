@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { updateAssetFileName } from "../src/core/update/github-app-update.js";
@@ -112,6 +112,22 @@ describe("release workflows", () => {
     expect(ciWorkflow).toContain("scripts/*.sh scripts/lib/*.sh .github/scripts/*.sh tests/release/*.sh");
     expect(ciWorkflow.match(/^ {8}run: tests\/release\/run\.sh$/gmu)).toHaveLength(2);
     expect(ciWorkflow).toContain("TEST_BASH: /bin/bash");
+  });
+
+  // macOS's bash 3.2 in a UTF-8 locale reads the first byte of «» as part of a
+  // name: "«$v»" is the variable "v\xC2", unbound under set -u. ${v} is safe.
+  it("no shell variable runs into a non-ASCII character", () => {
+    const dirs = ["scripts", "scripts/lib", ".github/scripts", ".github/workflows", "tests/release"];
+    const offenders = dirs.flatMap((dir) =>
+      readdirSync(dir)
+        .filter((name) => /\.(sh|ya?ml)$/u.test(name))
+        .flatMap((name) =>
+          readFileSync(`${dir}/${name}`, "utf8")
+            .split("\n")
+            .flatMap((line, index) => (/\$[A-Za-z_]\w*[^\p{ASCII}]/u.test(line) ? [`${dir}/${name}:${index + 1}`] : []))
+        )
+    );
+    expect(offenders).toEqual([]);
   });
 
   it("the release scripts and their tests are executable", () => {

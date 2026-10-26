@@ -17,7 +17,7 @@ repo="${GH_REPO:-${GITHUB_REPOSITORY:?}}"
 sha="${GITHUB_SHA:-HEAD}"
 VERSION="${VERSION:-$(node "$ROOT/scripts/lib/package-version.mjs" get)}"
 version_valid "$VERSION" || {
-	echo "release-notes: «$VERSION» is not X.Y.Z" >&2
+	echo "release-notes: «${VERSION}» is not X.Y.Z" >&2
 	exit 1
 }
 

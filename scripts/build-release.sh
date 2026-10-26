@@ -98,7 +98,7 @@ command -v go >/dev/null 2>&1 || die "нужен Go: npm run native:build-servic
 [ -d node_modules ] || die "нет node_modules: сначала npm ci."
 
 version="$(node "$HERE/lib/package-version.mjs" get)" || die "не удалось прочитать версию из package.json."
-version_valid "$version" || die "в package.json версия «$version», а не X.Y.Z (без ведущих нулей и «v»)."
+version_valid "$version" || die "в package.json версия «${version}», а не X.Y.Z (без ведущих нулей и «v»)."
 node "$HERE/lib/package-version.mjs" check || exit 1
 
 if command -v git >/dev/null 2>&1 && git rev-parse -q --verify HEAD >/dev/null 2>&1 &&

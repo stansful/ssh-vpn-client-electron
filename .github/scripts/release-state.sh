@@ -24,7 +24,7 @@ ROOT="$(cd "$HERE/../.." && pwd -P)"
 VERSION="${VERSION:-$(node "$ROOT/scripts/lib/package-version.mjs" get)}"
 
 if ! version_valid "$VERSION"; then
-	echo "::error file=package.json::Версия «$VERSION» должна быть X.Y.Z (без ведущих нулей и «v»): так называются релиз и его тег, и другой тег встроенное обновление не примет. Задайте её через scripts/make-release.sh." >&2
+	echo "::error file=package.json::Версия «${VERSION}» должна быть X.Y.Z (без ведущих нулей и «v»): так называются релиз и его тег, и другой тег встроенное обновление не примет. Задайте её через scripts/make-release.sh." >&2
 	exit 1
 fi
 

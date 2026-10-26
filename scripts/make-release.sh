@@ -134,7 +134,7 @@ fi
 # --- versions
 current="$(node "$HERE/lib/package-version.mjs" get)" || die "не удалось прочитать версию из package.json."
 version_valid "$current" ||
-	die "в package.json версия «$current», а не X.Y.Z: исправьте её вручную (и в package-lock.json) и закоммитьте."
+	die "в package.json версия «${current}», а не X.Y.Z: исправьте её вручную (и в package-lock.json) и закоммитьте."
 if ! lock_problem="$(node "$HERE/lib/package-version.mjs" check 2>&1)"; then
 	warn "${lock_problem#Ошибка: }"
 	warn "релизный коммит запишет новую версию в оба файла."
@@ -175,8 +175,8 @@ check_version() {
 	fi
 	if ! version_valid "$v"; then
 		case $v in
-		v[0-9]* | V[0-9]*) echo "«$v»: нужна версия без «v», например ${v#?}" ;;
-		*) echo "«$v» — не версия X.Y.Z (три числа без ведущих нулей, например $suggested)" ;;
+		v[0-9]* | V[0-9]*) echo "«${v}»: нужна версия без «v», например ${v#?}" ;;
+		*) echo "«${v}» — не версия X.Y.Z (три числа без ведущих нулей, например $suggested)" ;;
 		esac
 		return 1
 	fi
