@@ -9,14 +9,14 @@ import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath, URL } from "node:url";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 // The release committed under resources/xray and recorded in
 // xray-checksums.json. Never releases/latest: that installs whatever GitHub
 // calls latest today, checked only by the digest the same API response gives,
 // and the config builder targets this release's config shapes.
 const pinnedVersion = "v26.3.27";
 const releaseApiUrl = `https://api.github.com/repos/XTLS/Xray-core/releases/tags/${pinnedVersion}`;
-const checksumsPath = path.join(root, "scripts", "xray-checksums.json");
+const checksumsPath = path.join(root, "scripts", "lib", "xray-checksums.json");
 const maxRedirects = 5;
 const requestIdleTimeoutMs = 30_000;
 const maxReleaseMetadataBytes = 4 * 1024 * 1024;

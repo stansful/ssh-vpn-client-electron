@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 // unpacked folders, builder debug/config dumps, update metadata (*.yml) and
 // differential-update blockmaps.
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const { version } = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 const releaseDirectory = path.join(root, "release");
 const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");

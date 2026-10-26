@@ -8,8 +8,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import packageJson from "../package.json";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const ensureScript = path.join(repoRoot, "scripts", "ensure-xray-runtime.mjs");
-const checksumsFile = path.join(repoRoot, "scripts", "xray-checksums.json");
+const ensureScript = path.join(repoRoot, "scripts", "lib", "ensure-xray-runtime.mjs");
+const checksumsFile = path.join(repoRoot, "scripts", "lib", "xray-checksums.json");
 const fixtures: string[] = [];
 /** The fixture binary as the script names it, relative to the root and with this platform's separators. */
 const fixtureBinary = path.join("resources", "xray", "linux", "x64", "xray");
@@ -27,9 +27,9 @@ function sha256(contents: Buffer | string): string {
 function fixtureRoot(binary: string | undefined, recorded: Record<string, string>): string {
   const root = mkdtempSync(path.join(os.tmpdir(), "xray-gate-"));
   fixtures.push(root);
-  mkdirSync(path.join(root, "scripts"), { recursive: true });
+  mkdirSync(path.join(root, "scripts", "lib"), { recursive: true });
   writeFileSync(
-    path.join(root, "scripts", "xray-checksums.json"),
+    path.join(root, "scripts", "lib", "xray-checksums.json"),
     JSON.stringify({ version: "v0.0.1", archives: {}, executables: recorded })
   );
   if (binary !== undefined) {
@@ -56,7 +56,7 @@ function runEnsure(args: string[], root?: string): { status: number | null; outp
 describe("xray runtime gate", () => {
   it("pins the download to the release whose checksums are recorded", () => {
     const checksums = JSON.parse(readFileSync(checksumsFile, "utf8"));
-    const downloader = readFileSync(path.join(repoRoot, "scripts", "download-xray-runtime.mjs"), "utf8");
+    const downloader = readFileSync(path.join(repoRoot, "scripts", "lib", "download-xray-runtime.mjs"), "utf8");
 
     expect(checksums.version).toMatch(/^v\d+\.\d+\.\d+$/u);
     expect(downloader).toContain(`const pinnedVersion = "${checksums.version}";`);
@@ -106,7 +106,7 @@ describe("xray runtime gate", () => {
   });
 
   it("is checked before every package build", () => {
-    expect(packageJson.scripts["xray:ensure"]).toBe("node scripts/ensure-xray-runtime.mjs");
+    expect(packageJson.scripts["xray:ensure"]).toBe("node scripts/lib/ensure-xray-runtime.mjs");
     expect(packageJson.scripts["package:prepare"]).toMatch(/^npm run xray:ensure -- --all && /u);
   });
 });

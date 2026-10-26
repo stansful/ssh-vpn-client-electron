@@ -43,7 +43,7 @@ describe("build channel", () => {
   });
 
   it("is baked in by the packaging script and read the same way by the CommonJS bootstrap", () => {
-    const wrapper = readFileSync("scripts/electron-builder-with-local-dist.mjs", "utf8");
+    const wrapper = readFileSync("scripts/lib/electron-builder-with-local-dist.mjs", "utf8");
     expect(wrapper).toContain(`--config.extraMetadata.${BUILD_CHANNEL_METADATA_FIELD}=`);
     expect(wrapper).toContain('isShadowDevBuild ? "development" : "production"');
     const bootstrap = readFileSync("src/main/bootstrap.cts", "utf8");

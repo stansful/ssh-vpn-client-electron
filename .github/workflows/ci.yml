@@ -1,0 +1,128 @@
+# Checks every push to a branch other than master, and every pull request. A push to master does not start this
+# workflow: release.yml calls it (workflow_call) before it builds and publishes anything, so the checks run once per
+# push and no skipped CI run is left behind.
+#   lint     actionlint (the workflows), shellcheck and the tests of the release scripts (scripts/*.sh,
+#            .github/scripts/*.sh: tests/release/run.sh)
+#   quality  on the image the release is built on: package/lock versions, typecheck, lint, Vitest, go test ./...,
+#            the Windows builds of the Go helper, and the release scripts' tests under macOS's bash 3.2
+name: CI
+
+on:
+  push:
+    branches-ignore: [master]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: Called by release.yml, which runs these checks on every push to master
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# github.workflow is the caller's name under workflow_call: a release's checks never cancel, and are never
+# cancelled by, the checks of a push to the same ref, and a running release never loses its checks.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !inputs.release }}
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # the workflows, with shellcheck over their run: scripts
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE" -color
+
+      # actionlint does not look at script files; the same image's shellcheck (0.11.0) does. -f gcc: this static
+      # build cannot print the Cyrillic source lines of its default format, whatever the locale
+      - name: shellcheck (scripts)
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo --entrypoint shellcheck "$ACTIONLINT_IMAGE" -x -f gcc \
+            scripts/*.sh scripts/lib/*.sh .github/scripts/*.sh tests/release/*.sh
+
+      # scripts/lib/package-version.mjs reads and writes the version
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ !cancelled() }}
+        with:
+          node-version: 24.11.1
+
+      - name: Release scripts tests (make-release.sh, build-release.sh, release-state.sh, release-notes.sh)
+        if: ${{ !cancelled() }}
+        run: tests/release/run.sh
+
+  quality:
+    # The image the release is built on and the suite is developed on.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # npm ci does not check the lock's own version, and 2.6.0 and 2.6.1 were released with a stale one.
+      - name: Check version consistency
+        run: |
+          if ! problem=$(node scripts/lib/package-version.mjs check 2>&1); then
+            echo "::error file=package-lock.json::${problem#Ошибка: }"
+            exit 1
+          fi
+
+      # The owner's local Node, as in the release build (release.yml).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.11.1
+          cache: npm
+
+      # Same Go as the build: the release helpers are compiled with 1.25.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - run: npm ci --no-audit --no-fund
+
+      - run: npm run typecheck
+
+      - run: npm run lint
+
+      # Includes the package/lock version test, the Xray checksum gate and the release asset names.
+      - run: npm test
+
+      - name: Go tests
+        working-directory: native/service-go
+        run: go test ./...
+
+      # Most of the helper is Windows-only code that go test on macOS never
+      # compiles. go build leaves out the _test.go files, so vet type-checks
+      # the Windows tests as well.
+      - name: Windows helper builds
+        working-directory: native/service-go
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/shadow-ssh-service
+          GOOS=windows GOARCH=arm64 go build -o /dev/null ./cmd/shadow-ssh-service
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=windows GOARCH=arm64 go vet ./...
+
+      # The owner runs scripts/make-release.sh and build-release.sh with macOS's own bash, which is 3.2.
+      - name: Release scripts tests under /bin/bash (3.2)
+        if: ${{ !cancelled() }}
+        env:
+          TEST_BASH: /bin/bash
+        run: tests/release/run.sh

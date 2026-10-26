@@ -18,8 +18,9 @@ import (
 // below, and it is loaded from the very file that was checked.
 
 // pinnedWintunVersion is the wintun release the digests belong to. It is the
-// release scripts/download-wintun.mjs fetches and scripts/wintun-checksums.json
-// pins (as a zip archive; these are the DLLs inside that archive).
+// release scripts/lib/download-wintun.mjs fetches and
+// scripts/lib/wintun-checksums.json pins (as a zip archive; these are the DLLs
+// inside that archive).
 const pinnedWintunVersion = "0.14.1"
 
 // pinnedWintunSHA256 maps GOARCH to the SHA-256 of bin/<arch>/wintun.dll in

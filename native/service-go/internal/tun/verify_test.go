@@ -49,7 +49,7 @@ func TestPinnedWintunVersionIsTheOneTheBuildFetches(t *testing.T) {
 	// Bumping wintun in the download script without updating the pinned DLL
 	// digests here would ship a helper that refuses its own DLL.
 	root := filepath.Join("..", "..", "..", "..")
-	raw, err := os.ReadFile(filepath.Join(root, "scripts", "wintun-checksums.json"))
+	raw, err := os.ReadFile(filepath.Join(root, "scripts", "lib", "wintun-checksums.json"))
 	if err != nil {
 		t.Skipf("checksum file unavailable: %v", err)
 	}
@@ -60,14 +60,14 @@ func TestPinnedWintunVersionIsTheOneTheBuildFetches(t *testing.T) {
 		t.Fatalf("parse checksum file: %v", err)
 	}
 	if checksums.Archives[pinnedWintunVersion] == "" {
-		t.Fatalf("scripts/wintun-checksums.json does not pin wintun %s", pinnedWintunVersion)
+		t.Fatalf("scripts/lib/wintun-checksums.json does not pin wintun %s", pinnedWintunVersion)
 	}
-	script, err := os.ReadFile(filepath.Join(root, "scripts", "download-wintun.mjs"))
+	script, err := os.ReadFile(filepath.Join(root, "scripts", "lib", "download-wintun.mjs"))
 	if err != nil {
 		t.Fatalf("read download script: %v", err)
 	}
 	if !strings.Contains(string(script), `const defaultVersion = "`+pinnedWintunVersion+`";`) {
-		t.Fatalf("scripts/download-wintun.mjs no longer fetches wintun %s; update pinnedWintunSHA256 with the new DLLs", pinnedWintunVersion)
+		t.Fatalf("scripts/lib/download-wintun.mjs no longer fetches wintun %s; update pinnedWintunSHA256 with the new DLLs", pinnedWintunVersion)
 	}
 }
 

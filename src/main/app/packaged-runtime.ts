@@ -3,7 +3,7 @@ import path from "node:path";
 
 /**
  * The package.json field electron-builder bakes into a packaged app
- * (scripts/electron-builder-with-local-dist.mjs). A packaged executable is
+ * (scripts/lib/electron-builder-with-local-dist.mjs). A packaged executable is
  * started later, from an environment that says nothing about how it was
  * built, so this field is what gives a "Shadow Dev" build its own identity.
  * bootstrap.cts reads it too.

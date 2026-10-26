@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 // Test seam: lets the check run against a fixture tree.
 const root = process.env.SHADOW_SSH_PROJECT_ROOT
-  ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const targetMap = new Map([
   ["x64", 0x8664],
   ["arm64", 0xaa64]

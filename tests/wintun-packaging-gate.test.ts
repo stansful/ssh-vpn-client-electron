@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import packageJson from "../package.json";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const ensureScript = path.join(repoRoot, "scripts", "ensure-wintun.mjs");
+const ensureScript = path.join(repoRoot, "scripts", "lib", "ensure-wintun.mjs");
 const PE_MACHINE = { x64: 0x8664, arm64: 0xaa64 } as const;
 const fixtures: string[] = [];
 
@@ -86,26 +86,26 @@ describe("wintun packaging gate", () => {
   });
 
   it("is wired into packaging, not left to a console warning", () => {
-    expect(packageJson.scripts["wintun:download"]).toBe("node scripts/download-wintun.mjs");
-    expect(packageJson.scripts["wintun:ensure"]).toBe("node scripts/ensure-wintun.mjs");
+    expect(packageJson.scripts["wintun:download"]).toBe("node scripts/lib/download-wintun.mjs");
+    expect(packageJson.scripts["wintun:ensure"]).toBe("node scripts/lib/ensure-wintun.mjs");
 
     // Every Windows bundle goes through this script, so the check cannot be
     // bypassed by packing one target directly.
-    const packagingGate = readFileSync(path.join(repoRoot, "scripts", "electron-builder-with-local-dist.mjs"), "utf8");
+    const packagingGate = readFileSync(path.join(repoRoot, "scripts", "lib", "electron-builder-with-local-dist.mjs"), "utf8");
     expect(packagingGate).toContain('platformFlag === "--win"');
     expect(packagingGate).toContain("wintun.dll");
     expect(packagingGate).toContain("npm run wintun:download");
 
     // And the built bundle is checked for it, not just the source tree.
-    const artifactVerifier = readFileSync(path.join(repoRoot, "scripts", "verify-production-artifacts.mjs"), "utf8");
+    const artifactVerifier = readFileSync(path.join(repoRoot, "scripts", "lib", "verify-production-artifacts.mjs"), "utf8");
     expect(artifactVerifier).toContain('"wintun.dll"');
   });
 
   // A third-party signed binary must never be installed unverified.
   it("keeps a checksum file that the downloader verifies against", () => {
-    const checksums = JSON.parse(readFileSync(path.join(repoRoot, "scripts", "wintun-checksums.json"), "utf8"));
+    const checksums = JSON.parse(readFileSync(path.join(repoRoot, "scripts", "lib", "wintun-checksums.json"), "utf8"));
     expect(checksums.archives).toBeTypeOf("object");
-    const downloader = readFileSync(path.join(repoRoot, "scripts", "download-wintun.mjs"), "utf8");
+    const downloader = readFileSync(path.join(repoRoot, "scripts", "lib", "download-wintun.mjs"), "utf8");
     expect(downloader).toContain("SHA-256 mismatch");
     expect(downloader).toContain("--trust-download");
   });
