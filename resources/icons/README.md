@@ -10,6 +10,6 @@ The canonical application icon is `icon.svg` in the repository root.
 
 Run `npm run icons:transparent` after changing `icon.svg` or raster icon assets.
 `trayTemplate.svg` (16x16 viewBox) is the source of the tray PNGs. Every packaging build regenerates them once
-(`package:prepare` runs `npm run icons:tray`); run it yourself to see a change in `npm run dev`. The script renders both sizes with `scripts/svg-template-raster.mjs` (no browser needed; it accepts a small SVG subset and
+(`package:prepare` runs `npm run icons:tray`); run it yourself to see a change in `npm run dev`. The script renders both sizes with `scripts/lib/svg-template-raster.mjs` (no browser needed; it accepts a small SVG subset and
 treats white paint as an eraser) and refuses ink in the outer pixel ring. Keep the badge corner in mind: connecting,
 connected and error states cut a 9 px badge into the bottom-right of the glyph at runtime.

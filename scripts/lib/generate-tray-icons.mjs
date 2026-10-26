@@ -7,7 +7,7 @@ import { renderSvg } from "./svg-template-raster.mjs";
 
 // Renders the macOS menu-bar template (resources/icons/trayTemplate.svg, a 16x16 viewBox) to its
 // 1x and 2x PNGs. `--check` only verifies that the committed PNGs still match the SVG.
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const iconsDir = path.join(root, "resources", "icons");
 const source = path.join(iconsDir, "trayTemplate.svg");
 const outputs = [

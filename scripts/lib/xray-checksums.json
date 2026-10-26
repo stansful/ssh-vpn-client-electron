@@ -1,5 +1,5 @@
 {
-  "comment": "SHA-256 of the pinned Xray-core release: the archives published at https://github.com/XTLS/Xray-core/releases and the executables committed under resources/xray/<platform>/<arch>/. `npm run xray:download*` installs nothing that differs from these, and `npm run xray:ensure` (run by package:prepare) fails when a committed executable does. To move to a newer release, change pinnedVersion in scripts/download-xray-runtime.mjs, run `npm run xray:download-all -- --trust-download` to record it, compare the archive values against the release's .dgst files, and commit this file with the new binaries.",
+  "comment": "SHA-256 of the pinned Xray-core release: the archives published at https://github.com/XTLS/Xray-core/releases and the executables committed under resources/xray/<platform>/<arch>/. `npm run xray:download*` installs nothing that differs from these, and `npm run xray:ensure` (run by package:prepare) fails when a committed executable does. To move to a newer release, change pinnedVersion in scripts/lib/download-xray-runtime.mjs, run `npm run xray:download-all -- --trust-download` to record it, compare the archive values against the release's .dgst files, and commit this file with the new binaries.",
   "version": "v26.3.27",
   "archives": {
     "Xray-windows-64.zip": "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad",

@@ -6,15 +6,15 @@ import { fileURLToPath } from "node:url";
 
 /**
  * Fails when an Xray runtime is missing or is not the pinned release recorded
- * in `scripts/xray-checksums.json`. The binaries are committed and packaged
+ * in `scripts/lib/xray-checksums.json`. The binaries are committed and packaged
  * as they are, so this is the check that stands between a replaced binary and
  * a shipped build.
  */
 
 // Test seam: lets the check run against a fixture tree.
 const root = process.env.SHADOW_SSH_PROJECT_ROOT
-  ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const checksumsPath = path.join(root, "scripts", "xray-checksums.json");
+  ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const checksumsPath = path.join(root, "scripts", "lib", "xray-checksums.json");
 const targetMap = new Map([
   ["windows/x64", "xray.exe"],
   ["windows/arm64", "xray.exe"],

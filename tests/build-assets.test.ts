@@ -38,11 +38,11 @@ describe("build assets", () => {
     expect(scripts["build:prod-linux"]).toContain("verify:prod-artifacts -- --linux && npm run release:prune");
     expect(scripts["build:prod-exe"]).toBe("npm run build:prod-win");
     expect(packageJson.author.email).toMatch(/@/u);
-    expect(readFileSync("scripts/electron-builder-with-local-dist.mjs", "utf8")).toContain(
+    expect(readFileSync("scripts/lib/electron-builder-with-local-dist.mjs", "utf8")).toContain(
       'path.join(root, ".cache", "electron-builder")'
     );
 
-    const plan = spawnSync(process.execPath, ["scripts/verify-production-artifacts.mjs", "--plan"], {
+    const plan = spawnSync(process.execPath, ["scripts/lib/verify-production-artifacts.mjs", "--plan"], {
       encoding: "utf8"
     });
     expect(plan.error).toBeUndefined();
@@ -76,7 +76,12 @@ describe("build assets", () => {
 
   it("runs tests, lint and the Go checks before a release is built", () => {
     const workflow = readFileSync(".github/workflows/release.yml", "utf8");
-    const quality = workflow.slice(workflow.indexOf("\n  quality:"), workflow.indexOf("\n  build:"));
+    const ci = readFileSync(".github/workflows/ci.yml", "utf8");
+    // release.yml's quality job is ci.yml, whose own quality job holds the checks.
+    expect(workflow.slice(workflow.indexOf("\n  quality:"), workflow.indexOf("\n  build:"))).toContain(
+      "uses: ./.github/workflows/ci.yml"
+    );
+    const quality = ci.slice(ci.indexOf("\n  quality:"));
 
     for (const step of [
       "npm run typecheck",
@@ -92,8 +97,8 @@ describe("build assets", () => {
       expect(quality).toContain(step);
     }
     expect(quality).not.toContain("-race");
-    expect(workflow).toContain("needs: [check, quality]\n    if: needs.check.outputs.should_release == 'true'");
-    expect(workflow).toContain("needs: [check, quality, build]");
+    expect(workflow).toContain("needs: [gate, quality]\n    if: needs.gate.outputs.should_release == 'true'");
+    expect(workflow).toContain("needs: [gate, quality, build]");
   });
 
   it("builds the preload bridge as the CommonJS script a sandboxed window needs", () => {
@@ -143,7 +148,7 @@ describe("build assets", () => {
   it("renders the macOS menu-bar template PNGs from trayTemplate.svg", () => {
     expect(packageJson.scripts["package:prepare"]).toContain("icons:tray");
 
-    const check = spawnSync(process.execPath, ["scripts/generate-tray-icons.mjs", "--check"], { encoding: "utf8" });
+    const check = spawnSync(process.execPath, ["scripts/lib/generate-tray-icons.mjs", "--check"], { encoding: "utf8" });
 
     expect(check.error).toBeUndefined();
     expect(check.status, check.stderr).toBe(0);

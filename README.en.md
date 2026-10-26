@@ -144,4 +144,24 @@ npm run build:prod # release builds for every system, into release/
 You can also open the interface in a plain browser with demo data: run `npx vite`, then open
 `http://localhost:5173/?scenario=connected`. That's how the screenshots above were made.
 
+**Releases:**
+
+```bash
+scripts/make-release.sh   # shows the current version, asks for the new one (Enter: next patch), commits
+git push                  # a push to master starts the release
+```
+
+`scripts/make-release.sh` checks that the tree is clean and that the new version X.Y.Z (no "v") is higher than the
+current one and every release tag, writes it to `package.json` and `package-lock.json` and commits only those two
+files as `feat: release - version X.Y.Z`. Without questions: `scripts/make-release.sh 2.8.0 --yes`. It never pushes
+and creates no tags. On every push to `master`, `.github/workflows/release.yml` runs the whole CI (`ci.yml`) and,
+when the version in `package.json` has no release yet, builds the eight files with `scripts/build-release.sh` and
+publishes release `X.Y.Z`: the tag on that commit, a draft first, the uploads checked, then published as the latest
+release, which is what the in-app updater finds. When the version is released already, the run ends with a hint to
+bump it. When the CI fails, nothing is released: re-run the failed jobs, or push a fix.
+
+A local release build is `scripts/build-release.sh` (what CI runs; macOS only): `npm run build:prod` and a check that
+`release/` holds exactly the eight release files; `--test` runs typecheck, lint, Vitest and `go test` first. The other
+build helpers live in `scripts/lib/`.
+
 Building, packaging and how the tunnel and routing work inside are covered in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).

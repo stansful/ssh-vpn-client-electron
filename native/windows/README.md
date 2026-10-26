@@ -26,7 +26,7 @@ npm run wintun:download
 ```
 
 That fetches the signed release from <https://www.wintun.net/>, verifies it
-against `scripts/wintun-checksums.json` and installs both architectures:
+against `scripts/lib/wintun-checksums.json` and installs both architectures:
 
 ```
 native/windows/x64/wintun.dll
@@ -40,7 +40,7 @@ record it with `npm run wintun:download -- --trust-download` and commit the
 result, so every later build is checked against it.
 
 No `package.json` change is needed; the folder is packaged wholesale. Windows
-packaging refuses to run without the DLL (`scripts/electron-builder-with-local-dist.mjs`),
+packaging refuses to run without the DLL (`scripts/lib/electron-builder-with-local-dist.mjs`),
 `npm run wintun:ensure` checks it on demand, and `npm run verify:prod-artifacts`
 confirms it reached the built bundle. It used to be only a console warning
 during the native build, which is how releases shipped without it.
@@ -63,7 +63,7 @@ helper therefore loads a candidate only if it is byte-for-byte the WireGuard
 0.14.1 DLL for its architecture (SHA-256 pinned in
 `native/service-go/internal/tun/verify.go`); any other file is skipped and named
 in the diagnostic. Updating wintun means updating those digests along with
-`scripts/wintun-checksums.json`; a Go test fails if the download script's
+`scripts/lib/wintun-checksums.json`; a Go test fails if the download script's
 version and the pinned one disagree.
 
 The DLL is deliberately not committed: it is a third-party signed binary and

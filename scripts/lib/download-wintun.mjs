@@ -21,9 +21,9 @@ import { fileURLToPath, URL } from "node:url";
  * process rule against an application that ignores the proxy setting.
  */
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const defaultVersion = "0.14.1";
-const checksumsPath = path.join(root, "scripts", "wintun-checksums.json");
+const checksumsPath = path.join(root, "scripts", "lib", "wintun-checksums.json");
 const maxRedirects = 5;
 const requestIdleTimeoutMs = 30_000;
 const maxArchiveBytes = 16 * 1024 * 1024;

@@ -12,7 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { prunedRuntimeFiles } from "./after-pack-prune.mjs";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const packageMetadata = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 
 let options;
@@ -172,7 +172,7 @@ function verifyLinuxBundle(releaseRoot, unpackedDirectory, arch) {
 function rejectPrunedRuntime(bundleRoot, platform) {
   for (const relativePath of prunedRuntimeFiles(platform)) {
     if (existsSync(path.join(bundleRoot, relativePath))) {
-      throw new Error(`${displayPath(path.join(bundleRoot, relativePath))} should have been pruned by scripts/after-pack-prune.mjs`);
+      throw new Error(`${displayPath(path.join(bundleRoot, relativePath))} should have been pruned by scripts/lib/after-pack-prune.mjs`);
     }
   }
 }
@@ -324,7 +324,7 @@ function toErrorMessage(error) {
 
 function printUsage() {
   console.log([
-    "Usage: node scripts/verify-production-artifacts.mjs [options]",
+    "Usage: node scripts/lib/verify-production-artifacts.mjs [options]",
     "",
     "Options:",
     "  --win | --mac | --linux  Verify one or more platform matrices (default: all)",

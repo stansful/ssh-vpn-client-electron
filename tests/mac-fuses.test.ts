@@ -16,7 +16,7 @@ interface MacFusesModule {
   ): Promise<void>;
 }
 
-const macFuses = (await import(pathToFileURL(path.resolve("scripts/mac-fuses.mjs")).href)) as MacFusesModule;
+const macFuses = (await import(pathToFileURL(path.resolve("scripts/lib/mac-fuses.mjs")).href)) as MacFusesModule;
 
 function packContext(electronPlatformName: string, electronFuses: Record<string, unknown> = packageJson.build.electronFuses) {
   const flipped: unknown[] = [];
@@ -87,7 +87,7 @@ describe("macOS fuses", () => {
   });
 
   it("is the afterPack hook, after the runtime is pruned", () => {
-    expect(packageJson.build.afterPack).toBe("./scripts/after-pack.mjs");
+    expect(packageJson.build.afterPack).toBe("./scripts/lib/after-pack.mjs");
     expect(packageJson.build.electronFuses.resetAdHocDarwinSignature).toBe(false);
   });
 });
